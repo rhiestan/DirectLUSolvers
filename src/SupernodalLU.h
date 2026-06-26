@@ -136,6 +136,23 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   /** Number of refinement steps actually taken by the last solve(). */
   Index iterativeRefinements() const { return m_lastRefinementIterations; }
 
+  /** Amalgamation (relaxed supernodes): merge fundamental supernodes along
+   *  elimination-tree paths into larger dense panels for better BLAS-3
+   *  efficiency, at the cost of a bounded number of explicit structural zeros.
+   *  Merging is applied during analyzePattern().
+   *
+   *  A path-continuation boundary is merged when EITHER the supernode being
+   *  closed is narrower than relaxedSize columns, OR the merge step introduces
+   *  no more than maxZeroRows extra (logically zero) off-diagonal rows per
+   *  column. Set relaxedSize = 1 and maxZeroRows = 0 to recover the pure
+   *  fundamental-supernode partition (no amalgamation). */
+  void setAmalgamation(Index relaxedSize, Index maxZeroRows) {
+    m_relaxedSize = relaxedSize;
+    m_maxAmalgamationZeroRows = maxZeroRows;
+  }
+  Index relaxedSize() const { return m_relaxedSize; }
+  Index maxAmalgamationZeroRows() const { return m_maxAmalgamationZeroRows; }
+
   Index nnzL() const { return m_nnzL; }
   Index nnzU() const { return m_nnzU; }
   Index supernodeCount() const { return static_cast<Index>(m_supernodes.size()); }
@@ -166,6 +183,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_maxRefinementIterations = 5;
     m_refinementTolerance = NumTraits<RealScalar>::epsilon();
     m_lastRefinementIterations = 0;
+    m_relaxedSize = 4;
+    m_maxAmalgamationZeroRows = 4;
     m_nnzL = 0;
     m_nnzU = 0;
   }
@@ -222,6 +241,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index m_maxRefinementIterations;
   RealScalar m_refinementTolerance;
   mutable Index m_lastRefinementIterations;
+  Index m_relaxedSize;                // amalgamation: force-merge below this width
+  Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
   Index m_nnzL;
   Index m_nnzU;
 };
@@ -363,12 +384,42 @@ void SupernodalLU<MatrixType, OrderingType>::detectSupernodesAndBlocks(
   for (StorageIndex j = 0; j < n; ++j)
     if (parent[j] != StorageIndex(-1)) ++childCount[parent[j]];
 
-  // Fundamental supernodes: column j joins the previous column iff its only
-  // tree-parent is j (i.e. parent[j-1]==j) and j has exactly one child.
+  // Number of entries in a sorted column structure that lie strictly beyond a
+  // given column (i.e. its off-diagonal rows relative to that column).
+  auto rowsBeyond = [](const std::vector<StorageIndex>& structure, StorageIndex col) -> StorageIndex {
+    return static_cast<StorageIndex>(
+        structure.end() - std::upper_bound(structure.begin(), structure.end(), col));
+  };
+
+  // Supernode partition. A boundary at column j is MANDATORY when parent[j-1]!=j
+  // (j does not continue the elimination-tree path of j-1); merging across it
+  // would violate the "last column has the largest structure" invariant. When
+  // the path does continue, a fundamental boundary (childCount[j]!=1, a branch
+  // point) may be AMALGAMATED into the running supernode: we accept the merge
+  // when the supernode being closed is narrow, or the step adds few explicit
+  // zeros. This trades a bounded number of structural zeros for larger dense
+  // panels (better BLAS-3) without changing the factorization mathematically.
   std::vector<bool> startsSupernode(n, false);
   if (n > 0) startsSupernode[0] = true;
-  for (StorageIndex j = 1; j < n; ++j)
-    startsSupernode[j] = (parent[j - 1] != j) || (childCount[j] != 1);
+  StorageIndex currentStart = 0;
+  for (StorageIndex j = 1; j < n; ++j) {
+    bool start;
+    if (parent[j - 1] != j) {
+      start = true;  // mandatory structural boundary
+    } else if (childCount[j] == 1) {
+      start = false;  // fundamental supernode: no extra fill
+    } else {
+      // path-continuation branch point: amalgamate if cheap enough.
+      const StorageIndex childWidth = j - currentStart;
+      const StorageIndex deltaRows =
+          rowsBeyond(columnStructure[j], j) - rowsBeyond(columnStructure[j - 1], j);
+      const bool merge = (static_cast<Index>(childWidth) < m_relaxedSize) ||
+                         (static_cast<Index>(deltaRows) <= m_maxAmalgamationZeroRows);
+      start = !merge;
+    }
+    startsSupernode[j] = start;
+    if (start) currentStart = j;
+  }
 
   m_supernodes.clear();
   m_rowBlocks.clear();

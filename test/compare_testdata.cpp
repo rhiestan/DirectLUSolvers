@@ -127,22 +127,20 @@ struct Result {
   double err = 0, resid = 0, factorMs = 0, solveMs = 0;
   long long nnzL = 0, nnzU = 0;
   long long replaced = 0;
+  long long snodes = 0;
   int refineIters = 0;
   std::string note;
 };
 
-// When refine==false we disable both built-in features (pure unpivoted LU) to
-// show the raw behavior; otherwise we rely on the solver's own defaults
-// (automatic static-pivot threshold + built-in iterative refinement).
+// Both variants use the robust defaults (auto static pivot + iterative
+// refinement). When amalgamate==false we force the pure fundamental-supernode
+// partition (setAmalgamation(1,0)) so the effect of amalgamation is isolated.
 Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue,
-                     bool refine) {
+                     bool amalgamate) {
   Result r;
   Eigen::SupernodalLU<SparseMatrix<double>> solver;
   try {
-    if (!refine) {
-      solver.setStaticPivotThreshold(0.0);
-      solver.setMaxIterativeRefinements(0);
-    }
+    if (!amalgamate) solver.setAmalgamation(1, 0);
     auto t0 = Clock::now();
     solver.compute(A);
     auto t1 = Clock::now();
@@ -160,6 +158,7 @@ Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const Vec
     r.nnzU = solver.nnzU();
     r.replaced = solver.replacedPivots();
     r.refineIters = static_cast<int>(solver.iterativeRefinements());
+    r.snodes = static_cast<long long>(solver.supernodeCount());
     r.ok = true;
   } catch (const std::exception& e) {
     r.note = std::string("threw: ") + e.what();
@@ -230,14 +229,17 @@ int main(int argc, char** argv) {
     VectorXd xTrue = VectorXd::Random(A.rows());
     VectorXd b = Asym * xTrue;
 
-    Result plain = runSupernodal(Asym, b, xTrue, /*refine=*/false);
-    Result piv = runSupernodal(Asym, b, xTrue, /*refine=*/true);
+    Result plain = runSupernodal(Asym, b, xTrue, /*amalgamate=*/false);
+    Result piv = runSupernodal(Asym, b, xTrue, /*amalgamate=*/true);
     Result ref = runSparseLU(Asym, b, xTrue);
 
-    auto report = [](const char* name, const Result& r) {
+    const long long nn = A.rows();
+    auto report = [nn](const char* name, const Result& r) {
       if (r.ok) {
         std::printf("  %-22s  err=%.3e  resid=%.3e  factor=%8.2f ms  solve=%7.2f ms  nnzL=%lld nnzU=%lld",
                     name, r.err, r.resid, r.factorMs, r.solveMs, r.nnzL, r.nnzU);
+        if (r.snodes > 0)
+          std::printf("  snodes=%lld avgW=%.1f", r.snodes, double(nn) / double(r.snodes));
         if (r.replaced > 0 || r.refineIters > 0)
           std::printf("  [bumped %lld pivots, %d refine its]", r.replaced, r.refineIters);
         std::printf("\n");
@@ -245,16 +247,19 @@ int main(int argc, char** argv) {
         std::printf("  %-22s  DID NOT SOLVE: %s\n", name, r.note.c_str());
       }
     };
-    report("SupernodalLU (no pivot)", plain);
-    report("SupernodalLU (defaults)", piv);
+    report("SNLU (fundamental)", plain);
+    report("SNLU (amalgamated)", piv);
     report("Eigen SparseLU", ref);
 
     const bool pivAccurate = piv.ok && piv.resid < 1e-6;
-    if (!plain.ok && pivAccurate)
-      std::printf("  -> static pivoting + refinement RECOVERED a solution unpivoted LU could not.\n");
-    else if (piv.ok && !pivAccurate)
-      std::printf("  -> static pivoting produced a solution but residual stayed large"
-                  " (%lld/%ld pivots bumped) -> needs true row pivoting.\n",
+    if (plain.ok && piv.ok) {
+      const double fillRatio = double(piv.nnzL + piv.nnzU) / double(plain.nnzL + plain.nnzU);
+      const double speedup = piv.factorMs > 0 ? plain.factorMs / piv.factorMs : 0.0;
+      std::printf("  -> amalgamation: %.2fx factor speed, %lld->%lld supernodes, %+.0f%% stored nz\n",
+                  speedup, plain.snodes, piv.snodes, (fillRatio - 1.0) * 100.0);
+    }
+    if (piv.ok && !pivAccurate)
+      std::printf("  -> residual stayed large (%lld/%ld pivots bumped) -> needs true row pivoting.\n",
                   piv.replaced, (long)A.rows());
     if (!pivAccurate) ++failures;
     std::printf("\n");
