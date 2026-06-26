@@ -34,6 +34,49 @@
 
 namespace Eigen {
 
+/** \class SupernodalLUTransposeView
+ * \brief Solve expression for the transpose (Conjugate=false) or adjoint
+ *        (Conjugate=true) of a factored SupernodalLU, returned by
+ *        SupernodalLU::transpose() / adjoint(). Mirrors Eigen::SparseLU's
+ *        SparseLUTransposeView. The only supported operation is solve(). */
+template <bool Conjugate, typename SolverType>
+class SupernodalLUTransposeView
+    : public SparseSolverBase<SupernodalLUTransposeView<Conjugate, SolverType>> {
+  typedef SparseSolverBase<SupernodalLUTransposeView<Conjugate, SolverType>> APIBase;
+  using APIBase::m_isInitialized;
+
+ public:
+  typedef typename SolverType::Scalar Scalar;
+  typedef typename SolverType::StorageIndex StorageIndex;
+  typedef typename SolverType::MatrixType MatrixType;
+  typedef typename SolverType::OrderingType OrderingType;
+
+  enum {
+    ColsAtCompileTime = MatrixType::ColsAtCompileTime,
+    MaxColsAtCompileTime = MatrixType::MaxColsAtCompileTime
+  };
+
+  using APIBase::_solve_impl;
+
+  SupernodalLUTransposeView() = default;
+
+  void setSolver(SolverType* solver) { m_solver = solver; }
+  void setIsInitialized(bool isInitialized) { this->m_isInitialized = isInitialized; }
+
+  template <typename Rhs, typename Dest>
+  void _solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
+    eigen_assert(m_solver && m_solver->info() == Success &&
+                 "the matrix must be factorized first");
+    m_solver->template _solve_transposed_impl<Conjugate>(b, x);
+  }
+
+  inline Index rows() const { return m_solver->rows(); }
+  inline Index cols() const { return m_solver->cols(); }
+
+ private:
+  SolverType* m_solver = nullptr;
+};
+
 /** \class SupernodalLU
  * \brief Supernodal sparse direct LU factorization for general matrices with a
  *        symmetric nonzero pattern.
@@ -166,6 +209,64 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     return det;
   }
 
+  // --- factor accessors (Eigen::SparseLU-compatible) ------------------------
+
+  /** Expression of the unit-lower factor L. The supported operation is the
+   *  in-place triangular solve, in the solver's internal numbering:
+   *  \code
+   *    VectorXd y = solver.rowsPermutation() * b;   // permute into internal order
+   *    solver.matrixL().solveInPlace(y);            // L y = (P b)
+   *    solver.matrixU().solveInPlace(y);            // U y = ...
+   *    VectorXd x = solver.colsPermutation().transpose() * y;
+   *  \endcode
+   *  with P A P^T = L U. */
+  struct SupernodalLUMatrixLReturnType {
+    explicit SupernodalLUMatrixLReturnType(const SupernodalLU& solver) : m_solver(solver) {}
+    Index rows() const { return m_solver.rows(); }
+    Index cols() const { return m_solver.cols(); }
+    template <typename Dest>
+    void solveInPlace(MatrixBase<Dest>& x) const;
+    const SupernodalLU& m_solver;
+  };
+
+  /** Expression of the upper factor U; see SupernodalLUMatrixLReturnType. */
+  struct SupernodalLUMatrixUReturnType {
+    explicit SupernodalLUMatrixUReturnType(const SupernodalLU& solver) : m_solver(solver) {}
+    Index rows() const { return m_solver.rows(); }
+    Index cols() const { return m_solver.cols(); }
+    template <typename Dest>
+    void solveInPlace(MatrixBase<Dest>& x) const;
+    const SupernodalLU& m_solver;
+  };
+
+  SupernodalLUMatrixLReturnType matrixL() const { return SupernodalLUMatrixLReturnType(*this); }
+  SupernodalLUMatrixUReturnType matrixU() const { return SupernodalLUMatrixUReturnType(*this); }
+
+  // --- transpose / adjoint solve views (Eigen::SparseLU-compatible) ---------
+
+  /** \returns a view solving the transposed system: x = solver.transpose().solve(b)
+   *  solves A^T x = b, reusing the existing factorization. */
+  SupernodalLUTransposeView<false, SupernodalLU> transpose() {
+    SupernodalLUTransposeView<false, SupernodalLU> view;
+    view.setSolver(this);
+    view.setIsInitialized(this->m_isInitialized);
+    return view;
+  }
+
+  /** \returns a view solving the adjoint system: x = solver.adjoint().solve(b)
+   *  solves A^H x = b. For real scalar types this equals transpose(). */
+  SupernodalLUTransposeView<true, SupernodalLU> adjoint() {
+    SupernodalLUTransposeView<true, SupernodalLU> view;
+    view.setSolver(this);
+    view.setIsInitialized(this->m_isInitialized);
+    return view;
+  }
+
+  /** Internal: solve A^T x = b (Conjugate=false) or A^H x = b (Conjugate=true).
+   *  Used by the transpose()/adjoint() views; prefer those. */
+  template <bool Conjugate, typename Rhs, typename Dest>
+  void _solve_transposed_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const;
+
  private:
   typedef Matrix<Scalar, Dynamic, Dynamic, ColMajor> DenseMatrix;
   typedef Matrix<Scalar, Dynamic, Dynamic, ColMajor> WorkMatrix;
@@ -206,6 +307,22 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // one block forward/backward triangular solve (no refinement), in the
   // original numbering. Used both for the initial solve and the corrections.
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
+
+  // in-place triangular solves in the internal numbering: L y = y (unit lower)
+  // and U y = y. Shared by solveTriangular and the matrixL()/matrixU() proxies.
+  template <typename Dest>
+  void applyInverseL(Dest& y) const;
+  template <typename Dest>
+  void applyInverseU(Dest& y) const;
+
+  // transposed in-place triangular solves (internal numbering): L^T/L^H y = y
+  // and U^T/U^H y = y, for the transpose()/adjoint() solve.
+  template <bool Conjugate, typename Dest>
+  void applyInverseLTransposed(Dest& y) const;
+  template <bool Conjugate, typename Dest>
+  void applyInverseUTransposed(Dest& y) const;
+  template <bool Conjugate>
+  void solveTriangularTransposed(const DenseMatrix& rhs, DenseMatrix& solution) const;
 
   // state ---------------------------------------------------------------------
   StorageIndex m_size;
@@ -784,19 +901,12 @@ void SupernodalLU<MatrixType, OrderingType>::_solve_impl(const MatrixBase<Rhs>& 
   x = solution;
 }
 
+// Forward substitution L y = y (unit-lower), in place, on an internal-numbered
+// right-hand side. Shared by the full solve and matrixL().solveInPlace().
 template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& rhs,
-                                                             DenseMatrix& x) const {
-  const StorageIndex n = m_size;
-  const Index nrhs = rhs.cols();
-
-  // permute right-hand side into the internal numbering.
-  DenseMatrix y(n, nrhs);
-  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = rhs.row(i);
-
+template <typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::applyInverseL(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-
-  // forward substitution: L (unit lower) y = Pb
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
@@ -808,8 +918,14 @@ void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& 
       y.middleRows(block.firstRow, hb).noalias() -= m_lowerFactor[s].middleRows(block.panelOffset, hb) * head;
     }
   }
+}
 
-  // backward substitution: U x = y
+// Backward substitution U y = y (upper), in place, on an internal-numbered
+// right-hand side. Shared by the full solve and matrixU().solveInPlace().
+template <typename MatrixType, typename OrderingType>
+template <typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::applyInverseU(Dest& y) const {
+  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
@@ -822,9 +938,153 @@ void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& 
     m_diagonalFactor[s].template triangularView<Upper>().solveInPlace(head);
     if (s == 0) break;  // guard against unsigned underflow
   }
+}
 
-  // scatter the solution back to the original numbering.
+template <typename MatrixType, typename OrderingType>
+void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& rhs,
+                                                             DenseMatrix& x) const {
+  const StorageIndex n = m_size;
+  const Index nrhs = rhs.cols();
+
+  // permute right-hand side into the internal numbering, solve, permute back.
+  DenseMatrix y(n, nrhs);
+  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = rhs.row(i);
+  applyInverseL(y);
+  applyInverseU(y);
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = y.row(m_toInternal[i]);
+}
+
+// ===========================================================================
+//  matrixL() / matrixU() factor accessors
+// ===========================================================================
+
+template <typename MatrixType, typename OrderingType>
+template <typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::SupernodalLUMatrixLReturnType::solveInPlace(
+    MatrixBase<Dest>& x) const {
+  m_solver.applyInverseL(x.derived());
+}
+
+template <typename MatrixType, typename OrderingType>
+template <typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::SupernodalLUMatrixUReturnType::solveInPlace(
+    MatrixBase<Dest>& x) const {
+  m_solver.applyInverseU(x.derived());
+}
+
+// ===========================================================================
+//  transpose() / adjoint() solve
+// ===========================================================================
+
+// Solve U^T y = y (Conjugate=false) or U^H y = y, in place, internal numbering.
+// U^T is lower-triangular, so this is a forward sweep mirroring applyInverseL:
+// diagonal solve, then push the result down to higher-index rows via U's panel.
+template <typename MatrixType, typename OrderingType>
+template <bool Conjugate, typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::applyInverseUTransposed(Dest& y) const {
+  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
+  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
+    const Supernode& sn = m_supernodes[s];
+    const StorageIndex w = sn.width();
+    auto head = y.middleRows(sn.firstColumn, w);
+    if (Conjugate)
+      m_diagonalFactor[s].template triangularView<Upper>().adjoint().solveInPlace(head);
+    else
+      m_diagonalFactor[s].template triangularView<Upper>().transpose().solveInPlace(head);
+    for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
+      const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
+      const StorageIndex hb = block.height();
+      const auto panel = m_upperFactor[s].middleCols(block.panelOffset, hb);  // w x hb
+      if (Conjugate)
+        y.middleRows(block.firstRow, hb).noalias() -= panel.adjoint() * head;
+      else
+        y.middleRows(block.firstRow, hb).noalias() -= panel.transpose() * head;
+    }
+  }
+}
+
+// Solve L^T z = z (Conjugate=false) or L^H z = z, in place, internal numbering.
+// L^T is unit-upper-triangular, so this is a backward sweep mirroring
+// applyInverseU: pull contributions from higher-index rows via L's panel, then
+// the (unit) diagonal solve.
+template <typename MatrixType, typename OrderingType>
+template <bool Conjugate, typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::applyInverseLTransposed(Dest& y) const {
+  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
+  for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
+    const Supernode& sn = m_supernodes[s];
+    const StorageIndex w = sn.width();
+    auto head = y.middleRows(sn.firstColumn, w);
+    for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
+      const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
+      const StorageIndex hb = block.height();
+      const auto panel = m_lowerFactor[s].middleRows(block.panelOffset, hb);  // hb x w
+      if (Conjugate)
+        head.noalias() -= panel.adjoint() * y.middleRows(block.firstRow, hb);
+      else
+        head.noalias() -= panel.transpose() * y.middleRows(block.firstRow, hb);
+    }
+    if (Conjugate)
+      m_diagonalFactor[s].template triangularView<UnitLower>().adjoint().solveInPlace(head);
+    else
+      m_diagonalFactor[s].template triangularView<UnitLower>().transpose().solveInPlace(head);
+    if (s == 0) break;  // guard against unsigned underflow
+  }
+}
+
+// A^T = P^T U^T L^T P, so solve A^T x = b as: P b -> U^T solve -> L^T solve -> P^T.
+template <typename MatrixType, typename OrderingType>
+template <bool Conjugate>
+void SupernodalLU<MatrixType, OrderingType>::solveTriangularTransposed(const DenseMatrix& rhs,
+                                                                       DenseMatrix& x) const {
+  const StorageIndex n = m_size;
+  const Index nrhs = rhs.cols();
+  DenseMatrix y(n, nrhs);
+  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = rhs.row(i);
+  applyInverseUTransposed<Conjugate>(y);
+  applyInverseLTransposed<Conjugate>(y);
+  for (StorageIndex i = 0; i < n; ++i) x.row(i) = y.row(m_toInternal[i]);
+}
+
+template <typename MatrixType, typename OrderingType>
+template <bool Conjugate, typename Rhs, typename Dest>
+void SupernodalLU<MatrixType, OrderingType>::_solve_transposed_impl(const MatrixBase<Rhs>& b,
+                                                                    MatrixBase<Dest>& x) const {
+  eigen_assert(m_info == Success && "the matrix must be factorized first");
+  const Index nrhs = b.cols();
+
+  const DenseMatrix rhs = b;
+  DenseMatrix solution(m_size, nrhs);
+  solveTriangularTransposed<Conjugate>(rhs, solution);
+
+  // iterative refinement against A^T (or A^H), mirroring _solve_impl.
+  m_lastRefinementIterations = 0;
+  const RealScalar rhsNorm = rhs.norm();
+  if (m_maxRefinementIterations > 0 && rhsNorm > RealScalar(0)) {
+    DenseMatrix best = solution;
+    RealScalar bestNorm = NumTraits<RealScalar>::highest();
+    RealScalar prevNorm = NumTraits<RealScalar>::highest();
+    for (Index it = 0;; ++it) {
+      DenseMatrix residual = Conjugate ? DenseMatrix(rhs - m_originalMatrix.adjoint() * solution)
+                                       : DenseMatrix(rhs - m_originalMatrix.transpose() * solution);
+      const RealScalar resNorm = residual.norm();
+      if (resNorm < bestNorm) {
+        bestNorm = resNorm;
+        best = solution;
+      }
+      if (resNorm <= m_refinementTolerance * rhsNorm) break;
+      if (resNorm > prevNorm) break;
+      if (it >= m_maxRefinementIterations) break;
+      prevNorm = resNorm;
+      DenseMatrix correction(m_size, nrhs);
+      solveTriangularTransposed<Conjugate>(residual, correction);
+      solution += correction;
+      ++m_lastRefinementIterations;
+    }
+    solution = best;
+  }
+
+  x = solution;
 }
 
 }  // namespace Eigen

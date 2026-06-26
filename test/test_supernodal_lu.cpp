@@ -110,6 +110,69 @@ double solveAndMeasure(const SparseMatrix<double>& A, const char* name) {
   return worst;
 }
 
+// Verify matrixL()/matrixU().solveInPlace reproduce the full solve when driven
+// with the documented permutation recipe (P A P^T = L U).
+void testFactorAccessors() {
+  SparseMatrix<double> A = laplacian2d(12, 10);
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  Eigen::SupernodalLU<SparseMatrix<double>> solver;
+  solver.setMaxIterativeRefinements(0);  // compare the raw factor solve
+  solver.compute(A);
+
+  // manual solve through the L and U factor accessors.
+  VectorXd y = solver.rowsPermutation() * b;
+  solver.matrixL().solveInPlace(y);
+  solver.matrixU().solveInPlace(y);
+  VectorXd xManual = solver.colsPermutation().transpose() * y;
+
+  const VectorXd xSolve = solver.solve(b);
+  const double agree = (xManual - xSolve).norm() / xSolve.norm();
+  const double resid = (A * xManual - b).norm() / b.norm();
+  check(std::max(agree, resid) < 1e-10, "matrixL()/matrixU() vs solve()", std::max(agree, resid));
+
+  // also exercise the matrix (multi-column) overload of solveInPlace.
+  MatrixXd Xtrue = MatrixXd::Random(n, 3);
+  MatrixXd Bm = A * Xtrue;
+  MatrixXd Ym = solver.rowsPermutation() * Bm;
+  solver.matrixL().solveInPlace(Ym);
+  solver.matrixU().solveInPlace(Ym);
+  MatrixXd Xm = solver.colsPermutation().transpose() * Ym;
+  const double residM = (A * Xm - Bm).norm() / Bm.norm();
+  check(residM < 1e-10, "matrixL()/matrixU() multi-column solveInPlace", residM);
+}
+
+// Verify transpose()/adjoint() solve A^T x = b. Uses a symmetric-PATTERN matrix
+// with unsymmetric VALUES so that A^T != A and the test is meaningful.
+void testTransposeSolve() {
+  SparseMatrix<double> A = randomSymmetricPattern(150, 0.05, 99);
+  const int n = static_cast<int>(A.rows());
+
+  Eigen::SupernodalLU<SparseMatrix<double>> solver;
+  solver.compute(A);
+
+  // transpose(): solve A^T x = b.
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd bT = A.transpose() * xTrue;
+  VectorXd xT = solver.transpose().solve(bT);
+  const double residT = (A.transpose() * xT - bT).norm() / bT.norm();
+  check(residT < 1e-8, "transpose().solve(): A^T x = b", residT);
+
+  // cross-check against Eigen::SparseLU's transpose solve.
+  Eigen::SparseLU<SparseMatrix<double>> ref;
+  ref.compute(A);
+  VectorXd xRef = ref.transpose().solve(bT);
+  const double agree = (xT - xRef).norm() / xRef.norm();
+  check(agree < 1e-8, "transpose().solve() matches Eigen::SparseLU", agree);
+
+  // adjoint(): for real scalars equals transpose(); verify it also solves.
+  VectorXd xA = solver.adjoint().solve(bT);
+  const double residA = (A.adjoint() * xA - bT).norm() / bT.norm();
+  check(residA < 1e-8, "adjoint().solve(): A^H x = b", residA);
+}
+
 void testMultipleRhs() {
   SparseMatrix<double> A = laplacian2d(8, 8);
   const int n = static_cast<int>(A.rows());
@@ -141,6 +204,8 @@ int main() {
 
   std::printf("Other:\n");
   testMultipleRhs();
+  testFactorAccessors();
+  testTransposeSolve();
 
   std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
               g_failures, g_failures == 1 ? "" : "s");
