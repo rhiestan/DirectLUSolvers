@@ -213,6 +213,38 @@ void testEquilibration() {
               residOff, (long long)off.replacedPivots(), residOn, (long long)on.replacedPivots());
 }
 
+// Krylov refinement robustness: with a deliberately weak preconditioner (a large
+// static-pivot threshold bumps many pivots), stationary iterative refinement
+// stalls far from machine precision, while LU-preconditioned BiCGStab converges.
+void testKrylovRefinement() {
+  SparseMatrix<double> A = laplacian2d(20, 20);  // SPD, well-conditioned
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  long long bumped = 0;
+  auto run = [&](Eigen::supernodal_lu::Refinement method) {
+    Eigen::SupernodalLU<SparseMatrix<double>> s;
+    s.setEquilibration(false);
+    s.setStaticPivotThreshold(3.0);  // bump many pivots -> weak preconditioner
+    s.setRefinementMethod(method);
+    s.setMaxIterativeRefinements(30);
+    s.compute(A);
+    const VectorXd x = s.solve(b);
+    bumped = s.replacedPivots();
+    return (A * x - b).norm() / b.norm();
+  };
+
+  const double irResid = run(Eigen::supernodal_lu::Refinement::IterativeRefinement);
+  const double bcgResid = run(Eigen::supernodal_lu::Refinement::BiCGStab);
+
+  check(bcgResid < 1e-10, "BiCGStab refinement converges (weak preconditioner)", bcgResid);
+  check(bcgResid < irResid * 1e-3, "BiCGStab beats stationary IR (weak preconditioner)",
+        bcgResid / irResid);
+  std::printf("        (%lld/%d pivots bumped) stationary IR resid=%.2e | BiCGStab resid=%.2e\n",
+              bumped, n, irResid, bcgResid);
+}
+
 void testMultipleRhs() {
   SparseMatrix<double> A = laplacian2d(8, 8);
   const int n = static_cast<int>(A.rows());
@@ -247,6 +279,7 @@ int main() {
   testFactorAccessors();
   testTransposeSolve();
   testEquilibration();
+  testKrylovRefinement();
 
   std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
               g_failures, g_failures == 1 ? "" : "s");

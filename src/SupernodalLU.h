@@ -34,6 +34,14 @@
 #include "SupernodalLUExecutor.h"
 
 namespace Eigen {
+namespace supernodal_lu {
+// Method used by solve() to refine the direct factor solve.
+//   None                 - return the raw factor solve.
+//   IterativeRefinement  - stationary refinement x += M^{-1}(b - A x).
+//   BiCGStab             - Krylov (BiCGStab) preconditioned by the LU factors;
+//                          robust where stationary refinement stalls/diverges.
+enum class Refinement { None, IterativeRefinement, BiCGStab };
+}  // namespace supernodal_lu
 
 /** \class SupernodalLUTransposeView
  * \brief Solve expression for the transpose (Conjugate=false) or adjoint
@@ -188,6 +196,11 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   void setRefinementTolerance(const RealScalar& tol) { m_refinementTolerance = tol; }
   RealScalar refinementTolerance() const { return m_refinementTolerance; }
 
+  /** Refinement method used by solve(). Default BiCGStab (LU-preconditioned
+   *  Krylov), which is robust where stationary refinement diverges. */
+  void setRefinementMethod(supernodal_lu::Refinement method) { m_refinementMethod = method; }
+  supernodal_lu::Refinement refinementMethod() const { return m_refinementMethod; }
+
   /** Number of refinement steps actually taken by the last solve(). */
   Index iterativeRefinements() const { return m_lastRefinementIterations; }
 
@@ -330,6 +343,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_replacedPivots = 0;
     m_maxRefinementIterations = 5;
     m_refinementTolerance = NumTraits<RealScalar>::epsilon();
+    m_refinementMethod = supernodal_lu::Refinement::BiCGStab;
     m_lastRefinementIterations = 0;
     m_relaxedSize = 4;
     m_maxAmalgamationZeroRows = 4;
@@ -395,6 +409,18 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   template <bool Conjugate>
   void solveTriangularTransposed(const DenseMatrix& rhs, DenseMatrix& solution) const;
 
+  // refine an initial solution in place against the operator applyA (A, A^T or
+  // A^H) preconditioned by applyPrec (the matching LU solve), using the
+  // configured refinement method. applyA(in,out): out = op*in; applyPrec(in,out):
+  // out ~= op^{-1}*in. Both operate on pre-sized dense (multi-)columns.
+  template <typename ApplyA, typename ApplyPrec>
+  void refineSolution(const DenseMatrix& rhs, DenseMatrix& solution, ApplyA applyA,
+                      ApplyPrec applyPrec) const;
+  // single right-hand-side preconditioned BiCGStab; returns iterations taken.
+  template <typename ApplyA, typename ApplyPrec>
+  Index bicgstabColumn(ApplyA applyA, ApplyPrec applyPrec, const DenseMatrix& b,
+                       DenseMatrix& x) const;
+
   // state ---------------------------------------------------------------------
   StorageIndex m_size;
   OrderingType m_orderingFunctor;
@@ -438,6 +464,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index m_replacedPivots;
   Index m_maxRefinementIterations;
   RealScalar m_refinementTolerance;
+  supernodal_lu::Refinement m_refinementMethod;
   mutable Index m_lastRefinementIterations;
   Index m_relaxedSize;                // amalgamation: force-merge below this width
   Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
@@ -1081,36 +1108,13 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixB
 
   const DenseMatrix rhs = b;            // materialize the right-hand side
   DenseMatrix solution(m_size, nrhs);
-  solveTriangular(rhs, solution);
+  solveTriangular(rhs, solution);       // initial direct factor solve
 
-  // iterative refinement: solution <- solution + (LU)^{-1} (b - A solution).
-  // Static pivoting perturbs the factors; this cheaply restores accuracy. We
-  // keep the best iterate seen and stop on convergence, divergence, or the
-  // iteration cap, so an unrecoverable matrix cannot blow the answer up.
-  m_lastRefinementIterations = 0;
-  const RealScalar rhsNorm = rhs.norm();
-  if (m_maxRefinementIterations > 0 && rhsNorm > RealScalar(0)) {
-    DenseMatrix best = solution;
-    RealScalar bestNorm = NumTraits<RealScalar>::highest();
-    RealScalar prevNorm = NumTraits<RealScalar>::highest();
-    for (Index it = 0; ; ++it) {
-      const DenseMatrix residual = rhs - m_originalMatrix * solution;
-      const RealScalar resNorm = residual.norm();
-      if (resNorm < bestNorm) {
-        bestNorm = resNorm;
-        best = solution;
-      }
-      if (resNorm <= m_refinementTolerance * rhsNorm) break;  // converged
-      if (resNorm > prevNorm) break;                          // diverging: keep best
-      if (it >= m_maxRefinementIterations) break;             // cap reached
-      prevNorm = resNorm;
-      DenseMatrix correction(m_size, nrhs);
-      solveTriangular(residual, correction);
-      solution += correction;
-      ++m_lastRefinementIterations;
-    }
-    solution = best;
-  }
+  // refine against A, preconditioned by the LU factors (M^{-1} = solveTriangular).
+  refineSolution(
+      rhs, solution,
+      [this](const DenseMatrix& in, DenseMatrix& out) { out.noalias() = m_originalMatrix * in; },
+      [this](const DenseMatrix& in, DenseMatrix& out) { solveTriangular(in, out); });
 
   x = solution;
 }
@@ -1273,16 +1277,51 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(co
   DenseMatrix solution(m_size, nrhs);
   solveTriangularTransposed<Conjugate>(rhs, solution);
 
-  // iterative refinement against A^T (or A^H), mirroring _solve_impl.
+  // refine against A^T (or A^H), preconditioned by the transposed LU solve.
+  refineSolution(
+      rhs, solution,
+      [this](const DenseMatrix& in, DenseMatrix& out) {
+        if (Conjugate)
+          out.noalias() = m_originalMatrix.adjoint() * in;
+        else
+          out.noalias() = m_originalMatrix.transpose() * in;
+      },
+      [this](const DenseMatrix& in, DenseMatrix& out) {
+        this->template solveTriangularTransposed<Conjugate>(in, out);
+      });
+
+  x = solution;
+}
+
+// ===========================================================================
+//  Iterative / Krylov refinement
+// ===========================================================================
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename ApplyA, typename ApplyPrec>
+void SupernodalLU<MatrixType, OrderingType, Executor>::refineSolution(const DenseMatrix& rhs,
+                                                                      DenseMatrix& solution,
+                                                                      ApplyA applyA,
+                                                                      ApplyPrec applyPrec) const {
   m_lastRefinementIterations = 0;
   const RealScalar rhsNorm = rhs.norm();
-  if (m_maxRefinementIterations > 0 && rhsNorm > RealScalar(0)) {
+  if (m_maxRefinementIterations <= 0 || rhsNorm == RealScalar(0) ||
+      m_refinementMethod == supernodal_lu::Refinement::None)
+    return;
+
+  const Index n = rhs.rows();
+  const Index nrhs = rhs.cols();
+
+  if (m_refinementMethod == supernodal_lu::Refinement::IterativeRefinement) {
+    // stationary refinement (all columns at once): keep the best iterate and
+    // stop on convergence, divergence, or the iteration cap.
     DenseMatrix best = solution;
     RealScalar bestNorm = NumTraits<RealScalar>::highest();
     RealScalar prevNorm = NumTraits<RealScalar>::highest();
+    DenseMatrix product(n, nrhs), correction(n, nrhs);
     for (Index it = 0;; ++it) {
-      DenseMatrix residual = Conjugate ? DenseMatrix(rhs - m_originalMatrix.adjoint() * solution)
-                                       : DenseMatrix(rhs - m_originalMatrix.transpose() * solution);
+      applyA(solution, product);
+      const DenseMatrix residual = rhs - product;
       const RealScalar resNorm = residual.norm();
       if (resNorm < bestNorm) {
         bestNorm = resNorm;
@@ -1292,15 +1331,91 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(co
       if (resNorm > prevNorm) break;
       if (it >= m_maxRefinementIterations) break;
       prevNorm = resNorm;
-      DenseMatrix correction(m_size, nrhs);
-      solveTriangularTransposed<Conjugate>(residual, correction);
+      applyPrec(residual, correction);
       solution += correction;
       ++m_lastRefinementIterations;
     }
     solution = best;
+    return;
   }
 
-  x = solution;
+  // BiCGStab, one right-hand-side column at a time.
+  DenseMatrix bcol(n, 1), xcol(n, 1);
+  for (Index c = 0; c < nrhs; ++c) {
+    bcol.col(0) = rhs.col(c);
+    xcol.col(0) = solution.col(c);
+    const Index iters = bicgstabColumn(applyA, applyPrec, bcol, xcol);
+    solution.col(c) = xcol.col(0);
+    m_lastRefinementIterations = numext::maxi(m_lastRefinementIterations, iters);
+  }
+}
+
+// Preconditioned BiCGStab for one column: solve (op) x = b with preconditioner
+// applyPrec ~= op^{-1}, starting from the given x. Returns the best iterate seen
+// (so it never makes the direct solve worse) and the iteration count.
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename ApplyA, typename ApplyPrec>
+Index SupernodalLU<MatrixType, OrderingType, Executor>::bicgstabColumn(ApplyA applyA,
+                                                                       ApplyPrec applyPrec,
+                                                                       const DenseMatrix& b,
+                                                                       DenseMatrix& x) const {
+  const Index n = b.rows();
+  const RealScalar bnorm = b.col(0).norm();
+  const RealScalar threshold = m_refinementTolerance * bnorm;
+
+  DenseMatrix tmp(n, 1);
+  applyA(x, tmp);
+  DenseMatrix r = b - tmp;
+  DenseMatrix best = x;
+  RealScalar bestNorm = r.col(0).norm();
+  if (bestNorm <= threshold) return 0;
+
+  const DenseMatrix rhat = r;  // shadow residual
+  Scalar rho(1), alpha(1), omega(1);
+  DenseMatrix v = DenseMatrix::Zero(n, 1), p = DenseMatrix::Zero(n, 1);
+  DenseMatrix y(n, 1), s(n, 1), z(n, 1), t(n, 1);
+
+  Index iters = 0;
+  for (Index it = 0; it < m_maxRefinementIterations; ++it) {
+    const Scalar rhoNew = rhat.col(0).dot(r.col(0));
+    if (numext::abs(rhoNew) == RealScalar(0)) break;  // breakdown
+    if (it == 0) {
+      p = r;
+    } else {
+      const Scalar beta = (rhoNew / rho) * (alpha / omega);
+      p = r + beta * (p - omega * v);
+    }
+    applyPrec(p, y);  // y = M^{-1} p
+    applyA(y, v);     // v = op y
+    const Scalar denom = rhat.col(0).dot(v.col(0));
+    if (numext::abs(denom) == RealScalar(0)) break;
+    alpha = rhoNew / denom;
+    s = r - alpha * v;
+    ++iters;
+    const RealScalar snorm = s.col(0).norm();
+    if (snorm <= threshold) {
+      x += alpha * y;
+      best = x;
+      break;
+    }
+    applyPrec(s, z);  // z = M^{-1} s
+    applyA(z, t);     // t = op z
+    const Scalar tt = t.col(0).dot(t.col(0));
+    if (numext::abs(tt) == RealScalar(0)) break;
+    omega = t.col(0).dot(s.col(0)) / tt;
+    x += alpha * y + omega * z;
+    r = s - omega * t;
+    rho = rhoNew;
+    const RealScalar rnorm = r.col(0).norm();
+    if (rnorm < bestNorm) {
+      bestNorm = rnorm;
+      best = x;
+    }
+    if (rnorm <= threshold) break;
+    if (numext::abs(omega) == RealScalar(0)) break;  // breakdown
+  }
+  x = best;
+  return iters;
 }
 
 }  // namespace Eigen
