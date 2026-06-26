@@ -337,6 +337,12 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, Index& replacedCount,
                           bool& singular);
 
+  // right-looking BLOCKED unpivoted LU of a dense diagonal block, with static
+  // pivoting. Panels of width kDiagBlockSize keep the trailing update a BLAS-3
+  // GEMM (vs. an unblocked BLAS-2 rank-1 sweep) for wide supernodes.
+  void factorizeDiagonalBlock(DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount,
+                              bool& singular) const;
+
   // group supernodes into elimination-tree levels for parallel scheduling: a
   // supernode's level is 1 + the max level of its update sources.
   void computeSupernodeLevels();
@@ -800,6 +806,51 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
+    DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount, bool& singular) const {
+  const StorageIndex w = static_cast<StorageIndex>(diag.rows());
+  const StorageIndex kDiagBlockSize = 64;  // BLAS-3 panel width (cf. PaStiX MAXSIZEOFBLOCKS)
+
+  for (StorageIndex j0 = 0; j0 < w; j0 += kDiagBlockSize) {
+    const StorageIndex jb = std::min<StorageIndex>(kDiagBlockSize, w - j0);
+    const StorageIndex panelEnd = j0 + jb;
+
+    // (1) unblocked LU of the current panel: columns [j0, panelEnd), all rows
+    //     below (so L21 is formed too). Rank-1 updates stay inside the panel.
+    for (StorageIndex k = j0; k < panelEnd; ++k) {
+      Scalar pivot = diag(k, k);
+      if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
+        pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
+                                                   : pivot * (staticPivot / std::abs(pivot));
+        diag(k, k) = pivot;
+        ++replacedCount;
+      }
+      if (pivot == Scalar(0)) {
+        singular = true;
+        return;
+      }
+      const StorageIndex below = w - k - 1;
+      if (below > 0) {
+        diag.col(k).segment(k + 1, below) /= pivot;
+        const StorageIndex panelTail = panelEnd - (k + 1);
+        if (panelTail > 0)
+          diag.block(k + 1, k + 1, below, panelTail).noalias() -=
+              diag.col(k).segment(k + 1, below) * diag.row(k).segment(k + 1, panelTail);
+      }
+    }
+
+    // (2) U12 = L11^{-1} A12 (TRSM) and (3) A22 -= L21 * U12 (GEMM) — BLAS-3.
+    const StorageIndex trailing = w - panelEnd;
+    if (trailing > 0) {
+      auto upperRight = diag.block(j0, panelEnd, jb, trailing);  // A12, becomes U12
+      diag.block(j0, j0, jb, jb).template triangularView<UnitLower>().solveInPlace(upperRight);
+      diag.block(panelEnd, panelEnd, trailing, trailing).noalias() -=
+          diag.block(panelEnd, j0, trailing, jb) * upperRight;  // L21 * U12
+    }
+  }
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(StorageIndex s,
                                                                           const RealScalar& staticPivot,
                                                                           Index& replacedCount,
@@ -809,27 +860,10 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storag
     applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
 
   DenseMatrix& diag = m_diagonalFactor[s];
-  const StorageIndex w = m_supernodes[s].width();
 
   // unpivoted (static) LU of the diagonal block: packed L (unit) and U.
-  for (StorageIndex k = 0; k < w; ++k) {
-    Scalar pivot = diag(k, k);
-    if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
-      pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
-                                                 : pivot * (staticPivot / std::abs(pivot));
-      diag(k, k) = pivot;
-      ++replacedCount;
-    }
-    if (pivot == Scalar(0)) {
-      singular = true;
-      return;
-    }
-    const StorageIndex tail = w - k - 1;
-    if (tail > 0) {
-      diag.col(k).tail(tail) /= pivot;
-      diag.bottomRightCorner(tail, tail).noalias() -= diag.col(k).tail(tail) * diag.row(k).tail(tail);
-    }
-  }
+  factorizeDiagonalBlock(diag, staticPivot, replacedCount, singular);
+  if (singular) return;
 
   // solve the off-diagonal panels against the diagonal factors.
   if (m_supernodes[s].offDiagonalRowCount > 0) {
