@@ -208,6 +208,14 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index relaxedSize() const { return m_relaxedSize; }
   Index maxAmalgamationZeroRows() const { return m_maxAmalgamationZeroRows; }
 
+  /** Supernode splitting: cap supernode width at maxBlockSize columns by forcing
+   *  extra boundaries (PaStiX MAX_BLOCKSIZE). Splitting adds NO fill (it only
+   *  relocates inter-block entries) and keeps dense panels at a cache-friendly
+   *  size; it also improves parallel load balance (finer, more uniform tasks).
+   *  Default 128; 0 = unlimited (no splitting). Applied during analyzePattern(). */
+  void setMaxBlockSize(Index maxBlockSize) { m_maxBlockSize = maxBlockSize; }
+  Index maxBlockSize() const { return m_maxBlockSize; }
+
   /** Access the parallel-execution backend (e.g. to configure its thread count
    *  for a stateful Executor). The factorization is dispatched through it. */
   Executor& executor() { return m_executor; }
@@ -312,6 +320,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_lastRefinementIterations = 0;
     m_relaxedSize = 4;
     m_maxAmalgamationZeroRows = 4;
+    m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
     m_nnzL = 0;
     m_nnzU = 0;
   }
@@ -407,6 +416,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   mutable Index m_lastRefinementIterations;
   Index m_relaxedSize;                // amalgamation: force-merge below this width
   Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
+  Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
   Index m_nnzL;
   Index m_nnzU;
 };
@@ -581,6 +591,11 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::detectSupernodesAndBlocks
                          (static_cast<Index>(deltaRows) <= m_maxAmalgamationZeroRows);
       start = !merge;
     }
+    // Splitting: force a boundary once the running supernode hits maxBlockSize.
+    // This adds no fill (inter-block entries just move to off-diagonal panels)
+    // and caps dense-panel width for cache- and task-friendly BLAS.
+    if (m_maxBlockSize > 0 && static_cast<Index>(j - currentStart) >= m_maxBlockSize)
+      start = true;
     startsSupernode[j] = start;
     if (start) currentStart = j;
   }
