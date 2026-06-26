@@ -216,6 +216,18 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   void setMaxBlockSize(Index maxBlockSize) { m_maxBlockSize = maxBlockSize; }
   Index maxBlockSize() const { return m_maxBlockSize; }
 
+  /** Row/column equilibration (Ruiz). When on (default), factorize() scales the
+   *  matrix to A~ = Dr*A*Dc so rows/columns have comparable magnitude, which
+   *  improves conditioning, reduces bumped static pivots, and improves backward
+   *  stability. Scaling is folded transparently into solve()/transpose()/
+   *  determinant(), which all operate on the original A. */
+  void setEquilibration(bool on) { m_equilibrate = on; }
+  bool equilibration() const { return m_equilibrate; }
+  /** The computed scaling vectors (original numbering), valid after factorize().
+   *  A~ = diag(rowScaling()) * A * diag(colScaling()). */
+  const std::vector<RealScalar>& rowScaling() const { return m_rowScale; }
+  const std::vector<RealScalar>& colScaling() const { return m_colScale; }
+
   /** Access the parallel-execution backend (e.g. to configure its thread count
    *  for a stateful Executor). The factorization is dispatched through it. */
   Executor& executor() { return m_executor; }
@@ -234,13 +246,14 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     return w;
   }
 
-  /** \returns the determinant of the factored matrix. */
+  /** \returns the determinant of the original matrix A. The factored matrix is
+   *  the equilibrated A~ = Dr*A*Dc, so det(A) = det(A~) / (prod Dr * prod Dc). */
   Scalar determinant() const {
     Scalar det(1);
     for (const auto& diag : m_diagonalFactor) {
       for (Index k = 0; k < diag.rows(); ++k) det *= diag(k, k);
     }
-    return det;
+    return det / m_scalingDeterminant;
   }
 
   // --- factor accessors (Eigen::SparseLU-compatible) ------------------------
@@ -321,6 +334,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_relaxedSize = 4;
     m_maxAmalgamationZeroRows = 4;
     m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
+    m_equilibrate = true;
+    m_scalingDeterminant = RealScalar(1);
     m_nnzL = 0;
     m_nnzU = 0;
   }
@@ -355,6 +370,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // group supernodes into elimination-tree levels for parallel scheduling: a
   // supernode's level is 1 + the max level of its update sources.
   void computeSupernodeLevels();
+
+  // Ruiz row/column equilibration: fill m_rowScale/m_colScale so that the scaled
+  // matrix diag(Dr)*A*diag(Dc) has rows and columns of comparable magnitude.
+  void computeEquilibration(const MatrixType& matrix);
 
   // one block forward/backward triangular solve (no refinement), in the
   // original numbering. Used both for the initial solve and the corrections.
@@ -405,6 +424,12 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // b - A x for iterative refinement.
   MatrixType m_originalMatrix;
 
+  // equilibration: A~ = diag(m_rowScale) * A * diag(m_colScale), both in the
+  // original numbering. m_scalingDeterminant = prod(m_rowScale) * prod(m_colScale).
+  std::vector<RealScalar> m_rowScale;
+  std::vector<RealScalar> m_colScale;
+  RealScalar m_scalingDeterminant;
+
   bool m_analysisDone;
   ComputationInfo m_info;
   std::string m_lastError;
@@ -417,6 +442,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index m_relaxedSize;                // amalgamation: force-merge below this width
   Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
   Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
+  bool m_equilibrate;                 // apply Ruiz row/column scaling
   Index m_nnzL;
   Index m_nnzU;
 };
@@ -821,6 +847,43 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::computeEquilibration(const MatrixType& matrix) {
+  const StorageIndex n = m_size;
+  m_rowScale.assign(n, RealScalar(1));
+  m_colScale.assign(n, RealScalar(1));
+  if (!m_equilibrate) return;
+
+  // Ruiz equilibration: alternately scale rows and columns by 1/sqrt(inf-norm)
+  // until every scaled row/column inf-norm is ~1. Converges geometrically.
+  std::vector<RealScalar> rowMax(n), colMax(n);
+  const int maxIters = 5;
+  for (int iter = 0; iter < maxIters; ++iter) {
+    std::fill(rowMax.begin(), rowMax.end(), RealScalar(0));
+    std::fill(colMax.begin(), colMax.end(), RealScalar(0));
+    for (StorageIndex j = 0; j < n; ++j) {
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+        const StorageIndex i = static_cast<StorageIndex>(it.index());
+        const RealScalar scaled = numext::abs(it.value()) * m_rowScale[i] * m_colScale[j];
+        rowMax[i] = numext::maxi(rowMax[i], scaled);
+        colMax[j] = numext::maxi(colMax[j], scaled);
+      }
+    }
+    RealScalar deviation(0);  // how far the current inf-norms are from 1
+    for (StorageIndex i = 0; i < n; ++i)
+      if (rowMax[i] > RealScalar(0)) {
+        m_rowScale[i] /= numext::sqrt(rowMax[i]);
+        deviation = numext::maxi(deviation, numext::abs(RealScalar(1) - rowMax[i]));
+      }
+    for (StorageIndex j = 0; j < n; ++j)
+      if (colMax[j] > RealScalar(0)) {
+        m_colScale[j] /= numext::sqrt(colMax[j]);
+        deviation = numext::maxi(deviation, numext::abs(RealScalar(1) - colMax[j]));
+      }
+    if (deviation < RealScalar(0.1)) break;
+  }
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
     DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount, bool& singular) const {
   const StorageIndex w = static_cast<StorageIndex>(diag.rows());
@@ -899,14 +962,22 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
   // keep A for iterative refinement during solve().
   m_originalMatrix = matrix;
 
+  // row/column equilibration: factor the scaled matrix A~ = Dr*A*Dc.
+  computeEquilibration(matrix);
+  m_scalingDeterminant = RealScalar(1);
+  for (StorageIndex i = 0; i < m_size; ++i)
+    m_scalingDeterminant *= m_rowScale[i] * m_colScale[i];
+
   // resolve the effective static-pivot threshold. When automatic, scale it to
-  // the matrix magnitude (sqrt(eps) * max|A_ij|, SuperLU_DIST style).
+  // the SCALED matrix magnitude (sqrt(eps) * max|A~_ij|, SuperLU_DIST style).
   RealScalar staticPivot = m_staticPivotThreshold;
   if (m_thresholdIsAuto) {
     RealScalar maxAbs(0);
     for (StorageIndex j = 0; j < m_size; ++j)
-      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it)
-        maxAbs = numext::maxi(maxAbs, numext::abs(it.value()));
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+        const StorageIndex i = static_cast<StorageIndex>(it.index());
+        maxAbs = numext::maxi(maxAbs, numext::abs(it.value()) * m_rowScale[i] * m_colScale[j]);
+      }
     staticPivot = numext::sqrt(NumTraits<RealScalar>::epsilon()) * maxAbs;
   }
 
@@ -929,8 +1000,9 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     const StorageIndex columnSupernode = m_supernodeOfColumn[jj];
     const Supernode& cs = m_supernodes[columnSupernode];
     for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
-      const StorageIndex ii = m_toInternal[static_cast<StorageIndex>(it.index())];
-      const Scalar value = it.value();
+      const StorageIndex origRow = static_cast<StorageIndex>(it.index());
+      const StorageIndex ii = m_toInternal[origRow];
+      const Scalar value = it.value() * m_rowScale[origRow] * m_colScale[j];  // A~ = Dr A Dc
       if (m_supernodeOfColumn[ii] == columnSupernode) {
         m_diagonalFactor[columnSupernode](ii - cs.firstColumn, jj - cs.firstColumn) += value;
       } else if (ii > jj) {  // below-diagonal: owned by the column's supernode
@@ -1088,12 +1160,13 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangular(const Den
   const StorageIndex n = m_size;
   const Index nrhs = rhs.cols();
 
-  // permute right-hand side into the internal numbering, solve, permute back.
+  // Solve A x = rhs via the factors of A~ = Dr*A*Dc: x = Dc * A~^{-1} * (Dr * rhs).
+  // Row-scale + permute in, triangular solves, permute out + column-scale.
   DenseMatrix y(n, nrhs);
-  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = rhs.row(i);
+  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = m_rowScale[i] * rhs.row(i);
   applyInverseL(y);
   applyInverseU(y);
-  for (StorageIndex i = 0; i < n; ++i) x.row(i) = y.row(m_toInternal[i]);
+  for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_colScale[i] * y.row(m_toInternal[i]);
 }
 
 // ===========================================================================
@@ -1174,7 +1247,8 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(D
   }
 }
 
-// A^T = P^T U^T L^T P, so solve A^T x = b as: P b -> U^T solve -> L^T solve -> P^T.
+// A^T = Dc^{-1} A~^T Dr^{-1}, so solve A^T x = rhs as x = Dr * A~^{-T} * (Dc * rhs)
+// (the row/column scalings swap roles vs. the forward solve).
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate>
 void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangularTransposed(const DenseMatrix& rhs,
@@ -1182,10 +1256,10 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangularTransposed
   const StorageIndex n = m_size;
   const Index nrhs = rhs.cols();
   DenseMatrix y(n, nrhs);
-  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = rhs.row(i);
+  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = m_colScale[i] * rhs.row(i);
   applyInverseUTransposed<Conjugate>(y);
   applyInverseLTransposed<Conjugate>(y);
-  for (StorageIndex i = 0; i < n; ++i) x.row(i) = y.row(m_toInternal[i]);
+  for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_rowScale[i] * y.row(m_toInternal[i]);
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>

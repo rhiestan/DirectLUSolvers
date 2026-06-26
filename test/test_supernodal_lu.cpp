@@ -9,6 +9,7 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -120,6 +121,7 @@ void testFactorAccessors() {
 
   Eigen::SupernodalLU<SparseMatrix<double>> solver;
   solver.setMaxIterativeRefinements(0);  // compare the raw factor solve
+  solver.setEquilibration(false);        // accessors expose the factors of A directly
   solver.compute(A);
 
   // manual solve through the L and U factor accessors.
@@ -173,6 +175,44 @@ void testTransposeSolve() {
   check(residA < 1e-8, "adjoint().solve(): A^H x = b", residA);
 }
 
+// Equilibration: a badly-scaled but well-conditioned system. With scaling on
+// (default) it must solve accurately; with it off, the magnitude-relative static
+// pivot threshold bumps many legitimate small pivots and the result degrades.
+void testEquilibration() {
+  SparseMatrix<double> A = randomSymmetricPattern(150, 0.05, 31);  // well-conditioned
+  const int n = static_cast<int>(A.rows());
+
+  // scale rows and columns by wildly different magnitudes (~1e-6 .. 1e6).
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<double> expo(-6.0, 6.0);
+  std::vector<double> dr(n), dc(n);
+  for (int i = 0; i < n; ++i) {
+    dr[i] = std::pow(10.0, expo(rng));
+    dc[i] = std::pow(10.0, expo(rng));
+  }
+  for (int j = 0; j < A.outerSize(); ++j)
+    for (SparseMatrix<double>::InnerIterator it(A, j); it; ++it)
+      it.valueRef() *= dr[it.row()] * dc[j];
+
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  Eigen::SupernodalLU<SparseMatrix<double>> on;  // equilibration on (default)
+  on.compute(A);
+  const VectorXd xOn = on.solve(b);
+  const double residOn = (A * xOn - b).norm() / b.norm();
+
+  Eigen::SupernodalLU<SparseMatrix<double>> off;
+  off.setEquilibration(false);
+  off.compute(A);
+  const VectorXd xOff = off.solve(b);
+  const double residOff = (A * xOff - b).norm() / b.norm();
+
+  check(residOn < 1e-8, "equilibration solves badly-scaled system", residOn);
+  std::printf("        scaling off: resid=%.2e (bumped %lld) | on: resid=%.2e (bumped %lld)\n",
+              residOff, (long long)off.replacedPivots(), residOn, (long long)on.replacedPivots());
+}
+
 void testMultipleRhs() {
   SparseMatrix<double> A = laplacian2d(8, 8);
   const int n = static_cast<int>(A.rows());
@@ -206,6 +246,7 @@ int main() {
   testMultipleRhs();
   testFactorAccessors();
   testTransposeSolve();
+  testEquilibration();
 
   std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
               g_failures, g_failures == 1 ? "" : "s");
