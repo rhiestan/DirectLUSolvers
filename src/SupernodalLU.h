@@ -4,9 +4,9 @@
 // Scope of this implementation:
 //   * General (unsymmetric) values with a SYMMETRIC nonzero pattern.
 //   * LU factorization with STATIC pivoting (no row interchanges); small pivots
-//     can optionally be bumped to a threshold to preserve the static block
-//     structure. Accuracy on such matrices is meant to be recovered with
-//     iterative refinement (not yet included).
+//     are bumped to a threshold (automatic by default) to preserve the static
+//     block structure. The accuracy lost to that perturbation is recovered by
+//     iterative refinement, applied automatically during solve().
 //   * Single-threaded, no MPI. Modeled on the public interface of
 //     Eigen::SparseLU so it can be used as a drop-in solver.
 //
@@ -106,13 +106,35 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   const PermutationType& colsPermutation() const { return m_permutation; }
 
   /** Magnitude below which a diagonal pivot is replaced (static pivoting).
-   *  Default 0 = no replacement (pure unpivoted LU). */
-  void setStaticPivotThreshold(const RealScalar& threshold) { m_staticPivotThreshold = threshold; }
+   *  By default the threshold is chosen automatically at factorization time as
+   *  sqrt(epsilon) * max|A_ij|, which steps over zero/tiny pivots while barely
+   *  perturbing well-conditioned matrices. Pass any value (including 0, to
+   *  disable replacement) to override the automatic choice. */
+  void setStaticPivotThreshold(const RealScalar& threshold) {
+    m_staticPivotThreshold = threshold;
+    m_thresholdIsAuto = false;
+  }
   /** Eigen::SparseLU-compatible alias. */
   void setPivotThreshold(const RealScalar& threshold) { setStaticPivotThreshold(threshold); }
 
   /** Number of pivots that were replaced during the last factorization. */
   Index replacedPivots() const { return m_replacedPivots; }
+
+  /** Maximum number of iterative-refinement steps applied during solve().
+   *  Refinement cheaply recovers the accuracy lost to static pivoting by
+   *  reusing the stored factors; it stops early once the relative residual
+   *  meets refinementTolerance() or stops improving. Default 5; set 0 to
+   *  disable. */
+  void setMaxIterativeRefinements(Index iters) { m_maxRefinementIterations = iters; }
+  Index maxIterativeRefinements() const { return m_maxRefinementIterations; }
+
+  /** Relative-residual target ||b - A x|| / ||b|| at which refinement stops.
+   *  Default is the working precision (NumTraits epsilon). */
+  void setRefinementTolerance(const RealScalar& tol) { m_refinementTolerance = tol; }
+  RealScalar refinementTolerance() const { return m_refinementTolerance; }
+
+  /** Number of refinement steps actually taken by the last solve(). */
+  Index iterativeRefinements() const { return m_lastRefinementIterations; }
 
   Index nnzL() const { return m_nnzL; }
   Index nnzU() const { return m_nnzU; }
@@ -139,7 +161,11 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_analysisDone = false;
     m_info = InvalidInput;
     m_staticPivotThreshold = RealScalar(0);
+    m_thresholdIsAuto = true;
     m_replacedPivots = 0;
+    m_maxRefinementIterations = 5;
+    m_refinementTolerance = NumTraits<RealScalar>::epsilon();
+    m_lastRefinementIterations = 0;
     m_nnzL = 0;
     m_nnzU = 0;
   }
@@ -157,6 +183,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
 
   // numeric helper: subtract the Schur contribution of a source supernode.
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex facingBlock);
+
+  // one block forward/backward triangular solve (no refinement), in the
+  // original numbering. Used both for the initial solve and the corrections.
+  void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
 
   // state ---------------------------------------------------------------------
   StorageIndex m_size;
@@ -179,11 +209,19 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   std::vector<DenseMatrix> m_lowerFactor;     // offDiag x w
   std::vector<DenseMatrix> m_upperFactor;     // w x offDiag
 
+  // a copy of A in the original numbering, kept so solve() can form residuals
+  // b - A x for iterative refinement.
+  MatrixType m_originalMatrix;
+
   bool m_analysisDone;
   ComputationInfo m_info;
   std::string m_lastError;
   RealScalar m_staticPivotThreshold;
+  bool m_thresholdIsAuto;
   Index m_replacedPivots;
+  Index m_maxRefinementIterations;
+  RealScalar m_refinementTolerance;
+  mutable Index m_lastRefinementIterations;
   Index m_nnzL;
   Index m_nnzU;
 };
@@ -538,6 +576,20 @@ void SupernodalLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix)
   m_replacedPivots = 0;
   m_info = Success;
 
+  // keep A for iterative refinement during solve().
+  m_originalMatrix = matrix;
+
+  // resolve the effective static-pivot threshold. When automatic, scale it to
+  // the matrix magnitude (sqrt(eps) * max|A_ij|, SuperLU_DIST style).
+  RealScalar staticPivot = m_staticPivotThreshold;
+  if (m_thresholdIsAuto) {
+    RealScalar maxAbs(0);
+    for (StorageIndex j = 0; j < m_size; ++j)
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it)
+        maxAbs = numext::maxi(maxAbs, numext::abs(it.value()));
+    staticPivot = numext::sqrt(NumTraits<RealScalar>::epsilon()) * maxAbs;
+  }
+
   // 1) allocate and zero the dense panels.
   m_diagonalFactor.resize(supernodeNbr);
   m_lowerFactor.resize(supernodeNbr);
@@ -595,9 +647,9 @@ void SupernodalLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix)
     // unpivoted (static) LU of the diagonal block: packed L (unit) and U.
     for (StorageIndex k = 0; k < w; ++k) {
       Scalar pivot = diag(k, k);
-      if (m_staticPivotThreshold > RealScalar(0) && std::abs(pivot) < m_staticPivotThreshold) {
-        pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(m_staticPivotThreshold)
-                                                   : pivot * (m_staticPivotThreshold / std::abs(pivot));
+      if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
+        pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
+                                                   : pivot * (staticPivot / std::abs(pivot));
         diag(k, k) = pivot;
         ++m_replacedPivots;
       }
@@ -643,12 +695,53 @@ template <typename MatrixType, typename OrderingType>
 template <typename Rhs, typename Dest>
 void SupernodalLU<MatrixType, OrderingType>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
   eigen_assert(m_info == Success && "the matrix must be factorized first");
-  const StorageIndex n = m_size;
   const Index nrhs = b.cols();
+
+  const DenseMatrix rhs = b;            // materialize the right-hand side
+  DenseMatrix solution(m_size, nrhs);
+  solveTriangular(rhs, solution);
+
+  // iterative refinement: solution <- solution + (LU)^{-1} (b - A solution).
+  // Static pivoting perturbs the factors; this cheaply restores accuracy. We
+  // keep the best iterate seen and stop on convergence, divergence, or the
+  // iteration cap, so an unrecoverable matrix cannot blow the answer up.
+  m_lastRefinementIterations = 0;
+  const RealScalar rhsNorm = rhs.norm();
+  if (m_maxRefinementIterations > 0 && rhsNorm > RealScalar(0)) {
+    DenseMatrix best = solution;
+    RealScalar bestNorm = NumTraits<RealScalar>::highest();
+    RealScalar prevNorm = NumTraits<RealScalar>::highest();
+    for (Index it = 0; ; ++it) {
+      const DenseMatrix residual = rhs - m_originalMatrix * solution;
+      const RealScalar resNorm = residual.norm();
+      if (resNorm < bestNorm) {
+        bestNorm = resNorm;
+        best = solution;
+      }
+      if (resNorm <= m_refinementTolerance * rhsNorm) break;  // converged
+      if (resNorm > prevNorm) break;                          // diverging: keep best
+      if (it >= m_maxRefinementIterations) break;             // cap reached
+      prevNorm = resNorm;
+      DenseMatrix correction(m_size, nrhs);
+      solveTriangular(residual, correction);
+      solution += correction;
+      ++m_lastRefinementIterations;
+    }
+    solution = best;
+  }
+
+  x = solution;
+}
+
+template <typename MatrixType, typename OrderingType>
+void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& rhs,
+                                                             DenseMatrix& x) const {
+  const StorageIndex n = m_size;
+  const Index nrhs = rhs.cols();
 
   // permute right-hand side into the internal numbering.
   DenseMatrix y(n, nrhs);
-  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = b.row(i);
+  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = rhs.row(i);
 
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
 

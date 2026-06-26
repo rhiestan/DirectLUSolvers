@@ -131,15 +131,18 @@ struct Result {
   std::string note;
 };
 
-// threshold <= 0 disables static pivoting. refineSteps > 0 enables iterative
-// refinement (re-using the stored factorization), stopping early once the
-// relative residual is at machine-precision level.
+// When refine==false we disable both built-in features (pure unpivoted LU) to
+// show the raw behavior; otherwise we rely on the solver's own defaults
+// (automatic static-pivot threshold + built-in iterative refinement).
 Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue,
-                     double threshold, int refineSteps) {
+                     bool refine) {
   Result r;
   Eigen::SupernodalLU<SparseMatrix<double>> solver;
   try {
-    if (threshold > 0.0) solver.setStaticPivotThreshold(threshold);
+    if (!refine) {
+      solver.setStaticPivotThreshold(0.0);
+      solver.setMaxIterativeRefinements(0);
+    }
     auto t0 = Clock::now();
     solver.compute(A);
     auto t1 = Clock::now();
@@ -148,21 +151,15 @@ Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const Vec
       return r;
     }
     VectorXd x = solver.solve(b);
-    const double bn = b.norm();
-    for (int it = 0; it < refineSteps; ++it) {
-      VectorXd resid = b - A * x;
-      if (resid.norm() / bn < 1e-14) break;
-      x += solver.solve(resid);
-      ++r.refineIters;
-    }
     auto t2 = Clock::now();
     r.factorMs = ms(t0, t1);
     r.solveMs = ms(t1, t2);
     r.err = (x - xTrue).norm() / xTrue.norm();
-    r.resid = (A * x - b).norm() / bn;
+    r.resid = (A * x - b).norm() / b.norm();
     r.nnzL = solver.nnzL();
     r.nnzU = solver.nnzU();
     r.replaced = solver.replacedPivots();
+    r.refineIters = static_cast<int>(solver.iterativeRefinements());
     r.ok = true;
   } catch (const std::exception& e) {
     r.note = std::string("threw: ") + e.what();
@@ -233,13 +230,8 @@ int main(int argc, char** argv) {
     VectorXd xTrue = VectorXd::Random(A.rows());
     VectorXd b = Asym * xTrue;
 
-    // Static-pivot threshold ~ sqrt(eps) * max|A_ij| (SuperLU_DIST style): big
-    // enough to step over zero/tiny pivots, small enough to barely perturb A.
-    const double scale = Asym.coeffs().cwiseAbs().maxCoeff();
-    const double threshold = std::sqrt(std::numeric_limits<double>::epsilon()) * scale;
-
-    Result plain = runSupernodal(Asym, b, xTrue, /*threshold=*/0.0, /*refine=*/0);
-    Result piv = runSupernodal(Asym, b, xTrue, threshold, /*refine=*/30);
+    Result plain = runSupernodal(Asym, b, xTrue, /*refine=*/false);
+    Result piv = runSupernodal(Asym, b, xTrue, /*refine=*/true);
     Result ref = runSparseLU(Asym, b, xTrue);
 
     auto report = [](const char* name, const Result& r) {
@@ -253,8 +245,8 @@ int main(int argc, char** argv) {
         std::printf("  %-22s  DID NOT SOLVE: %s\n", name, r.note.c_str());
       }
     };
-    report("SupernodalLU (plain)", plain);
-    report("SupernodalLU (pivot+refine)", piv);
+    report("SupernodalLU (no pivot)", plain);
+    report("SupernodalLU (defaults)", piv);
     report("Eigen SparseLU", ref);
 
     const bool pivAccurate = piv.ok && piv.resid < 1e-6;
