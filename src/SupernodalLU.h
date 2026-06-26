@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "SupernodalLUSupport.h"
+#include "SupernodalLUExecutor.h"
 
 namespace Eigen {
 
@@ -83,6 +84,9 @@ class SupernodalLUTransposeView
  *
  * \tparam MatrixType_   A column-major Eigen::SparseMatrix<Scalar, ColMajor, StorageIndex>.
  * \tparam OrderingType_ A fill-reducing ordering functor (default AMDOrdering).
+ * \tparam Executor_     A parallel-execution backend (default SerialExecutor);
+ *                       see SupernodalLUExecutor.h. Controls how the numeric
+ *                       factorization is parallelized over the elimination tree.
  *
  * Typical usage (identical to Eigen::SparseLU):
  * \code
@@ -90,16 +94,24 @@ class SupernodalLUTransposeView
  *   solver.compute(A);
  *   x = solver.solve(b);
  * \endcode
+ *
+ * To factor in parallel with the bundled std::thread pool:
+ * \code
+ *   SupernodalLU<SparseMatrix<double>, AMDOrdering<int>,
+ *                supernodal_lu::StdThreadExecutor> solver;
+ * \endcode
  */
-template <typename MatrixType_, typename OrderingType_ = AMDOrdering<typename MatrixType_::StorageIndex>>
-class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingType_>> {
+template <typename MatrixType_, typename OrderingType_ = AMDOrdering<typename MatrixType_::StorageIndex>,
+          typename Executor_ = supernodal_lu::SerialExecutor>
+class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingType_, Executor_>> {
  protected:
-  typedef SparseSolverBase<SupernodalLU<MatrixType_, OrderingType_>> Base;
+  typedef SparseSolverBase<SupernodalLU<MatrixType_, OrderingType_, Executor_>> Base;
   using Base::m_isInitialized;
 
  public:
   typedef MatrixType_ MatrixType;
   typedef OrderingType_ OrderingType;
+  typedef Executor_ Executor;
   typedef typename MatrixType::Scalar Scalar;
   typedef typename MatrixType::RealScalar RealScalar;
   typedef typename MatrixType::StorageIndex StorageIndex;
@@ -196,9 +208,23 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index relaxedSize() const { return m_relaxedSize; }
   Index maxAmalgamationZeroRows() const { return m_maxAmalgamationZeroRows; }
 
+  /** Access the parallel-execution backend (e.g. to configure its thread count
+   *  for a stateful Executor). The factorization is dispatched through it. */
+  Executor& executor() { return m_executor; }
+  const Executor& executor() const { return m_executor; }
+
   Index nnzL() const { return m_nnzL; }
   Index nnzU() const { return m_nnzU; }
   Index supernodeCount() const { return static_cast<Index>(m_supernodes.size()); }
+
+  /** Number of elimination-tree levels (parallel scheduling steps). */
+  Index levelCount() const { return static_cast<Index>(m_levelGroups.size()); }
+  /** Supernodes in the widest level — an upper bound on usable concurrency. */
+  Index widestLevel() const {
+    Index w = 0;
+    for (const auto& g : m_levelGroups) w = std::max<Index>(w, static_cast<Index>(g.size()));
+    return w;
+  }
 
   /** \returns the determinant of the factored matrix. */
   Scalar determinant() const {
@@ -304,6 +330,17 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // numeric helper: subtract the Schur contribution of a source supernode.
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex facingBlock);
 
+  // factor one supernode in place: pull its Schur updates, do the unpivoted LU
+  // of its diagonal block, then solve its off-diagonal panels. Writes only this
+  // supernode's panels, so supernodes in the same elimination-tree level run
+  // concurrently. Reports its local replaced-pivot count and singularity.
+  void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, Index& replacedCount,
+                          bool& singular);
+
+  // group supernodes into elimination-tree levels for parallel scheduling: a
+  // supernode's level is 1 + the max level of its update sources.
+  void computeSupernodeLevels();
+
   // one block forward/backward triangular solve (no refinement), in the
   // original numbering. Used both for the initial solve and the corrections.
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
@@ -339,6 +376,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   std::vector<std::vector<UpdateSource>> m_updateSources;  // per target supernode
   // m_rowPosition[s][internalRow] = position of that off-diagonal row in supernode s
   std::vector<std::unordered_map<StorageIndex, StorageIndex>> m_rowPosition;
+  // m_levelGroups[level] = supernodes that can be factored concurrently.
+  std::vector<std::vector<StorageIndex>> m_levelGroups;
+
+  Executor m_executor;  // parallel-execution backend (default serial)
 
   // numeric factors (one entry per supernode)
   std::vector<DenseMatrix> m_diagonalFactor;  // w x w  (packed LU)
@@ -368,8 +409,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
 //  Analysis (symbolic) phase
 // ===========================================================================
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::buildSymmetricAdjacency(
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::buildSymmetricAdjacency(
     const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency) const {
   const StorageIndex n = m_size;
   adjacency.assign(n, std::vector<StorageIndex>());
@@ -392,8 +433,8 @@ void SupernodalLU<MatrixType, OrderingType>::buildSymmetricAdjacency(
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::computeEliminationTree(
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::computeEliminationTree(
     const std::vector<std::vector<StorageIndex>>& adjacency, std::vector<StorageIndex>& parent) const {
   const StorageIndex n = m_size;
   parent.assign(n, StorageIndex(-1));
@@ -416,8 +457,8 @@ void SupernodalLU<MatrixType, OrderingType>::computeEliminationTree(
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::computePostorder(const std::vector<StorageIndex>& parent,
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::computePostorder(const std::vector<StorageIndex>& parent,
                                                               std::vector<StorageIndex>& postorder) const {
   const StorageIndex n = m_size;
   // children lists
@@ -453,8 +494,8 @@ void SupernodalLU<MatrixType, OrderingType>::computePostorder(const std::vector<
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::computeColumnStructures(
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::computeColumnStructures(
     const std::vector<std::vector<StorageIndex>>& adjacency, const std::vector<StorageIndex>& parent,
     std::vector<std::vector<StorageIndex>>& columnStructure) const {
   const StorageIndex n = m_size;
@@ -492,8 +533,8 @@ void SupernodalLU<MatrixType, OrderingType>::computeColumnStructures(
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::detectSupernodesAndBlocks(
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::detectSupernodesAndBlocks(
     const std::vector<StorageIndex>& parent, const std::vector<std::vector<StorageIndex>>& columnStructure) {
   const StorageIndex n = m_size;
 
@@ -626,8 +667,26 @@ void SupernodalLU<MatrixType, OrderingType>::detectSupernodesAndBlocks(
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& matrix) {
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodeLevels() {
+  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
+  std::vector<StorageIndex> level(supernodeNbr, 0);
+  StorageIndex maxLevel = 0;
+  // Update sources of supernode s are tree descendants, so they have smaller
+  // ids; processing in increasing id order means level[source] is already final.
+  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
+    StorageIndex lv = 0;
+    for (const UpdateSource& src : m_updateSources[s])
+      lv = std::max<StorageIndex>(lv, static_cast<StorageIndex>(level[src.sourceSupernode] + 1));
+    level[s] = lv;
+    maxLevel = std::max(maxLevel, lv);
+  }
+  m_levelGroups.assign(supernodeNbr == 0 ? 0 : (maxLevel + 1), std::vector<StorageIndex>());
+  for (StorageIndex s = 0; s < supernodeNbr; ++s) m_levelGroups[level[s]].push_back(s);
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const MatrixType& matrix) {
   eigen_assert(matrix.rows() == matrix.cols() && "SupernodalLU requires a square matrix");
   m_size = static_cast<StorageIndex>(matrix.rows());
   const StorageIndex n = m_size;
@@ -668,6 +727,9 @@ void SupernodalLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& ma
   // 6) supernode partition + block structure + update lists.
   detectSupernodesAndBlocks(parent, columnStructure);
 
+  // 7) elimination-tree levels for parallel factorization scheduling.
+  computeSupernodeLevels();
+
   // inverse permutation + public permutation object.
   m_toOriginal.resize(n);
   for (StorageIndex i = 0; i < n; ++i) m_toOriginal[m_toInternal[i]] = i;
@@ -683,8 +745,8 @@ void SupernodalLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& ma
 //  Numeric factorization phase
 // ===========================================================================
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::applyUpdate(StorageIndex source, StorageIndex target,
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex source, StorageIndex target,
                                                          StorageIndex firstFacingBlock) {
   const Supernode& src = m_supernodes[source];
   const StorageIndex wSrc = src.width();
@@ -737,8 +799,49 @@ void SupernodalLU<MatrixType, OrderingType>::applyUpdate(StorageIndex source, St
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix) {
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(StorageIndex s,
+                                                                          const RealScalar& staticPivot,
+                                                                          Index& replacedCount,
+                                                                          bool& singular) {
+  // pull contributions from already-factored sources (lower levels).
+  for (const UpdateSource& source : m_updateSources[s])
+    applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
+
+  DenseMatrix& diag = m_diagonalFactor[s];
+  const StorageIndex w = m_supernodes[s].width();
+
+  // unpivoted (static) LU of the diagonal block: packed L (unit) and U.
+  for (StorageIndex k = 0; k < w; ++k) {
+    Scalar pivot = diag(k, k);
+    if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
+      pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
+                                                 : pivot * (staticPivot / std::abs(pivot));
+      diag(k, k) = pivot;
+      ++replacedCount;
+    }
+    if (pivot == Scalar(0)) {
+      singular = true;
+      return;
+    }
+    const StorageIndex tail = w - k - 1;
+    if (tail > 0) {
+      diag.col(k).tail(tail) /= pivot;
+      diag.bottomRightCorner(tail, tail).noalias() -= diag.col(k).tail(tail) * diag.row(k).tail(tail);
+    }
+  }
+
+  // solve the off-diagonal panels against the diagonal factors.
+  if (m_supernodes[s].offDiagonalRowCount > 0) {
+    // lowerFactor := lowerFactor * U_kk^{-1}
+    diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(m_lowerFactor[s]);
+    // upperFactor := L_kk^{-1} * upperFactor
+    diag.template triangularView<UnitLower>().solveInPlace(m_upperFactor[s]);
+  }
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType& matrix) {
   eigen_assert(m_analysisDone && "analyzePattern must be called before factorize");
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   m_replacedPivots = 0;
@@ -803,43 +906,33 @@ void SupernodalLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix)
     }
   }
 
-  // 3) left-looking supernodal factorization.
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
-    // pull contributions from already-factored supernodes.
-    for (const UpdateSource& source : m_updateSources[s])
-      applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
+  // 3) left-looking supernodal factorization, scheduled by elimination-tree
+  //    levels: all supernodes within a level are independent (each writes only
+  //    its own panels) and are dispatched concurrently; levels run in order so
+  //    every update source is already factored. Per-supernode outputs are kept
+  //    in disjoint slots to avoid shared writes during the parallel region.
+  std::vector<Index> replacedPerSupernode(supernodeNbr, 0);
+  std::vector<char> singularPerSupernode(supernodeNbr, 0);
+  bool singular = false;
+  for (const std::vector<StorageIndex>& group : m_levelGroups) {
+    const Index groupSize = static_cast<Index>(group.size());
+    m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
+      const StorageIndex s = group[static_cast<std::size_t>(k)];
+      bool localSingular = false;
+      factorizeSupernode(s, staticPivot, replacedPerSupernode[s], localSingular);
+      singularPerSupernode[s] = localSingular ? 1 : 0;
+    });
+    for (StorageIndex s : group)
+      if (singularPerSupernode[s]) singular = true;
+    if (singular) break;  // factor is unusable; stop launching further levels
+  }
 
-    DenseMatrix& diag = m_diagonalFactor[s];
-    const StorageIndex w = m_supernodes[s].width();
-
-    // unpivoted (static) LU of the diagonal block: packed L (unit) and U.
-    for (StorageIndex k = 0; k < w; ++k) {
-      Scalar pivot = diag(k, k);
-      if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
-        pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
-                                                   : pivot * (staticPivot / std::abs(pivot));
-        diag(k, k) = pivot;
-        ++m_replacedPivots;
-      }
-      if (pivot == Scalar(0)) {
-        m_info = NumericalIssue;
-        m_lastError = "SupernodalLU: zero pivot encountered (matrix is singular).";
-        return;
-      }
-      const StorageIndex tail = w - k - 1;
-      if (tail > 0) {
-        diag.col(k).tail(tail) /= pivot;
-        diag.bottomRightCorner(tail, tail).noalias() -= diag.col(k).tail(tail) * diag.row(k).tail(tail);
-      }
-    }
-
-    // solve the off-diagonal panels against the diagonal factors.
-    if (m_supernodes[s].offDiagonalRowCount > 0) {
-      // lowerFactor := lowerFactor * U_kk^{-1}
-      diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(m_lowerFactor[s]);
-      // upperFactor := L_kk^{-1} * upperFactor
-      diag.template triangularView<UnitLower>().solveInPlace(m_upperFactor[s]);
-    }
+  m_replacedPivots = 0;
+  for (Index r : replacedPerSupernode) m_replacedPivots += r;
+  if (singular) {
+    m_info = NumericalIssue;
+    m_lastError = "SupernodalLU: zero pivot encountered (matrix is singular).";
+    return;
   }
 
   // 4) book-keeping: nonzero counts.
@@ -859,9 +952,9 @@ void SupernodalLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix)
 //  Solve phase
 // ===========================================================================
 
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Rhs, typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
+void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
   eigen_assert(m_info == Success && "the matrix must be factorized first");
   const Index nrhs = b.cols();
 
@@ -903,9 +996,9 @@ void SupernodalLU<MatrixType, OrderingType>::_solve_impl(const MatrixBase<Rhs>& 
 
 // Forward substitution L y = y (unit-lower), in place, on an internal-numbered
 // right-hand side. Shared by the full solve and matrixL().solveInPlace().
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::applyInverseL(Dest& y) const {
+void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
@@ -922,9 +1015,9 @@ void SupernodalLU<MatrixType, OrderingType>::applyInverseL(Dest& y) const {
 
 // Backward substitution U y = y (upper), in place, on an internal-numbered
 // right-hand side. Shared by the full solve and matrixU().solveInPlace().
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::applyInverseU(Dest& y) const {
+void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseU(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
     const Supernode& sn = m_supernodes[s];
@@ -940,8 +1033,8 @@ void SupernodalLU<MatrixType, OrderingType>::applyInverseU(Dest& y) const {
   }
 }
 
-template <typename MatrixType, typename OrderingType>
-void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& rhs,
+template <typename MatrixType, typename OrderingType, typename Executor>
+void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangular(const DenseMatrix& rhs,
                                                              DenseMatrix& x) const {
   const StorageIndex n = m_size;
   const Index nrhs = rhs.cols();
@@ -958,16 +1051,16 @@ void SupernodalLU<MatrixType, OrderingType>::solveTriangular(const DenseMatrix& 
 //  matrixL() / matrixU() factor accessors
 // ===========================================================================
 
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::SupernodalLUMatrixLReturnType::solveInPlace(
+void SupernodalLU<MatrixType, OrderingType, Executor>::SupernodalLUMatrixLReturnType::solveInPlace(
     MatrixBase<Dest>& x) const {
   m_solver.applyInverseL(x.derived());
 }
 
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::SupernodalLUMatrixUReturnType::solveInPlace(
+void SupernodalLU<MatrixType, OrderingType, Executor>::SupernodalLUMatrixUReturnType::solveInPlace(
     MatrixBase<Dest>& x) const {
   m_solver.applyInverseU(x.derived());
 }
@@ -979,9 +1072,9 @@ void SupernodalLU<MatrixType, OrderingType>::SupernodalLUMatrixUReturnType::solv
 // Solve U^T y = y (Conjugate=false) or U^H y = y, in place, internal numbering.
 // U^T is lower-triangular, so this is a forward sweep mirroring applyInverseL:
 // diagonal solve, then push the result down to higher-index rows via U's panel.
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::applyInverseUTransposed(Dest& y) const {
+void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseUTransposed(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
@@ -1007,9 +1100,9 @@ void SupernodalLU<MatrixType, OrderingType>::applyInverseUTransposed(Dest& y) co
 // L^T is unit-upper-triangular, so this is a backward sweep mirroring
 // applyInverseU: pull contributions from higher-index rows via L's panel, then
 // the (unit) diagonal solve.
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::applyInverseLTransposed(Dest& y) const {
+void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
     const Supernode& sn = m_supernodes[s];
@@ -1033,9 +1126,9 @@ void SupernodalLU<MatrixType, OrderingType>::applyInverseLTransposed(Dest& y) co
 }
 
 // A^T = P^T U^T L^T P, so solve A^T x = b as: P b -> U^T solve -> L^T solve -> P^T.
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate>
-void SupernodalLU<MatrixType, OrderingType>::solveTriangularTransposed(const DenseMatrix& rhs,
+void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangularTransposed(const DenseMatrix& rhs,
                                                                        DenseMatrix& x) const {
   const StorageIndex n = m_size;
   const Index nrhs = rhs.cols();
@@ -1046,9 +1139,9 @@ void SupernodalLU<MatrixType, OrderingType>::solveTriangularTransposed(const Den
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = y.row(m_toInternal[i]);
 }
 
-template <typename MatrixType, typename OrderingType>
+template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Rhs, typename Dest>
-void SupernodalLU<MatrixType, OrderingType>::_solve_transposed_impl(const MatrixBase<Rhs>& b,
+void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(const MatrixBase<Rhs>& b,
                                                                     MatrixBase<Dest>& x) const {
   eigen_assert(m_info == Success && "the matrix must be factorized first");
   const Index nrhs = b.cols();
