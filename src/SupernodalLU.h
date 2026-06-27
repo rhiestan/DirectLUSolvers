@@ -74,7 +74,7 @@ class SupernodalLUTransposeView
 
   template <typename Rhs, typename Dest>
   void _solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
-    eigen_assert(m_solver && m_solver->info() == Success &&
+    eigen_assert(m_solver && m_solver->isFactorized() &&
                  "the matrix must be factorized first");
     m_solver->template _solve_transposed_impl<Conjugate>(b, x);
   }
@@ -158,8 +158,18 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   inline Index rows() const { return m_size; }
   inline Index cols() const { return m_size; }
 
-  /** \returns Success if (numeric) factorization succeeded. */
+  /** \returns the status of the last operation. After compute()/factorize() this
+   *  is Success unless the factorization broke down (singular). After solve() it
+   *  is downgraded to NumericalIssue if the computed solution failed the honesty
+   *  check (non-finite, or relative residual above solveFailureThreshold()) — so
+   *  a usable-looking result is never silently returned for an unsolvable system.
+   *  A subsequent solve() with a good right-hand side restores Success. */
   ComputationInfo info() const { return m_info; }
+
+  /** \returns true once a numeric factorization has completed successfully. This
+   *  is the guard for solve(); unlike info() it is NOT affected by a failed
+   *  solve, so the factors stay usable for further right-hand sides. */
+  bool isFactorized() const { return m_factorized; }
 
   const std::string& lastErrorMessage() const { return m_lastError; }
 
@@ -203,6 +213,20 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
 
   /** Number of refinement steps actually taken by the last solve(). */
   Index iterativeRefinements() const { return m_lastRefinementIterations; }
+
+  /** Relative-residual ceiling above which solve() reports failure (NumericalIssue).
+   *  After every solve the true relative residual ||b - A x|| / ||b|| is measured
+   *  against the original A; if it exceeds this threshold (or the solution is
+   *  non-finite) info() becomes NumericalIssue instead of silently returning a
+   *  bad answer. The default (1e-6) flags genuinely broken solves — e.g. a matrix
+   *  whose diagonal is unusable so every static pivot is replaced — while leaving
+   *  ordinary, well-converged solves reported as Success. */
+  void setSolveFailureThreshold(const RealScalar& tol) { m_solveFailureThreshold = tol; }
+  RealScalar solveFailureThreshold() const { return m_solveFailureThreshold; }
+
+  /** The relative residual ||b - A x|| / ||b|| measured by the last solve(),
+   *  against the original (unscaled) matrix. */
+  RealScalar solveResidual() const { return m_lastSolveRelativeResidual; }
 
   /** Amalgamation (relaxed supernodes): merge fundamental supernodes along
    *  elimination-tree paths into larger dense panels for better BLAS-3
@@ -337,7 +361,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   void init() {
     m_size = 0;
     m_analysisDone = false;
+    m_factorized = false;
     m_info = InvalidInput;
+    m_solveFailureThreshold = RealScalar(1e-6);
+    m_lastSolveRelativeResidual = RealScalar(0);
     m_staticPivotThreshold = RealScalar(0);
     m_thresholdIsAuto = true;
     m_replacedPivots = 0;
@@ -392,6 +419,13 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // one block forward/backward triangular solve (no refinement), in the
   // original numbering. Used both for the initial solve and the corrections.
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
+
+  // honesty check shared by the forward and transposed solves: measure the true
+  // relative residual ||rhs - op*solution|| / ||rhs|| (op via applyA) and set
+  // m_info to Success, or NumericalIssue if the solution is non-finite or the
+  // residual exceeds m_solveFailureThreshold. Records m_lastSolveRelativeResidual.
+  template <typename ApplyA>
+  void recordSolveStatus(const DenseMatrix& rhs, const DenseMatrix& solution, ApplyA applyA) const;
 
   // in-place triangular solves in the internal numbering: L y = y (unit lower)
   // and U y = y. Shared by solveTriangular and the matrixL()/matrixU() proxies.
@@ -457,8 +491,11 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   RealScalar m_scalingDeterminant;
 
   bool m_analysisDone;
-  ComputationInfo m_info;
-  std::string m_lastError;
+  bool m_factorized;            // a successful numeric factorization is available
+  mutable ComputationInfo m_info;     // status of the last operation (solve may set it)
+  mutable std::string m_lastError;
+  RealScalar m_solveFailureThreshold;               // relative-residual ceiling for solve()
+  mutable RealScalar m_lastSolveRelativeResidual;   // residual measured by the last solve()
   RealScalar m_staticPivotThreshold;
   bool m_thresholdIsAuto;
   Index m_replacedPivots;
@@ -984,6 +1021,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
   eigen_assert(m_analysisDone && "analyzePattern must be called before factorize");
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   m_replacedPivots = 0;
+  m_factorized = false;
   m_info = Success;
 
   // keep A for iterative refinement during solve().
@@ -1093,6 +1131,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     m_nnzU += Index(w) * Index(w + 1) / 2 + Index(w) * Index(r);  // upper diag (incl) + upper panel
   }
 
+  m_factorized = true;
   m_isInitialized = true;
 }
 
@@ -1103,7 +1142,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Rhs, typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
-  eigen_assert(m_info == Success && "the matrix must be factorized first");
+  eigen_assert(m_factorized && "the matrix must be factorized first");
   const Index nrhs = b.cols();
 
   const DenseMatrix rhs = b;            // materialize the right-hand side
@@ -1111,11 +1150,11 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixB
   solveTriangular(rhs, solution);       // initial direct factor solve
 
   // refine against A, preconditioned by the LU factors (M^{-1} = solveTriangular).
-  refineSolution(
-      rhs, solution,
-      [this](const DenseMatrix& in, DenseMatrix& out) { out.noalias() = m_originalMatrix * in; },
-      [this](const DenseMatrix& in, DenseMatrix& out) { solveTriangular(in, out); });
+  auto applyA = [this](const DenseMatrix& in, DenseMatrix& out) { out.noalias() = m_originalMatrix * in; };
+  refineSolution(rhs, solution, applyA,
+                 [this](const DenseMatrix& in, DenseMatrix& out) { solveTriangular(in, out); });
 
+  recordSolveStatus(rhs, solution, applyA);  // honest pass/fail on the final residual
   x = solution;
 }
 
@@ -1171,6 +1210,31 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangular(const Den
   applyInverseL(y);
   applyInverseU(y);
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_colScale[i] * y.row(m_toInternal[i]);
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename ApplyA>
+void SupernodalLU<MatrixType, OrderingType, Executor>::recordSolveStatus(const DenseMatrix& rhs,
+                                                                         const DenseMatrix& solution,
+                                                                         ApplyA applyA) const {
+  const RealScalar rhsNorm = rhs.norm();
+  DenseMatrix product(rhs.rows(), rhs.cols());
+  applyA(solution, product);
+  const RealScalar resNorm = (rhs - product).norm();
+  // Relative residual; for a zero right-hand side fall back to the absolute one.
+  const RealScalar relResid = (rhsNorm > RealScalar(0)) ? resNorm / rhsNorm : resNorm;
+  m_lastSolveRelativeResidual = relResid;
+
+  const bool usable = solution.allFinite() && (numext::isfinite)(relResid) &&
+                      relResid <= m_solveFailureThreshold;
+  if (usable) {
+    m_info = Success;
+  } else {
+    m_info = NumericalIssue;
+    m_lastError =
+        "SupernodalLU: solve produced a large residual (see solveResidual()); the matrix is "
+        "likely too ill-conditioned for static pivoting and may require true row pivoting.";
+  }
 }
 
 // ===========================================================================
@@ -1270,7 +1334,7 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Rhs, typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(const MatrixBase<Rhs>& b,
                                                                     MatrixBase<Dest>& x) const {
-  eigen_assert(m_info == Success && "the matrix must be factorized first");
+  eigen_assert(m_factorized && "the matrix must be factorized first");
   const Index nrhs = b.cols();
 
   const DenseMatrix rhs = b;
@@ -1278,18 +1342,17 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(co
   solveTriangularTransposed<Conjugate>(rhs, solution);
 
   // refine against A^T (or A^H), preconditioned by the transposed LU solve.
-  refineSolution(
-      rhs, solution,
-      [this](const DenseMatrix& in, DenseMatrix& out) {
-        if (Conjugate)
-          out.noalias() = m_originalMatrix.adjoint() * in;
-        else
-          out.noalias() = m_originalMatrix.transpose() * in;
-      },
-      [this](const DenseMatrix& in, DenseMatrix& out) {
-        this->template solveTriangularTransposed<Conjugate>(in, out);
-      });
+  auto applyA = [this](const DenseMatrix& in, DenseMatrix& out) {
+    if (Conjugate)
+      out.noalias() = m_originalMatrix.adjoint() * in;
+    else
+      out.noalias() = m_originalMatrix.transpose() * in;
+  };
+  refineSolution(rhs, solution, applyA, [this](const DenseMatrix& in, DenseMatrix& out) {
+    this->template solveTriangularTransposed<Conjugate>(in, out);
+  });
 
+  recordSolveStatus(rhs, solution, applyA);  // honest pass/fail on the final residual
   x = solution;
 }
 

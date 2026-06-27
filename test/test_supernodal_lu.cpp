@@ -245,6 +245,55 @@ void testKrylovRefinement() {
               bumped, n, irResid, bcgResid);
 }
 
+// Honest failure reporting: a solve that cannot be satisfied (here a structurally
+// singular matrix with a zeroed row/column, so static pivoting bumps the dead
+// pivot and the factorization "succeeds") must report info()==NumericalIssue
+// rather than silently returning a large-residual answer. A good solve on the
+// same factorization restores Success.
+void testHonestFailure() {
+  // Well-conditioned control: solve must succeed AND report Success after solve.
+  SparseMatrix<double> good = randomSymmetricPattern(80, 0.06, 17);
+  VectorXd xTrueGood = VectorXd::Random(80);
+  Eigen::SupernodalLU<SparseMatrix<double>> okSolver;
+  okSolver.compute(good);
+  const VectorXd xGood = okSolver.solve(good * xTrueGood);
+  check(okSolver.info() == Eigen::Success && okSolver.solveResidual() < 1e-8,
+        "honest check: good solve reports Success", okSolver.solveResidual());
+
+  // Structurally singular matrix: zero out one row and its symmetric column
+  // (including the diagonal). The factorization bumps the dead pivot and returns
+  // Success, but a generic right-hand side is not in range -> garbage solution.
+  SparseMatrix<double> A = randomSymmetricPattern(80, 0.06, 23);
+  const int dead = 40;
+  for (int j = 0; j < A.outerSize(); ++j)
+    for (SparseMatrix<double>::InnerIterator it(A, j); it; ++it)
+      if (it.row() == dead || it.col() == dead) it.valueRef() = 0.0;
+  A.prune(0.0);  // drop the explicit zeros so the pattern stays symmetric
+
+  Eigen::SupernodalLU<SparseMatrix<double>> solver;
+  solver.compute(A);
+  // factorization itself does not see a structural zero pivot (it gets bumped).
+  const bool factored = solver.isFactorized();
+
+  VectorXd b = VectorXd::Random(80);  // generic RHS, not in range(A)
+  const VectorXd x = solver.solve(b);
+  const double resid = (A * x - b).norm() / b.norm();
+  check(factored && solver.info() == Eigen::NumericalIssue,
+        "honest check: singular solve reports NumericalIssue", resid);
+  std::printf("        singular solve resid=%.2e info=%s (factored=%d)\n", resid,
+              solver.info() == Eigen::NumericalIssue ? "NumericalIssue" : "Success", factored);
+
+  // The factors stay usable: a right-hand side in range(A) solves fine and the
+  // status recovers to Success (a failed solve must not poison later solves).
+  VectorXd xr = VectorXd::Random(80);
+  xr(dead) = 0.0;                 // keep the consistent component out of the null space
+  VectorXd bIn = A * xr;          // guaranteed in range(A)
+  const VectorXd x2 = solver.solve(bIn);
+  const double resid2 = (A * x2 - bIn).norm() / std::max(1e-300, bIn.norm());
+  check(solver.info() == Eigen::Success && resid2 < 1e-8,
+        "honest check: status recovers on a consistent RHS", resid2);
+}
+
 void testMultipleRhs() {
   SparseMatrix<double> A = laplacian2d(8, 8);
   const int n = static_cast<int>(A.rows());
@@ -280,6 +329,7 @@ int main() {
   testTransposeSolve();
   testEquilibration();
   testKrylovRefinement();
+  testHonestFailure();
 
   std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
               g_failures, g_failures == 1 ? "" : "s");
