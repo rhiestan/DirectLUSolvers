@@ -1,19 +1,54 @@
-// Compare SupernodalLU against Eigen::SparseLU on the real-world MatrixMarket
-// matrices in testdata/.
+// Compare SupernodalLU against Eigen::SparseLU (and, optionally, Intel MKL
+// PARDISO) on the real-world MatrixMarket matrices in testdata/.
 //
-// Build (from repo root):
+// The METIS (HAVE_METIS) and PARDISO (HAVE_PARDISO) comparisons are each behind
+// an independent compile guard, so any subset can be built.
+//
+// Plain build (SupernodalLU vs Eigen::SparseLU only, from repo root):
 //   clang++ -std=c++17 -O2 -I eigen -I DirectLUSolvers/src \
 //       DirectLUSolvers/test/compare_testdata.cpp -o build/compare_testdata
 //
-// Run (from repo root, so relative testdata/ paths resolve):
+// PARDISO only (Eigen/PardisoSupport, statically linked MKL sequential LP64 -
+//   no MKL runtime DLLs needed; MKL_INT==int matches StorageIndex):
+//   clang++ -std=c++17 -O2 -DHAVE_PARDISO -I eigen -I DirectLUSolvers/src \
+//       -I mkl/include DirectLUSolvers/test/compare_testdata.cpp \
+//       -L mkl/lib -lmkl_intel_lp64 -lmkl_sequential -lmkl_core \
+//       -o build/compare_testdata
+//
+// With METIS, and the full combination, use clang-cl: the installed GKlib/metis
+// were built against the dynamic CRT (/MD), so everything must agree on /MD,
+// which means MKL must be linked dynamically too (mkl_rt) when combined. clang++
+// in its GNU driver does not inject the dynamic UCRT import libs cleanly, so
+// clang-cl is the reliable Windows linker here.
+//
+//   clang-cl /std:c++17 /O2 /EHsc /MD /DHAVE_METIS /DHAVE_PARDISO \
+//       /I eigen /I DirectLUSolvers/src /I mkl/include /I install/include \
+//       DirectLUSolvers/test/compare_testdata.cpp \
+//       /Fe:build/compare_testdata.exe \
+//       /link /LIBPATH:mkl/lib mkl_rt.lib /LIBPATH:install/lib metis.lib GKlib.lib
+//
+// (Drop /DHAVE_PARDISO and the mkl bits for a self-contained METIS-only build.)
+//
+// Run (from repo root, so relative testdata/ paths resolve). When PARDISO was
+// linked via mkl_rt, put mkl/bin on PATH and pick a threading layer that does
+// not need libiomp5md.dll:
+//   set MKL_THREADING_LAYER=SEQUENTIAL && set PATH=mkl\bin;%PATH%
 //   ./build/compare_testdata
 //
 // For each matrix we build b = A*xTrue with a known xTrue, then solve A x = b
-// with both solvers and report relative error, residual, factor sizes and time.
+// with each solver and report relative error, residual, factor sizes and time.
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
+
+#ifdef HAVE_PARDISO
+#include <Eigen/PardisoSupport>
+#endif
+
+#ifdef HAVE_METIS
+#include "SupernodalLUMetis.h"  // SupernodalLUMetis = SupernodalLU + MetisOrdering
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -132,13 +167,16 @@ struct Result {
   std::string note;
 };
 
-// Both variants use the robust defaults (auto static pivot + iterative
-// refinement). When amalgamate==false we force the pure fundamental-supernode
-// partition (setAmalgamation(1,0)) so the effect of amalgamation is isolated.
-Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue,
-                     bool amalgamate) {
+// Runs a SupernodalLU instance (any ordering) with the robust defaults (auto
+// static pivot + iterative refinement). When amalgamate==false we force the
+// pure fundamental-supernode partition (setAmalgamation(1,0)) so the effect of
+// amalgamation is isolated. Templated on the solver type so the same body
+// serves both the default AMD ordering and the METIS ordering.
+template <typename Solver>
+Result runSupernodalWith(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue,
+                         bool amalgamate) {
   Result r;
-  Eigen::SupernodalLU<SparseMatrix<double>> solver;
+  Solver solver;
   try {
     if (!amalgamate) solver.setAmalgamation(1, 0);
     auto t0 = Clock::now();
@@ -166,6 +204,21 @@ Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const Vec
   return r;
 }
 
+Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue,
+                     bool amalgamate) {
+  return runSupernodalWith<Eigen::SupernodalLU<SparseMatrix<double>>>(A, b, xTrue, amalgamate);
+}
+
+#ifdef HAVE_METIS
+// Same solver, but with the METIS nested-dissection ordering wired in. Uses the
+// default (amalgamated) supernode settings, like the AMD "amalgamated" run, so
+// the two are directly comparable and the difference is purely the ordering.
+Result runSupernodalMetis(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
+  return runSupernodalWith<Eigen::SupernodalLUMetis<SparseMatrix<double>>>(A, b, xTrue,
+                                                                           /*amalgamate=*/true);
+}
+#endif
+
 Result runSparseLU(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
   Result r;
   Eigen::SparseLU<SparseMatrix<double>> solver;
@@ -188,6 +241,32 @@ Result runSparseLU(const SparseMatrix<double>& A, const VectorXd& b, const Vecto
   return r;
 }
 
+#ifdef HAVE_PARDISO
+// Intel MKL PARDISO via Eigen's drop-in interface (Eigen/PardisoSupport).
+// PardisoLU factorizes a general real unsymmetric matrix with PARDISO's own
+// scaling + partial pivoting (mtype 11). The wrapper does not expose factor
+// nnz, so nnzL/nnzU are left at 0.
+Result runPardiso(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
+  Result r;
+  Eigen::PardisoLU<SparseMatrix<double>> solver;
+  auto t0 = Clock::now();
+  solver.compute(A);
+  auto t1 = Clock::now();
+  if (solver.info() != Eigen::Success) {
+    r.note = "factorize failed";
+    return r;
+  }
+  VectorXd x = solver.solve(b);
+  auto t2 = Clock::now();
+  r.factorMs = ms(t0, t1);
+  r.solveMs = ms(t1, t2);
+  r.err = (x - xTrue).norm() / xTrue.norm();
+  r.resid = (A * x - b).norm() / b.norm();
+  r.ok = true;
+  return r;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -204,7 +283,14 @@ int main(int argc, char** argv) {
   std::vector<std::string> files(matrices);
   if (argc > 1) files.assign(argv + 1, argv + argc);
 
-  std::printf("Comparing SupernodalLU vs Eigen::SparseLU on testdata matrices\n");
+  std::printf("Comparing SupernodalLU vs Eigen::SparseLU"
+#ifdef HAVE_METIS
+              " (AMD & METIS orderings)"
+#endif
+#ifdef HAVE_PARDISO
+              " vs MKL PARDISO"
+#endif
+              " on testdata matrices\n");
   std::printf("(b = A*xTrue with random xTrue; pattern symmetrized for SupernodalLU)\n\n");
 
   int failures = 0;
@@ -231,6 +317,9 @@ int main(int argc, char** argv) {
 
     Result plain = runSupernodal(Asym, b, xTrue, /*amalgamate=*/false);
     Result piv = runSupernodal(Asym, b, xTrue, /*amalgamate=*/true);
+#ifdef HAVE_METIS
+    Result metis = runSupernodalMetis(Asym, b, xTrue);
+#endif
     Result ref = runSparseLU(Asym, b, xTrue);
 
     const long long nn = A.rows();
@@ -248,8 +337,15 @@ int main(int argc, char** argv) {
       }
     };
     report("SNLU (fundamental)", plain);
-    report("SNLU (amalgamated)", piv);
+    report("SNLU AMD (amalg)", piv);
+#ifdef HAVE_METIS
+    report("SNLU METIS (amalg)", metis);
+#endif
     report("Eigen SparseLU", ref);
+#ifdef HAVE_PARDISO
+    Result pard = runPardiso(Asym, b, xTrue);
+    report("MKL PARDISO", pard);
+#endif
 
     const bool pivAccurate = piv.ok && piv.resid < 1e-6;
     if (plain.ok && piv.ok) {
@@ -258,6 +354,14 @@ int main(int argc, char** argv) {
       std::printf("  -> amalgamation: %.2fx factor speed, %lld->%lld supernodes, %+.0f%% stored nz\n",
                   speedup, plain.snodes, piv.snodes, (fillRatio - 1.0) * 100.0);
     }
+#ifdef HAVE_METIS
+    if (piv.ok && metis.ok) {
+      const double fillRatio = double(metis.nnzL + metis.nnzU) / double(piv.nnzL + piv.nnzU);
+      const double speedup = metis.factorMs > 0 ? piv.factorMs / metis.factorMs : 0.0;
+      std::printf("  -> METIS vs AMD ordering: %+.0f%% stored nz, %.2fx factor speed\n",
+                  (fillRatio - 1.0) * 100.0, speedup);
+    }
+#endif
     if (piv.ok && !pivAccurate)
       std::printf("  -> residual stayed large (%lld/%ld pivots bumped) -> needs true row pivoting.\n",
                   piv.replaced, (long)A.rows());
