@@ -250,6 +250,17 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index relaxedSize() const { return m_relaxedSize; }
   Index maxAmalgamationZeroRows() const { return m_maxAmalgamationZeroRows; }
 
+  /** Relative amalgamation tolerance: a path-continuation boundary is also merged
+   *  when the extra (logically zero) off-diagonal rows it introduces are at most
+   *  this fraction of the rows the supernode already carries. This coarsens the
+   *  supernode partition of dense-ish factorizations — where a wide panel already
+   *  has many off-diagonal rows, so a few more are negligible fill but the larger
+   *  panels sharply reduce per-supernode bookkeeping/dispatch overhead. It barely
+   *  affects sparse matrices (few rows -> the absolute rule already governs).
+   *  Default 0.3; set 0 to use only the absolute (relaxedSize/maxZeroRows) rule. */
+  void setAmalgamationFillFraction(double fraction) { m_amalgamationFillFraction = fraction; }
+  double amalgamationFillFraction() const { return m_amalgamationFillFraction; }
+
   /** Supernode splitting: cap supernode width at maxBlockSize columns by forcing
    *  extra boundaries (PaStiX MAX_BLOCKSIZE). Splitting adds NO fill (it only
    *  relocates inter-block entries) and keeps dense panels at a cache-friendly
@@ -405,6 +416,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_lastRefinementIterations = 0;
     m_relaxedSize = 4;
     m_maxAmalgamationZeroRows = 4;
+    m_amalgamationFillFraction = 0.3;
     m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
     m_equilibrate = true;
     m_useMatching = true;
@@ -565,6 +577,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   mutable Index m_lastRefinementIterations;
   Index m_relaxedSize;                // amalgamation: force-merge below this width
   Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
+  double m_amalgamationFillFraction;  // amalgamation: max extra rows as fraction of existing
   Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
   bool m_equilibrate;                 // apply Ruiz row/column scaling
   bool m_useMatching;                 // apply MC64-style maximum-transversal matching
@@ -737,10 +750,18 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::detectSupernodesAndBlocks
     } else {
       // path-continuation branch point: amalgamate if cheap enough.
       const StorageIndex childWidth = j - currentStart;
-      const StorageIndex deltaRows =
-          rowsBeyond(columnStructure[j], j) - rowsBeyond(columnStructure[j - 1], j);
-      const bool merge = (static_cast<Index>(childWidth) < m_relaxedSize) ||
-                         (static_cast<Index>(deltaRows) <= m_maxAmalgamationZeroRows);
+      const StorageIndex existingRows = rowsBeyond(columnStructure[j - 1], j);
+      const StorageIndex deltaRows = rowsBeyond(columnStructure[j], j) - existingRows;
+      // Absolute rule (governs sparse matrices: few rows, so the fraction term is
+      // tiny) OR a RELATIVE rule: accept the merge when the extra zero rows are a
+      // small fraction of the rows the supernode already carries. The relative
+      // rule matters for dense-ish factorizations (e.g. gemat11), where a wide
+      // panel already has hundreds of off-diagonal rows so a few more are
+      // negligible fill but coarser supernodes sharply cut per-supernode overhead.
+      const bool merge =
+          (static_cast<Index>(childWidth) < m_relaxedSize) ||
+          (static_cast<Index>(deltaRows) <= m_maxAmalgamationZeroRows) ||
+          (static_cast<double>(deltaRows) <= m_amalgamationFillFraction * static_cast<double>(existingRows));
       start = !merge;
     }
     // Splitting: force a boundary once the running supernode hits maxBlockSize.
