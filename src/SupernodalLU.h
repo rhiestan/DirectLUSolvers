@@ -32,6 +32,7 @@
 
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUExecutor.h"
+#include "SupernodalLUMatching.h"
 
 namespace Eigen {
 namespace supernodal_lu {
@@ -173,8 +174,12 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
 
   const std::string& lastErrorMessage() const { return m_lastError; }
 
-  /** Row permutation; equals the column permutation (symmetric pattern). */
-  const PermutationType& rowsPermutation() const { return m_permutation; }
+  /** Row permutation mapping original rows to the internal (factored) numbering.
+   *  This folds the maximum-transversal matching together with the fill-reducing
+   *  ordering + postordering, so it differs from the column permutation whenever
+   *  matching() reorders rows (it equals colsPermutation() when matching is off
+   *  or is the identity). */
+  const PermutationType& rowsPermutation() const { return m_rowPermutation; }
   /** Column permutation chosen by the ordering + postordering. */
   const PermutationType& colsPermutation() const { return m_permutation; }
 
@@ -260,6 +265,30 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
    *  determinant(), which all operate on the original A. */
   void setEquilibration(bool on) { m_equilibrate = on; }
   bool equilibration() const { return m_equilibrate; }
+
+  /** Maximum-transversal matching (MC64-style). When on (default), analyzePattern()
+   *  permutes large-magnitude entries onto the diagonal BEFORE the symbolic
+   *  factorization (à la SuperLU_DIST / MUMPS), giving a zero-free, well-scaled
+   *  diagonal so the static-pivot threshold rarely fires. This is the key
+   *  robustness ingredient for matrices with a numerically weak or structurally
+   *  zero diagonal (e.g. unsymmetric circuit matrices); it is a pure row
+   *  permutation and does not change the static block structure. The matched
+   *  pattern is symmetrized internally. */
+  void setMatching(bool on) { m_useMatching = on; }
+  bool matching() const { return m_useMatching; }
+  /** True if the last matching produced a full zero-free diagonal (perfect
+   *  transversal). False indicates a structurally singular matrix. */
+  bool matchingIsPerfect() const { return m_matchingIsPerfect; }
+
+  /** Restricted (in-block) pivoting. When on (default), the dense diagonal block
+   *  of each supernode is factored with partial pivoting CONFINED to that block
+   *  (row swaps stay within the already-allocated dense block, so the global
+   *  symbolic structure — and BLAS-3 / tree parallelism — are preserved). This
+   *  makes the diagonal block numerically robust without the dynamic structure
+   *  growth of true partial pivoting. Combined with matching() it removes the
+   *  dead-diagonal failure mode that pure static pivoting cannot handle. */
+  void setDiagonalPivoting(bool on) { m_diagonalPivoting = on; }
+  bool diagonalPivoting() const { return m_diagonalPivoting; }
   /** The computed scaling vectors (original numbering), valid after factorize().
    *  A~ = diag(rowScaling()) * A * diag(colScaling()). */
   const std::vector<RealScalar>& rowScaling() const { return m_rowScale; }
@@ -290,7 +319,9 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     for (const auto& diag : m_diagonalFactor) {
       for (Index k = 0; k < diag.rows(); ++k) det *= diag(k, k);
     }
-    return det / m_scalingDeterminant;
+    // m_factorizationSign folds in the parity of the matching row permutation and
+    // of all in-block pivot swaps, so the sign of det(A) is correct.
+    return m_factorizationSign * det / m_scalingDeterminant;
   }
 
   // --- factor accessors (Eigen::SparseLU-compatible) ------------------------
@@ -376,6 +407,11 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_maxAmalgamationZeroRows = 4;
     m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
     m_equilibrate = true;
+    m_useMatching = true;
+    m_diagonalPivoting = true;
+    m_matchingIsPerfect = true;
+    m_matchSign = 1;
+    m_factorizationSign = Scalar(1);
     m_scalingDeterminant = RealScalar(1);
     m_nnzL = 0;
     m_nnzU = 0;
@@ -400,13 +436,18 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // supernode's panels, so supernodes in the same elimination-tree level run
   // concurrently. Reports its local replaced-pivot count and singularity.
   void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, Index& replacedCount,
-                          bool& singular);
+                          bool& singular, int& sign);
 
-  // right-looking BLOCKED unpivoted LU of a dense diagonal block, with static
-  // pivoting. Panels of width kDiagBlockSize keep the trailing update a BLAS-3
-  // GEMM (vs. an unblocked BLAS-2 rank-1 sweep) for wide supernodes.
+  // right-looking BLOCKED LU of a dense diagonal block, with static pivoting and
+  // optional restricted (in-block) partial pivoting. Panels of width
+  // kDiagBlockSize keep the trailing update a BLAS-3 GEMM (vs. an unblocked
+  // BLAS-2 rank-1 sweep) for wide supernodes. When restrictedPivot is true, row
+  // swaps confined to the block are recorded in rowPerm (rowPerm[k] = local row
+  // now sitting at position k; left empty when no swap occurred) and sign carries
+  // the permutation parity for the determinant.
   void factorizeDiagonalBlock(DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount,
-                              bool& singular) const;
+                              bool& singular, std::vector<StorageIndex>& rowPerm, int& sign,
+                              bool restrictedPivot) const;
 
   // group supernodes into elimination-tree levels for parallel scheduling: a
   // supernode's level is 1 + the max level of its update sources.
@@ -459,10 +500,29 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   StorageIndex m_size;
   OrderingType m_orderingFunctor;
 
-  // m_toInternal[original] = internal (fill-reducing, postordered) index.
+  // m_toInternal[original] = internal (fill-reducing, postordered) index. This is
+  // the COLUMN map (columns are not touched by the matching).
   std::vector<StorageIndex> m_toInternal;
   std::vector<StorageIndex> m_toOriginal;
-  PermutationType m_permutation;  // public-facing form of m_toInternal
+  PermutationType m_permutation;  // public-facing form of m_toInternal (columns)
+
+  // Maximum-transversal matching (MC64-style). m_matchRow[j] = original row placed
+  // on the diagonal of column j; m_matchRowInv is its inverse. m_rowToInternal
+  // composes the matching with the symbolic ordering: it maps an original row to
+  // its internal index (= m_toInternal[m_matchRowInv[row]]). Identity when
+  // matching is off. m_rowPermutation is the public form of m_rowToInternal.
+  std::vector<StorageIndex> m_matchRow;
+  std::vector<StorageIndex> m_matchRowInv;
+  std::vector<StorageIndex> m_rowToInternal;
+  PermutationType m_rowPermutation;
+  bool m_matchingIsPerfect;
+  int m_matchSign;  // parity of the matching row permutation (for det sign)
+
+  // Per-supernode restricted-pivoting row permutation (internal local order).
+  // m_diagPivot[s][k] = local diagonal-block row sitting at position k after
+  // in-block pivoting; an empty entry means no swap (identity) for that supernode.
+  std::vector<std::vector<StorageIndex>> m_diagPivot;
+  Scalar m_factorizationSign;  // sign(matching) * prod sign(in-block pivots)
 
   std::vector<Supernode> m_supernodes;
   std::vector<RowBlock> m_rowBlocks;             // flattened, owned by supernodes
@@ -507,6 +567,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
   Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
   bool m_equilibrate;                 // apply Ruiz row/column scaling
+  bool m_useMatching;                 // apply MC64-style maximum-transversal matching
+  bool m_diagonalPivoting;            // restricted (in-block) partial pivoting
   Index m_nnzL;
   Index m_nnzU;
 };
@@ -802,9 +864,41 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
   m_size = static_cast<StorageIndex>(matrix.rows());
   const StorageIndex n = m_size;
 
-  // 1) fill-reducing ordering (orders the pattern of A + A^T).
+  // 0) maximum-transversal matching: choose a row permutation that places large
+  //    entries on the diagonal (MC64-style). All of the symbolic analysis below
+  //    runs on the MATCHED matrix B = Pmatch * A, whose diagonal is zero-free, so
+  //    the elimination tree / supernodes are built around a strong diagonal and
+  //    static-pivot bumping rarely fires. Columns are untouched by the matching.
+  m_matchRow.assign(n, 0);
+  m_matchRowInv.assign(n, 0);
+  m_matchingIsPerfect = true;
+  if (m_useMatching && n > 0) {
+    m_matchingIsPerfect = supernodal_lu::maximumWeightMatching(matrix, m_matchRow);
+  } else {
+    for (StorageIndex i = 0; i < n; ++i) m_matchRow[i] = i;
+  }
+  for (StorageIndex j = 0; j < n; ++j) m_matchRowInv[m_matchRow[j]] = j;
+  m_matchSign = supernodal_lu::permutationSign(m_matchRow);
+
+  // Build B = Pmatch * A (original row r -> position m_matchRowInv[r]). When
+  // matching is the identity this is a copy of A. B is generally pattern-
+  // unsymmetric; the helpers below symmetrize its pattern (structural zeros).
+  MatrixType matched;
+  if (m_useMatching) {
+    std::vector<Triplet<Scalar, StorageIndex>> trips;
+    trips.reserve(static_cast<std::size_t>(matrix.nonZeros()));
+    for (StorageIndex j = 0; j < n; ++j)
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it)
+        trips.emplace_back(m_matchRowInv[static_cast<StorageIndex>(it.index())], j, it.value());
+    matched.resize(n, n);
+    matched.setFromTriplets(trips.begin(), trips.end());
+    matched.makeCompressed();
+  }
+  const MatrixType& B = m_useMatching ? matched : matrix;
+
+  // 1) fill-reducing ordering (orders the pattern of B + B^T).
   PermutationType orderingPerm;
-  m_orderingFunctor(matrix, orderingPerm);
+  m_orderingFunctor(B, orderingPerm);
 
   m_toInternal.resize(n);
   if (orderingPerm.size() == 0) {  // NaturalOrdering returns empty
@@ -815,7 +909,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
 
   // 2) elimination tree of the ordered symmetric pattern.
   std::vector<std::vector<StorageIndex>> adjacency;
-  buildSymmetricAdjacency(matrix, adjacency);
+  buildSymmetricAdjacency(B, adjacency);
   std::vector<StorageIndex> parent;
   computeEliminationTree(adjacency, parent);
 
@@ -828,7 +922,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
   for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = relabel[m_toInternal[i]];
 
   // 4) recompute adjacency + tree in the final numbering (clean and cheap).
-  buildSymmetricAdjacency(matrix, adjacency);
+  buildSymmetricAdjacency(B, adjacency);
   computeEliminationTree(adjacency, parent);
 
   // 5) symbolic factorization: per-column structure of the factor.
@@ -841,11 +935,18 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
   // 7) elimination-tree levels for parallel factorization scheduling.
   computeSupernodeLevels();
 
-  // inverse permutation + public permutation object.
+  // inverse permutation + public permutation objects. m_rowToInternal composes
+  // the matching with the symbolic ordering: original row -> internal index.
   m_toOriginal.resize(n);
   for (StorageIndex i = 0; i < n; ++i) m_toOriginal[m_toInternal[i]] = i;
+  m_rowToInternal.resize(n);
+  for (StorageIndex r = 0; r < n; ++r) m_rowToInternal[r] = m_toInternal[m_matchRowInv[r]];
   m_permutation.resize(n);
-  for (StorageIndex i = 0; i < n; ++i) m_permutation.indices()(i) = m_toInternal[i];
+  m_rowPermutation.resize(n);
+  for (StorageIndex i = 0; i < n; ++i) {
+    m_permutation.indices()(i) = m_toInternal[i];
+    m_rowPermutation.indices()(i) = m_rowToInternal[i];
+  }
 
   m_analysisDone = true;
   m_info = Success;
@@ -949,9 +1050,23 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeEquilibration(cons
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
-    DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount, bool& singular) const {
+    DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount, bool& singular,
+    std::vector<StorageIndex>& rowPerm, int& sign, bool restrictedPivot) const {
   const StorageIndex w = static_cast<StorageIndex>(diag.rows());
   const StorageIndex kDiagBlockSize = 64;  // BLAS-3 panel width (cf. PaStiX MAXSIZEOFBLOCKS)
+
+  // Restricted (in-block) partial pivoting: track the row permutation applied to
+  // the dense diagonal block. perm[k] = local block row now sitting at position
+  // k. Swaps are confined to the block, so the global symbolic structure (and
+  // thus L21 / U12 / parallelism) is untouched. Left as identity when off.
+  sign = 1;
+  rowPerm.clear();
+  std::vector<StorageIndex> perm;
+  bool anySwap = false;
+  if (restrictedPivot) {
+    perm.resize(static_cast<std::size_t>(w));
+    for (StorageIndex i = 0; i < w; ++i) perm[i] = i;
+  }
 
   for (StorageIndex j0 = 0; j0 < w; j0 += kDiagBlockSize) {
     const StorageIndex jb = std::min<StorageIndex>(kDiagBlockSize, w - j0);
@@ -960,6 +1075,20 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
     // (1) unblocked LU of the current panel: columns [j0, panelEnd), all rows
     //     below (so L21 is formed too). Rank-1 updates stay inside the panel.
     for (StorageIndex k = j0; k < panelEnd; ++k) {
+      // restricted partial pivoting: bring the largest entry in column k from
+      // within the diagonal block (rows [k, w)) onto the pivot, swapping FULL
+      // rows of the block so the already-factored columns stay consistent.
+      if (restrictedPivot) {
+        Index relMax = 0;
+        diag.col(k).segment(k, w - k).cwiseAbs().maxCoeff(&relMax);
+        const StorageIndex p = k + static_cast<StorageIndex>(relMax);
+        if (p != k) {
+          diag.row(k).swap(diag.row(p));
+          std::swap(perm[static_cast<std::size_t>(k)], perm[static_cast<std::size_t>(p)]);
+          sign = -sign;
+          anySwap = true;
+        }
+      }
       Scalar pivot = diag(k, k);
       if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
         pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
@@ -990,25 +1119,43 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
           diag.block(panelEnd, j0, trailing, jb) * upperRight;  // L21 * U12
     }
   }
+
+  if (anySwap) rowPerm = std::move(perm);  // empty => identity (no swap)
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(StorageIndex s,
                                                                           const RealScalar& staticPivot,
                                                                           Index& replacedCount,
-                                                                          bool& singular) {
+                                                                          bool& singular, int& sign) {
   // pull contributions from already-factored sources (lower levels).
   for (const UpdateSource& source : m_updateSources[s])
     applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
 
   DenseMatrix& diag = m_diagonalFactor[s];
 
-  // unpivoted (static) LU of the diagonal block: packed L (unit) and U.
-  factorizeDiagonalBlock(diag, staticPivot, replacedCount, singular);
+  // (static + optional restricted in-block) LU of the diagonal block: packed L
+  // (unit) and U. m_diagPivot[s] receives the in-block row permutation (empty if
+  // no swap occurred). The Schur complement a source sends to its targets is
+  // invariant to that local permutation (the P_s cancels), so applyUpdate and the
+  // off-diagonal panel structure are unaffected.
+  std::vector<StorageIndex>& rowPerm = m_diagPivot[s];
+  factorizeDiagonalBlock(diag, staticPivot, replacedCount, singular, rowPerm, sign,
+                         m_diagonalPivoting);
   if (singular) return;
 
   // solve the off-diagonal panels against the diagonal factors.
   if (m_supernodes[s].offDiagonalRowCount > 0) {
+    // U12's rows are the same equations as the diagonal block, so apply the
+    // in-block pivot permutation to upperFactor's rows before the L_kk solve.
+    // (lowerFactor's rows are other equations, below the block, and are not
+    // permuted — its values use the pivoted U_kk via the right solve below.)
+    if (!rowPerm.empty()) {
+      const StorageIndex w = m_supernodes[s].width();
+      DenseMatrix permuted(w, m_upperFactor[s].cols());
+      for (StorageIndex k = 0; k < w; ++k) permuted.row(k) = m_upperFactor[s].row(rowPerm[k]);
+      m_upperFactor[s] = std::move(permuted);
+    }
     // lowerFactor := lowerFactor * U_kk^{-1}
     diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(m_lowerFactor[s]);
     // upperFactor := L_kk^{-1} * upperFactor
@@ -1050,6 +1197,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
   m_diagonalFactor.resize(supernodeNbr);
   m_lowerFactor.resize(supernodeNbr);
   m_upperFactor.resize(supernodeNbr);
+  m_diagPivot.assign(supernodeNbr, std::vector<StorageIndex>());
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
@@ -1066,7 +1214,9 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     const Supernode& cs = m_supernodes[columnSupernode];
     for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
       const StorageIndex origRow = static_cast<StorageIndex>(it.index());
-      const StorageIndex ii = m_toInternal[origRow];
+      // m_rowToInternal folds the matching row permutation into the ordering, so
+      // the matched entry of each column lands on the internal diagonal block.
+      const StorageIndex ii = m_rowToInternal[origRow];
       const Scalar value = it.value() * m_rowScale[origRow] * m_colScale[j];  // A~ = Dr A Dc
       if (m_supernodeOfColumn[ii] == columnSupernode) {
         m_diagonalFactor[columnSupernode](ii - cs.firstColumn, jj - cs.firstColumn) += value;
@@ -1099,13 +1249,14 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
   //    in disjoint slots to avoid shared writes during the parallel region.
   std::vector<Index> replacedPerSupernode(supernodeNbr, 0);
   std::vector<char> singularPerSupernode(supernodeNbr, 0);
+  std::vector<int> signPerSupernode(supernodeNbr, 1);  // parity of each in-block pivot perm
   bool singular = false;
   for (const std::vector<StorageIndex>& group : m_levelGroups) {
     const Index groupSize = static_cast<Index>(group.size());
     m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
       const StorageIndex s = group[static_cast<std::size_t>(k)];
       bool localSingular = false;
-      factorizeSupernode(s, staticPivot, replacedPerSupernode[s], localSingular);
+      factorizeSupernode(s, staticPivot, replacedPerSupernode[s], localSingular, signPerSupernode[s]);
       singularPerSupernode[s] = localSingular ? 1 : 0;
     });
     for (StorageIndex s : group)
@@ -1115,6 +1266,11 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
 
   m_replacedPivots = 0;
   for (Index r : replacedPerSupernode) m_replacedPivots += r;
+  // determinant sign = parity of the matching row permutation times the parity of
+  // every supernode's in-block pivot permutation.
+  int totalSign = m_matchSign;
+  for (int sg : signPerSupernode) totalSign *= sg;
+  m_factorizationSign = Scalar(totalSign);
   if (singular) {
     m_info = NumericalIssue;
     m_lastError = "SupernodalLU: zero pivot encountered (matrix is singular).";
@@ -1168,6 +1324,12 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) co
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
+    // apply the in-block pivot permutation: head := P_s head (newhead[k]=head[piv[k]]).
+    const std::vector<StorageIndex>& piv = m_diagPivot[s];
+    if (!piv.empty()) {
+      DenseMatrix tmp = head;
+      for (StorageIndex k = 0; k < w; ++k) head.row(k) = tmp.row(piv[k]);
+    }
     m_diagonalFactor[s].template triangularView<UnitLower>().solveInPlace(head);
     for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
       const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
@@ -1203,10 +1365,13 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangular(const Den
   const StorageIndex n = m_size;
   const Index nrhs = rhs.cols();
 
-  // Solve A x = rhs via the factors of A~ = Dr*A*Dc: x = Dc * A~^{-1} * (Dr * rhs).
-  // Row-scale + permute in, triangular solves, permute out + column-scale.
+  // Solve A x = rhs via the factors of the matched, scaled matrix
+  //   Aeff = Pmatch * Dr * A * Dc,  Pdiag * P * Aeff * P^T = L U.
+  // Rows permute in through the matching+ordering (m_rowToInternal) with row
+  // scaling; columns permute out through the ordering (m_toInternal) with column
+  // scaling. The in-block pivot permutation Pdiag is folded inside applyInverseL.
   DenseMatrix y(n, nrhs);
-  for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = m_rowScale[i] * rhs.row(i);
+  for (StorageIndex i = 0; i < n; ++i) y.row(m_rowToInternal[i]) = m_rowScale[i] * rhs.row(i);
   applyInverseL(y);
   applyInverseU(y);
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_colScale[i] * y.row(m_toInternal[i]);
@@ -1311,6 +1476,13 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(D
       m_diagonalFactor[s].template triangularView<UnitLower>().adjoint().solveInPlace(head);
     else
       m_diagonalFactor[s].template triangularView<UnitLower>().transpose().solveInPlace(head);
+    // transpose of applyInverseL applies the INVERSE in-block pivot permutation
+    // here: head := P_s^{-1} head (newhead[piv[k]] = head[k]).
+    const std::vector<StorageIndex>& piv = m_diagPivot[s];
+    if (!piv.empty()) {
+      DenseMatrix tmp = head;
+      for (StorageIndex k = 0; k < w; ++k) head.row(piv[k]) = tmp.row(k);
+    }
     if (s == 0) break;  // guard against unsigned underflow
   }
 }
@@ -1326,8 +1498,8 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::solveTriangularTransposed
   DenseMatrix y(n, nrhs);
   for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = m_colScale[i] * rhs.row(i);
   applyInverseUTransposed<Conjugate>(y);
-  applyInverseLTransposed<Conjugate>(y);
-  for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_rowScale[i] * y.row(m_toInternal[i]);
+  applyInverseLTransposed<Conjugate>(y);  // folds in the inverse in-block pivot perm
+  for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_rowScale[i] * y.row(m_rowToInternal[i]);
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>

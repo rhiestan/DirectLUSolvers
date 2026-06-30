@@ -33,10 +33,16 @@
 // linked via mkl_rt, put mkl/bin on PATH and pick a threading layer that does
 // not need libiomp5md.dll:
 //   set MKL_THREADING_LAYER=SEQUENTIAL && set PATH=mkl\bin;%PATH%
-//   ./build/compare_testdata
+//   ./build/compare_testdata                 # runs the built-in matrix list
+//   ./build/compare_testdata path/to/A.mtx   # or an explicit list
 //
 // For each matrix we build b = A*xTrue with a known xTrue, then solve A x = b
-// with each solver and report relative error, residual, factor sizes and time.
+// with each solver and print one row of a precision/time table: relative error
+// ||x-xTrue||/||xTrue||, relative residual ||Ax-b||/||b||, and factor+solve time.
+// Rows stream out as they finish. SparseLU/PARDISO get the original A; only
+// SupernodalLU gets the pattern-symmetrized Asym (numerically the same system).
+// SupernodalLU is skipped (no row pivoting -> ruinous fill) above SNLU_MAX_N
+// rows (default 100000; env override, 0 = never skip), e.g. on the 659k pre2.
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
@@ -54,6 +60,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -159,6 +166,7 @@ double ms(Clock::time_point a, Clock::time_point b) {
 
 struct Result {
   bool ok = false;
+  bool skipped = false;
   double err = 0, resid = 0, factorMs = 0, solveMs = 0;
   long long nnzL = 0, nnzU = 0;
   long long replaced = 0;
@@ -221,23 +229,27 @@ Result runSupernodalMetis(const SparseMatrix<double>& A, const VectorXd& b, cons
 
 Result runSparseLU(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
   Result r;
-  Eigen::SparseLU<SparseMatrix<double>> solver;
-  auto t0 = Clock::now();
-  solver.compute(A);
-  auto t1 = Clock::now();
-  if (solver.info() != Eigen::Success) {
-    r.note = "factorize failed";
-    return r;
+  try {
+    Eigen::SparseLU<SparseMatrix<double>> solver;
+    auto t0 = Clock::now();
+    solver.compute(A);
+    auto t1 = Clock::now();
+    if (solver.info() != Eigen::Success) {
+      r.note = "factorize failed";
+      return r;
+    }
+    VectorXd x = solver.solve(b);
+    auto t2 = Clock::now();
+    r.factorMs = ms(t0, t1);
+    r.solveMs = ms(t1, t2);
+    r.err = (x - xTrue).norm() / xTrue.norm();
+    r.resid = (A * x - b).norm() / b.norm();
+    r.nnzL = solver.nnzL();
+    r.nnzU = solver.nnzU();
+    r.ok = true;
+  } catch (const std::exception& e) {
+    r.note = std::string("threw: ") + e.what();
   }
-  VectorXd x = solver.solve(b);
-  auto t2 = Clock::now();
-  r.factorMs = ms(t0, t1);
-  r.solveMs = ms(t1, t2);
-  r.err = (x - xTrue).norm() / xTrue.norm();
-  r.resid = (A * x - b).norm() / b.norm();
-  r.nnzL = solver.nnzL();
-  r.nnzU = solver.nnzU();
-  r.ok = true;
   return r;
 }
 
@@ -248,24 +260,53 @@ Result runSparseLU(const SparseMatrix<double>& A, const VectorXd& b, const Vecto
 // nnz, so nnzL/nnzU are left at 0.
 Result runPardiso(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
   Result r;
-  Eigen::PardisoLU<SparseMatrix<double>> solver;
-  auto t0 = Clock::now();
-  solver.compute(A);
-  auto t1 = Clock::now();
-  if (solver.info() != Eigen::Success) {
-    r.note = "factorize failed";
-    return r;
+  try {
+    Eigen::PardisoLU<SparseMatrix<double>> solver;
+    auto t0 = Clock::now();
+    solver.compute(A);
+    auto t1 = Clock::now();
+    if (solver.info() != Eigen::Success) {
+      r.note = "factorize failed";
+      return r;
+    }
+    VectorXd x = solver.solve(b);
+    auto t2 = Clock::now();
+    r.factorMs = ms(t0, t1);
+    r.solveMs = ms(t1, t2);
+    r.err = (x - xTrue).norm() / xTrue.norm();
+    r.resid = (A * x - b).norm() / b.norm();
+    r.ok = true;
+  } catch (const std::exception& e) {
+    r.note = std::string("threw: ") + e.what();
   }
-  VectorXd x = solver.solve(b);
-  auto t2 = Clock::now();
-  r.factorMs = ms(t0, t1);
-  r.solveMs = ms(t1, t2);
-  r.err = (x - xTrue).norm() / xTrue.norm();
-  r.resid = (A * x - b).norm() / b.norm();
-  r.ok = true;
   return r;
 }
 #endif
+
+// Short label for a matrix: its parent directory name (e.g. "sherman1" from
+// "testdata/sherman1/sherman1.mtx", which also handles dirs whose .mtx file is
+// named differently, like setfos/spmatrix.mtx).
+std::string matrixLabel(const std::string& path) {
+  size_t slash = path.find_last_of("/\\");
+  std::string dir = (slash == std::string::npos) ? std::string() : path.substr(0, slash);
+  size_t slash2 = dir.find_last_of("/\\");
+  std::string parent = (slash2 == std::string::npos) ? dir : dir.substr(slash2 + 1);
+  if (!parent.empty()) return parent;
+  std::string file = (slash == std::string::npos) ? path : path.substr(slash + 1);
+  size_t dot = file.find_last_of('.');
+  return dot == std::string::npos ? file : file.substr(0, dot);
+}
+
+// One solver's cell in the table: relative error, relative residual, and
+// total (factor + solve) time in ms. 29 chars wide, matching the header.
+void printCell(const Result& r) {
+  if (r.skipped)
+    std::printf(" %28s", "skipped (n too large)");
+  else if (r.ok && std::isfinite(r.err) && std::isfinite(r.resid))
+    std::printf(" %9.2e %9.2e %8.1f", r.err, r.resid, r.factorMs + r.solveMs);
+  else
+    std::printf(" %28s", r.ok ? "non-finite" : "FAILED");
+}
 
 }  // namespace
 
@@ -273,102 +314,124 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
   const std::vector<std::string> matrices = {
+      "testdata/bcsstm13/bcsstm13.mtx",
       "testdata/dendrimer/dendrimer.mtx",
-      "testdata/tomography/tomography.mtx",
+      "testdata/gemat11/gemat11.mtx",
       "testdata/rdb2048_noL/rdb2048_noL.mtx",
+      "testdata/setfos/spmatrix.mtx",
+      "testdata/sherman1/sherman1.mtx",
+      "testdata/tomography/tomography.mtx",
       "testdata/YaleB_10NN/YaleB_10NN.mtx",
       "testdata/bayer05/bayer05.mtx",
+      // Large, hard circuit matrix (n=659k). Kept last: SupernodalLU's
+      // symmetric-pattern static-pivot factorization may run very long or
+      // exhaust memory here; the other solvers are still listed.
+      "testdata/pre2/pre2.mtx",
   };
   // Allow overriding the list on the command line.
   std::vector<std::string> files(matrices);
   if (argc > 1) files.assign(argv + 1, argv + argc);
 
-  std::printf("Comparing SupernodalLU vs Eigen::SparseLU"
+  std::printf("Precision / time comparison: SupernodalLU vs Eigen::SparseLU"
 #ifdef HAVE_METIS
-              " (AMD & METIS orderings)"
+              " vs SupernodalLU+METIS"
 #endif
 #ifdef HAVE_PARDISO
               " vs MKL PARDISO"
 #endif
-              " on testdata matrices\n");
-  std::printf("(b = A*xTrue with random xTrue; pattern symmetrized for SupernodalLU)\n\n");
+              "\n");
+  std::printf("b = A*xTrue with random xTrue; pattern symmetrized for SupernodalLU.\n");
+  std::printf("Per solver: err = ||x-xTrue||/||xTrue||, resid = ||Ax-b||/||b||, "
+              "ms = factor+solve time.\n\n");
+
+  // Build the header. Each solver block is 29 chars: " err       resid     ms".
+  auto solverHead = [](const char* name) { std::printf(" |%-28s", name); };
+  auto solverSub = []() { std::printf(" | %9s %9s %8s", "err", "resid", "ms"); };
+
+  std::printf("%-12s %8s %10s", "matrix", "n", "nnz");
+  solverHead(" SupernodalLU");
+#ifdef HAVE_METIS
+  solverHead(" SupernodalLU+METIS");
+#endif
+  solverHead(" Eigen SparseLU");
+#ifdef HAVE_PARDISO
+  solverHead(" MKL PARDISO");
+#endif
+  std::printf("\n");
+  std::printf("%-12s %8s %10s", "", "", "");
+  solverSub();
+#ifdef HAVE_METIS
+  solverSub();
+#endif
+  solverSub();
+#ifdef HAVE_PARDISO
+  solverSub();
+#endif
+  std::printf("\n");
+
+  // SupernodalLU factors a STATIC symmetric pattern with no row pivoting; on a
+  // very large, ill-structured matrix (e.g. the 659k circuit matrix pre2) the
+  // resulting fill is enormous and the factorization exhausts memory. Skip it
+  // past this size so the table still reports the other solvers. Override with
+  // the SNLU_MAX_N environment variable (0 = never skip).
+  long long snluMaxN = 100000;
+  if (const char* env = std::getenv("SNLU_MAX_N")) snluMaxN = std::atoll(env);
 
   int failures = 0;
   for (const std::string& path : files) {
-    std::printf("==================================================================\n");
-    std::printf("%s\n", path.c_str());
     SparseMatrix<double> A;
     try {
       A = loadMatrixMarket(path);
     } catch (const std::exception& e) {
-      std::printf("  load error: %s\n", e.what());
+      std::printf("%-12s  load error: %s\n", matrixLabel(path).c_str(), e.what());
       ++failures;
       continue;
     }
 
-    const bool sym = patternIsSymmetric(A);
-    std::printf("  n = %ld, nnz = %ld, pattern %s\n", (long)A.rows(),
-                (long)A.nonZeros(), sym ? "symmetric" : "UNsymmetric (will symmetrize)");
-
-    SparseMatrix<double> Asym = sym ? A : symmetrizePattern(A);
-
+    // Adding explicit structural zeros (symmetrizePattern) does not change the
+    // operator, so b = A*xTrue works for every solver. SparseLU and PARDISO get
+    // the original (lighter, possibly unsymmetric) A; only SupernodalLU needs a
+    // symmetric pattern, and we build that Asym lazily -- not at all when SNLU
+    // is skipped, which avoids a large needless allocation on e.g. pre2.
     VectorXd xTrue = VectorXd::Random(A.rows());
-    VectorXd b = Asym * xTrue;
+    VectorXd b = A * xTrue;
 
-    Result plain = runSupernodal(Asym, b, xTrue, /*amalgamate=*/false);
-    Result piv = runSupernodal(Asym, b, xTrue, /*amalgamate=*/true);
-#ifdef HAVE_METIS
-    Result metis = runSupernodalMetis(Asym, b, xTrue);
-#endif
-    Result ref = runSparseLU(Asym, b, xTrue);
+    // Print the row label first and flush, so progress is visible even while a
+    // slow solver (e.g. on the large pre2 matrix) is still running.
+    std::printf("%-12s %8lld %10lld", matrixLabel(path).c_str(),
+                (long long)A.rows(), (long long)A.nonZeros());
 
-    const long long nn = A.rows();
-    auto report = [nn](const char* name, const Result& r) {
-      if (r.ok) {
-        std::printf("  %-22s  err=%.3e  resid=%.3e  factor=%8.2f ms  solve=%7.2f ms  nnzL=%lld nnzU=%lld",
-                    name, r.err, r.resid, r.factorMs, r.solveMs, r.nnzL, r.nnzU);
-        if (r.snodes > 0)
-          std::printf("  snodes=%lld avgW=%.1f", r.snodes, double(nn) / double(r.snodes));
-        if (r.replaced > 0 || r.refineIters > 0)
-          std::printf("  [bumped %lld pivots, %d refine its]", r.replaced, r.refineIters);
-        std::printf("\n");
-      } else {
-        std::printf("  %-22s  DID NOT SOLVE: %s\n", name, r.note.c_str());
-      }
-    };
-    report("SNLU (fundamental)", plain);
-    report("SNLU AMD (amalg)", piv);
+    const bool runSnlu = !(snluMaxN > 0 && (long long)A.rows() > snluMaxN);
+    SparseMatrix<double> Asym;  // built only if a SupernodalLU variant runs
+    if (runSnlu) Asym = patternIsSymmetric(A) ? A : symmetrizePattern(A);
+
+    Result snlu;
+    if (!runSnlu) snlu.skipped = true;
+    else snlu = runSupernodal(Asym, b, xTrue, /*amalgamate=*/true);
+    std::printf(" |");
+    printCell(snlu);
 #ifdef HAVE_METIS
-    report("SNLU METIS (amalg)", metis);
+    Result metis;
+    if (!runSnlu) metis.skipped = true;
+    else metis = runSupernodalMetis(Asym, b, xTrue);
+    std::printf(" |");
+    printCell(metis);
 #endif
-    report("Eigen SparseLU", ref);
+    Result ref = runSparseLU(A, b, xTrue);
+    std::printf(" |");
+    printCell(ref);
 #ifdef HAVE_PARDISO
-    Result pard = runPardiso(Asym, b, xTrue);
-    report("MKL PARDISO", pard);
+    Result pard = runPardiso(A, b, xTrue);
+    std::printf(" |");
+    printCell(pard);
 #endif
-
-    const bool pivAccurate = piv.ok && piv.resid < 1e-6;
-    if (plain.ok && piv.ok) {
-      const double fillRatio = double(piv.nnzL + piv.nnzU) / double(plain.nnzL + plain.nnzU);
-      const double speedup = piv.factorMs > 0 ? plain.factorMs / piv.factorMs : 0.0;
-      std::printf("  -> amalgamation: %.2fx factor speed, %lld->%lld supernodes, %+.0f%% stored nz\n",
-                  speedup, plain.snodes, piv.snodes, (fillRatio - 1.0) * 100.0);
-    }
-#ifdef HAVE_METIS
-    if (piv.ok && metis.ok) {
-      const double fillRatio = double(metis.nnzL + metis.nnzU) / double(piv.nnzL + piv.nnzU);
-      const double speedup = metis.factorMs > 0 ? piv.factorMs / metis.factorMs : 0.0;
-      std::printf("  -> METIS vs AMD ordering: %+.0f%% stored nz, %.2fx factor speed\n",
-                  (fillRatio - 1.0) * 100.0, speedup);
-    }
-#endif
-    if (piv.ok && !pivAccurate)
-      std::printf("  -> residual stayed large (%lld/%ld pivots bumped) -> needs true row pivoting.\n",
-                  piv.replaced, (long)A.rows());
-    if (!pivAccurate) ++failures;
     std::printf("\n");
+
+    if (!snlu.skipped &&
+        !(snlu.ok && std::isfinite(snlu.resid) && snlu.resid < 1e-6))
+      ++failures;
   }
 
-  std::printf("Done. %d matrix(es) where SupernodalLU did not produce a solution.\n", failures);
+  std::printf("\n%d matrix(es) where SupernodalLU did not reach resid < 1e-6.\n", failures);
   return failures == 0 ? 0 : 1;
 }
