@@ -2,7 +2,9 @@
 // PARDISO) on the real-world MatrixMarket matrices in testdata/.
 //
 // The METIS (HAVE_METIS) and PARDISO (HAVE_PARDISO) comparisons are each behind
-// an independent compile guard, so any subset can be built.
+// an independent compile guard, so any subset can be built. HAVE_METIS also
+// enables the SupernodalLU+Auto column (SupernodalLUAutoOrdering.h): AMD vs.
+// several METIS restarts, keeping whichever predicts the least fill.
 //
 // Plain build (SupernodalLU vs Eigen::SparseLU only, from repo root):
 //   clang++ -std=c++17 -O2 -I eigen -I DirectLUSolvers/src \
@@ -53,7 +55,8 @@
 #endif
 
 #ifdef HAVE_METIS
-#include "SupernodalLUMetis.h"  // SupernodalLUMetis = SupernodalLU + MetisOrdering
+#include "SupernodalLUMetis.h"        // SupernodalLUMetis = SupernodalLU + MetisOrdering
+#include "SupernodalLUAutoOrdering.h"  // SupernodalLUAuto = SupernodalLU + AutoOrdering (AMD vs METIS restarts)
 #endif
 
 #include <algorithm>
@@ -225,6 +228,16 @@ Result runSupernodalMetis(const SparseMatrix<double>& A, const VectorXd& b, cons
   return runSupernodalWith<Eigen::SupernodalLUMetis<SparseMatrix<double>>>(A, b, xTrue,
                                                                            /*amalgamate=*/true);
 }
+
+// Same solver again, but with AutoOrdering: tries AMD plus several METIS
+// restarts and keeps whichever predicts the least fill (see
+// SupernodalLUAutoOrdering.h). Should never be worse than the plain-AMD
+// column by more than noise, and can beat both AMD and a single METIS call
+// when nested dissection helps but a lucky/unlucky seed would have mattered.
+Result runSupernodalAuto(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
+  return runSupernodalWith<Eigen::SupernodalLUAuto<SparseMatrix<double>>>(A, b, xTrue,
+                                                                          /*amalgamate=*/true);
+}
 #endif
 
 Result runSparseLU(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue) {
@@ -334,7 +347,7 @@ int main(int argc, char** argv) {
 
   std::printf("Precision / time comparison: SupernodalLU vs Eigen::SparseLU"
 #ifdef HAVE_METIS
-              " vs SupernodalLU+METIS"
+              " vs SupernodalLU+METIS vs SupernodalLU+Auto"
 #endif
 #ifdef HAVE_PARDISO
               " vs MKL PARDISO"
@@ -352,6 +365,7 @@ int main(int argc, char** argv) {
   solverHead(" SupernodalLU");
 #ifdef HAVE_METIS
   solverHead(" SupernodalLU+METIS");
+  solverHead(" SupernodalLU+Auto");
 #endif
   solverHead(" Eigen SparseLU");
 #ifdef HAVE_PARDISO
@@ -361,6 +375,7 @@ int main(int argc, char** argv) {
   std::printf("%-12s %8s %10s", "", "", "");
   solverSub();
 #ifdef HAVE_METIS
+  solverSub();
   solverSub();
 #endif
   solverSub();
@@ -416,6 +431,11 @@ int main(int argc, char** argv) {
     else metis = runSupernodalMetis(Asym, b, xTrue);
     std::printf(" |");
     printCell(metis);
+    Result autoOrd;
+    if (!runSnlu) autoOrd.skipped = true;
+    else autoOrd = runSupernodalAuto(Asym, b, xTrue);
+    std::printf(" |");
+    printCell(autoOrd);
 #endif
     Result ref = runSparseLU(A, b, xTrue);
     std::printf(" |");
