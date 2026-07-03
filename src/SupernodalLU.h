@@ -260,6 +260,25 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   void setAmalgamationFillFraction(double fraction) { m_amalgamationFillFraction = fraction; }
   double amalgamationFillFraction() const { return m_amalgamationFillFraction; }
 
+  /** BLAS cost-model amalgamation (PaStiX cblk_time_fact). When enabled, a
+   *  path-continuation boundary is merged iff a machine-calibrated BLAS time
+   *  model predicts the merged panel is FASTER to factor than the two pieces
+   *  separately, i.e. modeled time(merged) < time(a) + time(b). The model sums a
+   *  diagonal-factor + panel-TRSM cost and one GEMM per contiguous off-diagonal
+   *  row run, each term = cubic flop time + a fixed per-call overhead; the merge
+   *  pays when the overhead saved by having fewer, larger kernels outweighs the
+   *  extra fill. This subsumes the width/zero-row/fraction heuristics with one
+   *  principled criterion (they are ignored while it is on). A positive tolerance
+   *  also accepts merges whose modeled cost rises by up to that fraction, trading
+   *  a little speed for coarser panels (better parallel load balance). Default
+   *  OFF (the absolute+fraction heuristics remain the default); tolerance 0. */
+  void setAmalgamationCostModel(bool enable, double tolerance = 0.0) {
+    m_useCostModelAmalgamation = enable;
+    m_costModelTolerance = tolerance;
+  }
+  bool amalgamationCostModel() const { return m_useCostModelAmalgamation; }
+  double amalgamationCostModelTolerance() const { return m_costModelTolerance; }
+
   /** Supernode splitting: cap supernode width at maxBlockSize columns by forcing
    *  extra boundaries (PaStiX MAX_BLOCKSIZE). Splitting adds NO fill (it only
    *  relocates inter-block entries) and keeps dense panels at a cache-friendly
@@ -416,6 +435,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_relaxedSize = 4;
     m_maxAmalgamationZeroRows = 4;
     m_amalgamationFillFraction = 0.3;
+    m_useCostModelAmalgamation = false;
+    m_costModelTolerance = 0.0;
     m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
     m_equilibrate = true;
     m_useMatching = true;
@@ -438,6 +459,18 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
                                std::vector<std::vector<StorageIndex>>& columnStructure) const;
   void detectSupernodesAndBlocks(const std::vector<StorageIndex>& parent,
                                  const std::vector<std::vector<StorageIndex>>& columnStructure);
+
+  // BLAS cost-model amalgamation (PaStiX cblk_time_fact + PERF_* model). Modeled
+  // factorization time of a dense panel of the given width whose sorted
+  // off-diagonal rows are offDiag[0..count): a diagonal factor + panel TRSM plus
+  // one GEMM per contiguous off-diagonal row run. Used to decide amalgamation
+  // merges; only relative comparisons of the returned times are meaningful.
+  static double cblkFactorTime(Index width, const StorageIndex* offDiag, Index count);
+  // Modeled time change from appending column j (a branch point) to the running
+  // supernode [firstColumn, j-1]: time(merged) - time(running) - time(column j).
+  // Negative means the merge is predicted to be faster overall.
+  static double amalgamationCostGain(StorageIndex firstColumn, StorageIndex j,
+                                     const std::vector<std::vector<StorageIndex>>& columnStructure);
 
   // numeric helper: subtract the Schur contribution of a source supernode.
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex facingBlock);
@@ -600,6 +633,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index m_relaxedSize;                // amalgamation: force-merge below this width
   Index m_maxAmalgamationZeroRows;    // amalgamation: max extra zero rows per column
   double m_amalgamationFillFraction;  // amalgamation: max extra rows as fraction of existing
+  bool m_useCostModelAmalgamation;    // amalgamation: use the BLAS time model instead
+  double m_costModelTolerance;        // amalgamation: accept merges up to this relative cost rise
   Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
   bool m_equilibrate;                 // apply Ruiz row/column scaling
   bool m_useMatching;                 // apply MC64-style maximum-transversal matching
@@ -736,6 +771,85 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeColumnStructures(
   }
 }
 
+// BLAS time model ported from PaStiX (kass/amalgamate.c: cblk_time_fact, and
+// perf/perf.h: the PERF_* machine-calibrated cost formulas, "AMD 6180 MKL").
+// Each kernel's time is cubic_flops * A + ... + F, where the CONSTANT term F is
+// the fixed per-call overhead. Amalgamation pays when merging trades a little
+// extra fill (cubic terms) for many fewer kernel launches (constant terms).
+// Absolute values are meaningless off the calibration machine, but the model is
+// only ever used for RELATIVE merge comparisons, where the overhead/flop balance
+// is what matters and is roughly machine-portable. Modeling LU rather than
+// Cholesky would scale every term ~uniformly by 2 (GETRF ~ 2*POF, both L and U
+// panels double TRSM/GEMM), which does not change any merge decision.
+template <typename MatrixType, typename OrderingType, typename Executor>
+double SupernodalLU<MatrixType, OrderingType, Executor>::cblkFactorTime(
+    Index width, const StorageIndex* offDiag, Index count) {
+  const double L = static_cast<double>(width);
+  double G = static_cast<double>(count);  // off-diagonal rows still below the cursor
+
+  // Diagonal factorization (POF) + off-diagonal panel solve (TRSM).
+  auto perfPOF = [](double i) {
+    return 2.439599e-11 * i * i * i + 1.707006e-08 * i * i - 1.469893e-07 * i + 4.071507e-07;
+  };
+  auto perfTRSM = [](double i, double j) {
+    return 2.626177e-10 * i * i * j + 3.976198e-08 * i + 3.255168e-06;
+  };
+  auto perfGEMM = [](double i, double j, double k) {
+    return 2.429169e-10 * i * j * k + 2.724804e-10 * i * j + 1.328900e-09 * j * k +
+           1.148989e-07 * i - 2.704179e-10 * j + 1.216278e-06;
+  };
+
+  double cost = perfPOF(L) + perfTRSM(L, G);
+
+  // One GEMM contribution per maximal run of contiguous off-diagonal rows; the
+  // update it sends spans the G rows from the run downward (G shrinks each run).
+  Index i = 0;
+  while (i < count) {
+    double H = 1.0;
+    ++i;
+    while (i < count && offDiag[i] == offDiag[i - 1] + 1) {
+      ++i;
+      H += 1.0;
+    }
+    cost += perfGEMM(G, H, L);
+    G -= H;
+  }
+  return cost;
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+double SupernodalLU<MatrixType, OrderingType, Executor>::amalgamationCostGain(
+    StorageIndex firstColumn, StorageIndex j,
+    const std::vector<std::vector<StorageIndex>>& columnStructure) {
+  // First off-diagonal row of a sorted column structure relative to column `col`
+  // (the first entry strictly greater than col).
+  auto beyond = [](const std::vector<StorageIndex>& s, StorageIndex col) {
+    return std::upper_bound(s.begin(), s.end(), col);
+  };
+
+  // Running supernode a = [firstColumn, j-1]: width and off-diagonal rows (> j-1).
+  const std::vector<StorageIndex>& structPrev = columnStructure[j - 1];
+  auto itA = beyond(structPrev, static_cast<StorageIndex>(j - 1));
+  const Index widthA = static_cast<Index>(j - firstColumn);
+  const Index countA = static_cast<Index>(structPrev.end() - itA);
+  const StorageIndex* rowsA = countA > 0 ? &*itA : nullptr;
+  const double timeA = cblkFactorTime(widthA, rowsA, countA);
+
+  // Column j alone (b): width 1, off-diagonal rows (> j). Its structure is the
+  // largest in the chain, so the merged panel shares these same off-diagonal rows.
+  const std::vector<StorageIndex>& structJ = columnStructure[j];
+  auto itB = beyond(structJ, j);
+  const Index countB = static_cast<Index>(structJ.end() - itB);
+  const StorageIndex* rowsB = countB > 0 ? &*itB : nullptr;
+  const double timeB = cblkFactorTime(1, rowsB, countB);
+
+  // Merged panel [firstColumn, j]: width widthA+1, off-diagonal rows (> j).
+  const double timeM = cblkFactorTime(widthA + 1, rowsB, countB);
+
+  const double reference = timeA > 0.0 ? timeA : 1.0;
+  return (timeM - timeA - timeB) / reference;  // relative modeled cost change
+}
+
 template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::detectSupernodesAndBlocks(
     const std::vector<StorageIndex>& parent, const std::vector<std::vector<StorageIndex>>& columnStructure) {
@@ -769,6 +883,14 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::detectSupernodesAndBlocks
       start = true;  // mandatory structural boundary
     } else if (childCount[j] == 1) {
       start = false;  // fundamental supernode: no extra fill
+    } else if (m_useCostModelAmalgamation) {
+      // path-continuation branch point: merge iff the BLAS time model predicts the
+      // merged panel factors faster than the two pieces (PaStiX cblk_time_fact).
+      // amalgamationCostGain returns the RELATIVE cost change (>=0 means the merge
+      // is predicted to cost that fraction more); a positive tolerance accepts a
+      // small modeled slowdown to coarsen panels further (better load balance).
+      const double relativeGain = amalgamationCostGain(currentStart, j, columnStructure);
+      start = !(relativeGain <= m_costModelTolerance);
     } else {
       // path-continuation branch point: amalgamate if cheap enough.
       const StorageIndex childWidth = j - currentStart;
