@@ -345,7 +345,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
    *  the equilibrated A~ = Dr*A*Dc, so det(A) = det(A~) / (prod Dr * prod Dc). */
   Scalar determinant() const {
     Scalar det(1);
-    for (const auto& diag : m_diagonalFactor) {
+    for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+      const ConstStridedPanel diag = diagBlock(s);
       for (Index k = 0; k < diag.rows(); ++k) det *= diag(k, k);
     }
     // m_factorizationSign folds in the parity of the matching row permutation and
@@ -417,6 +418,49 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   typedef supernodal_lu::Supernode<StorageIndex> Supernode;
   typedef supernodal_lu::RowBlock<StorageIndex> RowBlock;
   typedef supernodal_lu::UpdateSource<StorageIndex> UpdateSource;
+
+  // Views into the contiguous panel storage (PaStiX coeftab/ucoeftab with
+  // stride). Each supernode's L factor lives in one column-major panel of
+  // (width + offDiag) rows: its top `width` rows are the packed-LU diagonal
+  // block, the rows below are the L off-diagonal panel. Diagonal and lower thus
+  // share a leading dimension (stride = width + offDiag) and are STRIDED views.
+  // The U off-diagonal panel is stored contiguously (leading dimension = width).
+  typedef Map<DenseMatrix, 0, OuterStride<>> StridedPanel;
+  typedef Map<const DenseMatrix, 0, OuterStride<>> ConstStridedPanel;
+  typedef Map<DenseMatrix> ContiguousPanel;
+  typedef Map<const DenseMatrix> ConstContiguousPanel;
+
+  // Packed-LU diagonal block (width x width) = top rows of supernode s's L panel.
+  StridedPanel diagBlock(StorageIndex s) {
+    const Supernode& sn = m_supernodes[s];
+    const Index stride = Index(sn.width()) + Index(sn.offDiagonalRowCount);
+    return StridedPanel(m_lStorage.data() + m_lOffset[s], sn.width(), sn.width(), OuterStride<>(stride));
+  }
+  ConstStridedPanel diagBlock(StorageIndex s) const {
+    const Supernode& sn = m_supernodes[s];
+    const Index stride = Index(sn.width()) + Index(sn.offDiagonalRowCount);
+    return ConstStridedPanel(m_lStorage.data() + m_lOffset[s], sn.width(), sn.width(), OuterStride<>(stride));
+  }
+  // L off-diagonal panel (offDiag x width) = rows [width, width+offDiag) of it.
+  StridedPanel lowerPanel(StorageIndex s) {
+    const Supernode& sn = m_supernodes[s];
+    const Index w = sn.width(), r = sn.offDiagonalRowCount;
+    return StridedPanel(m_lStorage.data() + m_lOffset[s] + w, r, w, OuterStride<>(w + r));
+  }
+  ConstStridedPanel lowerPanel(StorageIndex s) const {
+    const Supernode& sn = m_supernodes[s];
+    const Index w = sn.width(), r = sn.offDiagonalRowCount;
+    return ConstStridedPanel(m_lStorage.data() + m_lOffset[s] + w, r, w, OuterStride<>(w + r));
+  }
+  // U off-diagonal panel (width x offDiag), contiguous.
+  ContiguousPanel upperPanel(StorageIndex s) {
+    const Supernode& sn = m_supernodes[s];
+    return ContiguousPanel(m_uStorage.data() + m_uOffset[s], sn.width(), sn.offDiagonalRowCount);
+  }
+  ConstContiguousPanel upperPanel(StorageIndex s) const {
+    const Supernode& sn = m_supernodes[s];
+    return ConstContiguousPanel(m_uStorage.data() + m_uOffset[s], sn.width(), sn.offDiagonalRowCount);
+  }
 
   void init() {
     m_size = 0;
@@ -512,7 +556,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // swaps confined to the block are recorded in rowPerm (rowPerm[k] = local row
   // now sitting at position k; left empty when no swap occurred) and sign carries
   // the permutation parity for the determinant.
-  void factorizeDiagonalBlock(DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount,
+  void factorizeDiagonalBlock(StridedPanel diag, const RealScalar& staticPivot, Index& replacedCount,
                               bool& singular, std::vector<StorageIndex>& rowPerm, int& sign,
                               bool restrictedPivot) const;
 
@@ -603,9 +647,18 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Executor m_executor;  // parallel-execution backend (default serial)
 
   // numeric factors (one entry per supernode)
-  std::vector<DenseMatrix> m_diagonalFactor;  // w x w  (packed LU)
-  std::vector<DenseMatrix> m_lowerFactor;     // offDiag x w
-  std::vector<DenseMatrix> m_upperFactor;     // w x offDiag
+  // Contiguous factor storage (PaStiX coeftab/ucoeftab). All L panels live
+  // end-to-end in m_lStorage (each supernode: a (width+offDiag) x width column-
+  // major panel = packed diagonal block on top of the L off-diagonal panel); all
+  // U off-diagonal panels (width x offDiag) live in m_uStorage. m_lOffset[s] /
+  // m_uOffset[s] are the starting scalar offsets of supernode s. This replaces
+  // 3*supernodes separate DenseMatrix allocations with two contiguous arenas,
+  // improving locality and cutting allocation/indirection. Access via the
+  // diagBlock()/lowerPanel()/upperPanel() Map accessors above.
+  std::vector<Scalar> m_lStorage;
+  std::vector<Scalar> m_uStorage;
+  std::vector<std::size_t> m_lOffset;
+  std::vector<std::size_t> m_uOffset;
 
   // a copy of A in the original numbering, kept so solve() can form residuals
   // b - A x for iterative refinement.
@@ -1126,11 +1179,11 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
   const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
   const StorageIndex targetFirstColumn = m_supernodes[target].firstColumn;
 
-  const DenseMatrix& srcLower = m_lowerFactor[source];
-  const DenseMatrix& srcUpper = m_upperFactor[source];
-  DenseMatrix& targetDiag = m_diagonalFactor[target];
-  DenseMatrix& targetLower = m_lowerFactor[target];
-  DenseMatrix& targetUpper = m_upperFactor[target];
+  const StridedPanel srcLower = lowerPanel(source);
+  const ContiguousPanel srcUpper = upperPanel(source);
+  StridedPanel targetDiag = diagBlock(target);
+  StridedPanel targetLower = lowerPanel(target);
+  ContiguousPanel targetUpper = upperPanel(target);
 
   // The blocks of the source facing the target are consecutive: [firstFacing, lastFacing).
   StorageIndex lastFacing = firstFacingBlock;
@@ -1210,7 +1263,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeEquilibration(cons
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
-    DenseMatrix& diag, const RealScalar& staticPivot, Index& replacedCount, bool& singular,
+    StridedPanel diag, const RealScalar& staticPivot, Index& replacedCount, bool& singular,
     std::vector<StorageIndex>& rowPerm, int& sign, bool restrictedPivot) const {
   const StorageIndex w = static_cast<StorageIndex>(diag.rows());
   const StorageIndex kDiagBlockSize = 64;  // BLAS-3 panel width (cf. PaStiX MAXSIZEOFBLOCKS)
@@ -1292,7 +1345,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storag
   for (const UpdateSource& source : m_updateSources[s])
     applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
 
-  DenseMatrix& diag = m_diagonalFactor[s];
+  StridedPanel diag = diagBlock(s);
 
   // (static + optional restricted in-block) LU of the diagonal block: packed L
   // (unit) and U. m_diagPivot[s] receives the in-block row permutation (empty if
@@ -1306,20 +1359,21 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storag
 
   // solve the off-diagonal panels against the diagonal factors.
   if (m_supernodes[s].offDiagonalRowCount > 0) {
+    ContiguousPanel upper = upperPanel(s);
     // U12's rows are the same equations as the diagonal block, so apply the
     // in-block pivot permutation to upperFactor's rows before the L_kk solve.
     // (lowerFactor's rows are other equations, below the block, and are not
     // permuted — its values use the pivoted U_kk via the right solve below.)
     if (!rowPerm.empty()) {
       const StorageIndex w = m_supernodes[s].width();
-      DenseMatrix permuted(w, m_upperFactor[s].cols());
-      for (StorageIndex k = 0; k < w; ++k) permuted.row(k) = m_upperFactor[s].row(rowPerm[k]);
-      m_upperFactor[s] = std::move(permuted);
+      DenseMatrix permuted(w, upper.cols());
+      for (StorageIndex k = 0; k < w; ++k) permuted.row(k) = upper.row(rowPerm[k]);
+      upper = permuted;  // copy back into the contiguous arena (cannot move into a Map)
     }
     // lowerFactor := lowerFactor * U_kk^{-1}
-    diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(m_lowerFactor[s]);
+    diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(lowerPanel(s));
     // upperFactor := L_kk^{-1} * upperFactor
-    diag.template triangularView<UnitLower>().solveInPlace(m_upperFactor[s]);
+    diag.template triangularView<UnitLower>().solveInPlace(upper);
   }
 }
 
@@ -1353,41 +1407,56 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     staticPivot = numext::sqrt(NumTraits<RealScalar>::epsilon()) * maxAbs;
   }
 
-  // 1) allocate and zero the dense panels.
-  m_diagonalFactor.resize(supernodeNbr);
-  m_lowerFactor.resize(supernodeNbr);
-  m_upperFactor.resize(supernodeNbr);
-  m_diagPivot.assign(supernodeNbr, std::vector<StorageIndex>());
+  // 1) lay out and zero the two contiguous panel arenas (coeftab/ucoeftab). Each
+  //    supernode gets a (width+offDiag) x width L panel and a width x offDiag U
+  //    panel, placed end-to-end; m_lOffset/m_uOffset record the starts.
+  m_lOffset.assign(supernodeNbr, 0);
+  m_uOffset.assign(supernodeNbr, 0);
+  std::size_t lTotal = 0, uTotal = 0;
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
-    const StorageIndex w = sn.width();
-    const StorageIndex r = sn.offDiagonalRowCount;
-    m_diagonalFactor[s] = DenseMatrix::Zero(w, w);
-    m_lowerFactor[s] = DenseMatrix::Zero(r, w);
-    m_upperFactor[s] = DenseMatrix::Zero(w, r);
+    const std::size_t w = static_cast<std::size_t>(sn.width());
+    const std::size_t r = static_cast<std::size_t>(sn.offDiagonalRowCount);
+    m_lOffset[s] = lTotal;
+    m_uOffset[s] = uTotal;
+    lTotal += (w + r) * w;
+    uTotal += w * r;
   }
+  m_lStorage.assign(lTotal, Scalar(0));
+  m_uStorage.assign(uTotal, Scalar(0));
+  m_diagPivot.assign(supernodeNbr, std::vector<StorageIndex>());
 
-  // 2) scatter the (permuted) values of A into the panels.
+  // 2) scatter the (permuted) values of A into the panels. Write straight into
+  //    the arenas by computed offset (column-major, L-panel leading dimension =
+  //    width+offDiag; the diagonal block occupies its first `width` rows).
   for (StorageIndex j = 0; j < m_size; ++j) {
     const StorageIndex jj = m_toInternal[j];
     const StorageIndex columnSupernode = m_supernodeOfColumn[jj];
     const Supernode& cs = m_supernodes[columnSupernode];
+    const std::size_t csFirst = static_cast<std::size_t>(cs.firstColumn);
+    const std::size_t csWidth = static_cast<std::size_t>(cs.width());
+    const std::size_t csStride = csWidth + static_cast<std::size_t>(cs.offDiagonalRowCount);
     for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
       const StorageIndex origRow = static_cast<StorageIndex>(it.index());
       // m_rowToInternal folds the matching row permutation into the ordering, so
       // the matched entry of each column lands on the internal diagonal block.
       const StorageIndex ii = m_rowToInternal[origRow];
       const Scalar value = it.value() * m_rowScale[origRow] * m_colScale[j];  // A~ = Dr A Dc
-      if (m_supernodeOfColumn[ii] == columnSupernode) {
-        m_diagonalFactor[columnSupernode](ii - cs.firstColumn, jj - cs.firstColumn) += value;
-      } else if (ii > jj) {  // below-diagonal: owned by the column's supernode
-        const StorageIndex pos = rowPanelPosition(columnSupernode, ii);
-        m_lowerFactor[columnSupernode](pos, jj - cs.firstColumn) += value;
-      } else {  // above-diagonal: owned by the row's supernode
+      if (m_supernodeOfColumn[ii] == columnSupernode) {  // diagonal block of L panel
+        const std::size_t col = static_cast<std::size_t>(jj) - csFirst;
+        const std::size_t row = static_cast<std::size_t>(ii) - csFirst;
+        m_lStorage[m_lOffset[columnSupernode] + col * csStride + row] += value;
+      } else if (ii > jj) {  // below-diagonal: L off-diagonal panel (rows >= width)
+        const std::size_t col = static_cast<std::size_t>(jj) - csFirst;
+        const std::size_t pos = static_cast<std::size_t>(rowPanelPosition(columnSupernode, ii));
+        m_lStorage[m_lOffset[columnSupernode] + col * csStride + csWidth + pos] += value;
+      } else {  // above-diagonal: U off-diagonal panel of the row's supernode
         const StorageIndex rowSupernode = m_supernodeOfColumn[ii];
         const Supernode& rs = m_supernodes[rowSupernode];
-        const StorageIndex pos = rowPanelPosition(rowSupernode, jj);
-        m_upperFactor[rowSupernode](ii - rs.firstColumn, pos) += value;
+        const std::size_t rsWidth = static_cast<std::size_t>(rs.width());
+        const std::size_t pos = static_cast<std::size_t>(rowPanelPosition(rowSupernode, jj));
+        const std::size_t row = static_cast<std::size_t>(ii) - static_cast<std::size_t>(rs.firstColumn);
+        m_uStorage[m_uOffset[rowSupernode] + pos * rsWidth + row] += value;
       }
     }
   }
@@ -1480,11 +1549,12 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) co
       DenseMatrix tmp = head;
       for (StorageIndex k = 0; k < w; ++k) head.row(k) = tmp.row(piv[k]);
     }
-    m_diagonalFactor[s].template triangularView<UnitLower>().solveInPlace(head);
+    diagBlock(s).template triangularView<UnitLower>().solveInPlace(head);
+    const ConstStridedPanel lower = lowerPanel(s);
     for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
       const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
       const StorageIndex hb = block.height();
-      y.middleRows(block.firstRow, hb).noalias() -= m_lowerFactor[s].middleRows(block.panelOffset, hb) * head;
+      y.middleRows(block.firstRow, hb).noalias() -= lower.middleRows(block.panelOffset, hb) * head;
     }
   }
 }
@@ -1499,12 +1569,13 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseU(Dest& y) co
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
+    const ConstContiguousPanel upper = upperPanel(s);
     for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
       const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
       const StorageIndex hb = block.height();
-      head.noalias() -= m_upperFactor[s].middleCols(block.panelOffset, hb) * y.middleRows(block.firstRow, hb);
+      head.noalias() -= upper.middleCols(block.panelOffset, hb) * y.middleRows(block.firstRow, hb);
     }
-    m_diagonalFactor[s].template triangularView<Upper>().solveInPlace(head);
+    diagBlock(s).template triangularView<Upper>().solveInPlace(head);
     if (s == 0) break;  // guard against unsigned underflow
   }
 }
@@ -1586,13 +1657,14 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseUTransposed(D
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
     if (Conjugate)
-      m_diagonalFactor[s].template triangularView<Upper>().adjoint().solveInPlace(head);
+      diagBlock(s).template triangularView<Upper>().adjoint().solveInPlace(head);
     else
-      m_diagonalFactor[s].template triangularView<Upper>().transpose().solveInPlace(head);
+      diagBlock(s).template triangularView<Upper>().transpose().solveInPlace(head);
+    const ConstContiguousPanel U = upperPanel(s);
     for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
       const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
       const StorageIndex hb = block.height();
-      const auto panel = m_upperFactor[s].middleCols(block.panelOffset, hb);  // w x hb
+      const auto panel = U.middleCols(block.panelOffset, hb);  // w x hb
       if (Conjugate)
         y.middleRows(block.firstRow, hb).noalias() -= panel.adjoint() * head;
       else
@@ -1613,19 +1685,20 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(D
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
+    const ConstStridedPanel L = lowerPanel(s);
     for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
       const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
       const StorageIndex hb = block.height();
-      const auto panel = m_lowerFactor[s].middleRows(block.panelOffset, hb);  // hb x w
+      const auto panel = L.middleRows(block.panelOffset, hb);  // hb x w
       if (Conjugate)
         head.noalias() -= panel.adjoint() * y.middleRows(block.firstRow, hb);
       else
         head.noalias() -= panel.transpose() * y.middleRows(block.firstRow, hb);
     }
     if (Conjugate)
-      m_diagonalFactor[s].template triangularView<UnitLower>().adjoint().solveInPlace(head);
+      diagBlock(s).template triangularView<UnitLower>().adjoint().solveInPlace(head);
     else
-      m_diagonalFactor[s].template triangularView<UnitLower>().transpose().solveInPlace(head);
+      diagBlock(s).template triangularView<UnitLower>().transpose().solveInPlace(head);
     // transpose of applyInverseL applies the INVERSE in-block pivot permutation
     // here: head := P_s^{-1} head (newhead[piv[k]] = head[k]).
     const std::vector<StorageIndex>& piv = m_diagPivot[s];
