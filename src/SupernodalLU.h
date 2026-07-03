@@ -27,7 +27,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <unordered_map>
 #include <vector>
 
 #include "SupernodalLUSupport.h"
@@ -443,6 +442,29 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // numeric helper: subtract the Schur contribution of a source supernode.
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex facingBlock);
 
+  // Panel position of off-diagonal internal row `r` within supernode `s`.
+  // The supernode's off-diagonal rows are partitioned into sorted, non-overlapping
+  // row blocks; within a block the position is panelOffset + (r - firstRow). A
+  // binary search over the (few) row blocks replaces a per-supernode hash map:
+  // less memory, contiguous access, and `r` is always a genuine off-diagonal row
+  // of `s` at every call site. See pastix_algorithms.md (offset arithmetic).
+  StorageIndex rowPanelPosition(StorageIndex s, StorageIndex r) const {
+    const Supernode& sn = m_supernodes[s];
+    const StorageIndex first = sn.firstRowBlock;
+    StorageIndex lo = 0, hi = sn.rowBlockCount;
+    while (lo < hi) {
+      const StorageIndex mid = lo + ((hi - lo) >> 1);
+      if (m_rowBlocks[first + mid].lastRow < r)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    const RowBlock& block = m_rowBlocks[first + lo];
+    eigen_assert(lo < sn.rowBlockCount && block.firstRow <= r && r <= block.lastRow &&
+                 "rowPanelPosition: row is not an off-diagonal row of this supernode");
+    return block.panelOffset + (r - block.firstRow);
+  }
+
   // factor one supernode in place: pull its Schur updates, do the unpivoted LU
   // of its diagonal block, then solve its off-diagonal panels. Writes only this
   // supernode's panels, so supernodes in the same elimination-tree level run
@@ -540,8 +562,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   std::vector<RowBlock> m_rowBlocks;             // flattened, owned by supernodes
   std::vector<StorageIndex> m_supernodeOfColumn;  // internal column -> supernode id
   std::vector<std::vector<UpdateSource>> m_updateSources;  // per target supernode
-  // m_rowPosition[s][internalRow] = position of that off-diagonal row in supernode s
-  std::vector<std::unordered_map<StorageIndex, StorageIndex>> m_rowPosition;
+  // Off-diagonal row -> panel position is computed on the fly by rowPanelPosition()
+  // via binary search over each supernode's sorted row blocks (see that helper).
   // m_levelGroups[level] = supernodes that can be factored concurrently.
   std::vector<std::vector<StorageIndex>> m_levelGroups;
 
@@ -832,21 +854,17 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::detectSupernodesAndBlocks
     sn.offDiagonalRowCount = offset;
   }
 
-  // Build, for each supernode, the map from off-diagonal internal row -> panel
-  // position, and the list of contributing sources for the left-looking sweep.
-  m_rowPosition.assign(supernodeNbr, std::unordered_map<StorageIndex, StorageIndex>());
+  // Build, for each supernode, the list of contributing sources for the
+  // left-looking sweep. (The off-diagonal row -> panel position map is no longer
+  // materialized; rowPanelPosition() derives it from the sorted row blocks.)
   m_updateSources.assign(supernodeNbr, std::vector<UpdateSource>());
 
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
-    auto& position = m_rowPosition[s];
-    position.reserve(static_cast<std::size_t>(sn.offDiagonalRowCount));
     StorageIndex previousFacing = StorageIndex(-1);
     for (StorageIndex b = 0; b < sn.rowBlockCount; ++b) {
       const StorageIndex blockIndex = sn.firstRowBlock + b;
       const RowBlock& block = m_rowBlocks[blockIndex];
-      for (StorageIndex r = block.firstRow; r <= block.lastRow; ++r)
-        position[r] = block.panelOffset + (r - block.firstRow);
       // Register one update per (source, facing supernode); a source's rows
       // inside one target's columns are consecutive in the sorted panel, so all
       // blocks facing the same target are consecutive. Record only the first.
@@ -991,7 +1009,6 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
   DenseMatrix& targetDiag = m_diagonalFactor[target];
   DenseMatrix& targetLower = m_lowerFactor[target];
   DenseMatrix& targetUpper = m_upperFactor[target];
-  const auto& targetPosition = m_rowPosition[target];
 
   // The blocks of the source facing the target are consecutive: [firstFacing, lastFacing).
   StorageIndex lastFacing = firstFacingBlock;
@@ -1015,7 +1032,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
         const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
         targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
       } else {  // below rows -> target lower panel
-        const StorageIndex destRow = targetPosition.at(rowBlock.firstRow);
+        const StorageIndex destRow = rowPanelPosition(target, rowBlock.firstRow);
         targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
       }
     }
@@ -1025,7 +1042,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
     for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
       const RowBlock& rowBlock = m_rowBlocks[rb];
       const StorageIndex rowCount = rowBlock.height();
-      const StorageIndex destCol = targetPosition.at(rowBlock.firstRow);
+      const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
       const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);  // wSrc x rc
       targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
     }
@@ -1242,22 +1259,12 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
       if (m_supernodeOfColumn[ii] == columnSupernode) {
         m_diagonalFactor[columnSupernode](ii - cs.firstColumn, jj - cs.firstColumn) += value;
       } else if (ii > jj) {  // below-diagonal: owned by the column's supernode
-#ifdef SNLU_DEBUG
-        if (!m_rowPosition[columnSupernode].count(ii))
-          std::fprintf(stderr, "SCATTER lower miss: ii=%d jj=%d colSn=%d [%d..%d]\n", (int)ii, (int)jj,
-                       (int)columnSupernode, (int)cs.firstColumn, (int)cs.lastColumn);
-#endif
-        const StorageIndex pos = m_rowPosition[columnSupernode].at(ii);
+        const StorageIndex pos = rowPanelPosition(columnSupernode, ii);
         m_lowerFactor[columnSupernode](pos, jj - cs.firstColumn) += value;
       } else {  // above-diagonal: owned by the row's supernode
         const StorageIndex rowSupernode = m_supernodeOfColumn[ii];
         const Supernode& rs = m_supernodes[rowSupernode];
-#ifdef SNLU_DEBUG
-        if (!m_rowPosition[rowSupernode].count(jj))
-          std::fprintf(stderr, "SCATTER upper miss: ii=%d jj=%d rowSn=%d [%d..%d]\n", (int)ii, (int)jj,
-                       (int)rowSupernode, (int)rs.firstColumn, (int)rs.lastColumn);
-#endif
-        const StorageIndex pos = m_rowPosition[rowSupernode].at(jj);
+        const StorageIndex pos = rowPanelPosition(rowSupernode, jj);
         m_upperFactor[rowSupernode](ii - rs.firstColumn, pos) += value;
       }
     }
