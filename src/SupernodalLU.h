@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <vector>
 
 #include "SupernodalLUSupport.h"
@@ -965,8 +966,20 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodePartition
   // live frontier, instead of ALL n columns' full fill lists simultaneously
   // for the whole analyze phase.
   std::vector<std::vector<StorageIndex>> columnStructure(n);
-  std::vector<StorageIndex> markedAt(n, StorageIndex(-1));
-  std::vector<StorageIndex> scratch;
+  // Column j's fill beyond j is the UNION of already-sorted, already-deduped
+  // ranges: adjacency[j]'s own tail beyond j (adjacency rows are sorted+
+  // deduped once, in buildSymmetricAdjacency), plus each child's columnStructure
+  // tail beyond j (sorted+deduped by this same construction, inductively). A
+  // sorted union of sorted inputs is exactly what std::set_union computes, in
+  // time linear in the input/output sizes -- so folding the children in one at
+  // a time via set_union (ping-ponging between scratch/scratch2) produces the
+  // same deduped, sorted result as the old mark-and-sweep-then-std::sort
+  // approach, but without ever paying an O(m log m) sort of a list that's
+  // almost entirely inherited, unchanged, from one child. This was the actual
+  // hot path on large fill-heavy matrices (large near-root supernodes' columns
+  // have the biggest m, and the OLD code re-sorted their near-identical
+  // structure from scratch at every one of their member columns).
+  std::vector<StorageIndex> scratch, scratch2;
 
   auto rowsBeyond = [](const std::vector<StorageIndex>& structure, StorageIndex col) -> StorageIndex {
     return static_cast<StorageIndex>(structure.end() - std::upper_bound(structure.begin(), structure.end(), col));
@@ -991,26 +1004,23 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodePartition
   StorageIndex currentStart = 0;
 
   for (StorageIndex j = 0; j < n; ++j) {
-    // --- symbolic fill of column j ---
-    scratch.clear();
-    scratch.push_back(j);  // diagonal
-    markedAt[j] = j;
-    for (StorageIndex neighbor : adjacency[j]) {
-      if (neighbor > j && markedAt[neighbor] != j) {
-        markedAt[neighbor] = j;
-        scratch.push_back(neighbor);
-      }
-    }
+    // --- symbolic fill of column j: merge already-sorted tails, no sort ---
+    const auto& adjJ = adjacency[j];
+    auto adjBeyond = std::upper_bound(adjJ.begin(), adjJ.end(), j);
+    scratch.assign(adjBeyond, adjJ.end());  // own new neighbors beyond j (small)
     for (StorageIndex c : children[j]) {
-      for (StorageIndex r : columnStructure[c]) {
-        if (r > j && markedAt[r] != j) {
-          markedAt[r] = j;
-          scratch.push_back(r);
-        }
-      }
+      const std::vector<StorageIndex>& cs = columnStructure[c];
+      auto childBeyond = std::upper_bound(cs.begin(), cs.end(), j);
+      if (childBeyond == cs.end()) continue;  // nothing from this child survives past j
+      scratch2.clear();
+      scratch2.reserve(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
+      std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), std::back_inserter(scratch2));
+      scratch.swap(scratch2);
     }
-    std::sort(scratch.begin(), scratch.end());
-    columnStructure[j] = scratch;
+    columnStructure[j].clear();
+    columnStructure[j].reserve(scratch.size() + 1);
+    columnStructure[j].push_back(j);  // diagonal, smaller than everything above (all > j)
+    columnStructure[j].insert(columnStructure[j].end(), scratch.begin(), scratch.end());
 
     // --- supernode-boundary decision (same rules as before). A boundary at
     //     column j is MANDATORY when parent[j-1]!=j (j does not continue the
