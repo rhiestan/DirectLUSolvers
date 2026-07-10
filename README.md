@@ -647,7 +647,18 @@ solver.compute(A);
   `Eigen::SparseLU` fails outright on).
 - Ordering matters more than any kernel-level tuning: `SupernodalLUAuto` never loses to plain
   AMD in testing and can win substantially (up to ~1000x tighter solve error observed on one
-  near-singular matrix), at the cost of extra `analyzePattern()` time on small matrices.
+  near-singular matrix), at the cost of extra `analyzePattern()` time on small matrices. For
+  **large, well-separated 3D FEM systems, use `MetisOrdering`** (nested dissection) — on such
+  matrices the symmetric-pattern factorization is competitive with, and sometimes beats, both
+  `Eigen::SparseLU` and MKL PARDISO on fill and memory (e.g. a 251k×251k FEM matrix: ~12x fill,
+  ~0.4 GB, matching PARDISO and using less memory than SparseLU); the remaining gap to PARDISO is
+  factorization *speed*, not fill.
+- **Get the ordering direction right.** These solvers consume the fill-reducing permutation as the
+  *inverse* of what `Eigen`'s `AMDOrdering`/`MetisOrdering` put in `indices()` (see the note in
+  `analyzePattern`). This was a bug until 2026-07: the ordering was applied backwards, which is
+  nearly invisible on near-symmetric orderings but inflates fill 250-350x on strongly directional
+  3D matrices. If you write a custom `OrderingType`, return the same convention as Eigen's
+  built-in orderings.
 - Parallel scaling benefits the most from `setIntraSupernodeParallelism` (on by default) on
   matrices with a wide, well-separated elimination tree (e.g. 2D/3D discretizations) — 3x+
   speedup measured at 32 threads, versus ~1.5x from level-parallelism alone.

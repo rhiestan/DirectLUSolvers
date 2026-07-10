@@ -1256,7 +1256,16 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
   if (orderingPerm.size() == 0) {  // NaturalOrdering returns empty
     for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = i;
   } else {
-    for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = orderingPerm.indices()(i);
+    // m_toInternal[i] must be the INTERNAL (elimination) index of original column
+    // i -- i.e. the fill-reducing "new index of i" (separators eliminated last).
+    // Eigen's ordering functors (AMDOrdering/MetisOrdering) return that mapping
+    // as the INVERSE in indices(): orderingPerm.indices()(k) is the original
+    // column placed at new position k. So we must invert it here, not copy it
+    // directly. Getting this backwards eliminates the top separators FIRST and
+    // inflates fill enormously on strongly directional matrices (e.g. 3D FEM:
+    // 250-300x more fill), while being nearly invisible on near-symmetric
+    // orderings -- which is exactly why the bug hid until the laoss matrices.
+    for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
   }
 
   // 2) elimination tree of the ordered symmetric pattern.
