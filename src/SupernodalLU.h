@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <iterator>
 #include <vector>
 
@@ -346,6 +347,35 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index nnzU() const { return m_nnzU; }
   Index supernodeCount() const { return static_cast<Index>(m_supernodes.size()); }
 
+  /** Predicted total scalars in the L and U factor arenas, computable right
+   *  after analyzePattern() and BEFORE factorize() allocates them. Each L panel
+   *  is (width+offDiag)*width (packed diagonal block + lower panel) and each U
+   *  panel is width*offDiag; the sum, times sizeof(Scalar), is the factor memory
+   *  factorize() is about to request. Use it to gauge memory or bail out on an
+   *  infeasible fill without attempting the allocation. Valid after
+   *  analyzePattern(). (nnzL()/nnzU() report the same structure post-factorize.) */
+  Index predictedFactorNonzeros() const {
+    Index total = 0;
+    for (const Supernode& sn : m_supernodes) {
+      const Index w = sn.width(), r = sn.offDiagonalRowCount;
+      total += (w + r) * w + w * r;
+    }
+    return total;
+  }
+
+  /** Fail-fast fill guard. A symmetric-pattern factorization can require far more
+   *  fill than an unsymmetric solver on matrices that lack good vertex separators
+   *  (e.g. some 3D FEM systems): the predicted L/U factor can reach hundreds of
+   *  GB where Eigen::SparseLU / PARDISO stay sub-GB. When `limit` (in scalars;
+   *  memory is limit*sizeof(Scalar)) is > 0, factorize() compares it against
+   *  predictedFactorNonzeros() -- computed from the symbolic structure alone, in
+   *  milliseconds -- and, if exceeded, ABORTS BEFORE allocating the arenas,
+   *  setting info()==NumericalIssue and a descriptive lastErrorMessage() instead
+   *  of attempting a doomed multi-hundred-GB allocation. Default 0 (off):
+   *  behavior is unchanged unless you set a limit. */
+  void setMaxFactorNonzeros(Index limit) { m_maxFactorNonzeros = limit; }
+  Index maxFactorNonzeros() const { return m_maxFactorNonzeros; }
+
   /** Number of elimination-tree levels (parallel scheduling steps). */
   Index levelCount() const { return static_cast<Index>(m_levelGroups.size()); }
   /** Supernodes in the widest level — an upper bound on usable concurrency. */
@@ -496,6 +526,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_useCostModelAmalgamation = false;
     m_costModelTolerance = 0.0;
     m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
+    m_maxFactorNonzeros = 0;  // fail-fast fill guard off by default
     m_intraParallel = true;
     m_equilibrate = true;
     m_useMatching = true;
@@ -762,6 +793,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   bool m_useCostModelAmalgamation;    // amalgamation: use the BLAS time model instead
   double m_costModelTolerance;        // amalgamation: accept merges up to this relative cost rise
   Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
+  Index m_maxFactorNonzeros;          // fail-fast fill guard (0 = off)
   bool m_intraParallel;               // parallelize inside supernodes on narrow levels
   bool m_equilibrate;                 // apply Ruiz row/column scaling
   bool m_useMatching;                 // apply MC64-style maximum-transversal matching
@@ -1613,6 +1645,31 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
   m_replacedPivots = 0;
   m_factorized = false;
   m_info = Success;
+
+  // Fail-fast fill guard: abort BEFORE allocating the factor arenas if the
+  // symbolic structure predicts a factor larger than the configured limit. This
+  // turns an (unrecoverable) multi-hundred-GB bad_alloc / OOM kill into a clean
+  // NumericalIssue with a diagnostic -- the symmetric-pattern fill of some
+  // matrices (e.g. FEM systems without good separators) is orders of magnitude
+  // larger than an unsymmetric solver would need. Off by default (limit 0).
+  if (m_maxFactorNonzeros > 0) {
+    const Index predicted = predictedFactorNonzeros();
+    if (predicted > m_maxFactorNonzeros) {
+      char buf[512];
+      std::snprintf(buf, sizeof(buf),
+                    "SupernodalLU: predicted factor size %lld scalars (~%.1f GB) exceeds the "
+                    "configured limit of %lld (setMaxFactorNonzeros). This symmetric-pattern "
+                    "fill is very large -- the matrix likely lacks good vertex separators; an "
+                    "iterative (e.g. BiCGSTAB+ILUT) or unsymmetric (SparseLU/PARDISO) solver is "
+                    "the right tool. Raise or clear the limit to force the factorization.",
+                    static_cast<long long>(predicted),
+                    static_cast<double>(predicted) * static_cast<double>(sizeof(Scalar)) / 1e9,
+                    static_cast<long long>(m_maxFactorNonzeros));
+      m_lastError = buf;
+      m_info = NumericalIssue;
+      return;  // nothing allocated; factors remain absent (isFactorized() stays false)
+    }
+  }
 
   // keep A for iterative refinement during solve().
   m_originalMatrix = matrix;

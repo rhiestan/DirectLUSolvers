@@ -290,6 +290,18 @@ operation they describe has run at least once.
   rows (equal when matching is off or found the identity).
 - **`nnzL()` / `nnzU() -> Index`** — nonzero counts of the stored `L`/`U` factors (including
   amalgamation's structural zeros).
+- **`predictedFactorNonzeros() -> Index`** — total scalars the `L`/`U` arenas will occupy,
+  computed from the symbolic structure after `analyzePattern()` and **before** `factorize()`
+  allocates them (memory ≈ this × `sizeof(Scalar)`). It equals `nnzL() + nnzU() - n` once
+  factored. Use it to gauge cost up front — a symmetric-pattern factorization can predict a
+  hundreds-of-GB factor on matrices that lack good vertex separators (some 3D FEM systems) where
+  an unsymmetric solver stays sub-GB.
+- **`setMaxFactorNonzeros(Index limit)`** (default `0` = off) — fail-fast fill guard. When set,
+  `factorize()` compares `predictedFactorNonzeros()` against `limit` and, if exceeded, **aborts
+  before allocating**, setting `info() == NumericalIssue` with a diagnostic `lastErrorMessage()`
+  (naming the predicted size and pointing to iterative/unsymmetric solvers) — instead of
+  attempting a doomed multi-hundred-GB allocation. Off by default (behavior unchanged); recommended
+  when factoring matrices of unknown structure. `maxFactorNonzeros()` returns the current limit.
 - **`supernodeCount() -> Index`** — number of supernodes after amalgamation/splitting.
 - **`levelCount() -> Index`** — number of elimination-tree levels used for scheduling.
 - **`widestLevel() -> Index`** — supernodes in the widest level, an upper bound on the useful
@@ -739,6 +751,10 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
 - **`setRefineOnlyIfPerturbed(bool)`** (default **true**) — PARDISO-style refinement gating.
 - **`logAbsDeterminant() -> RealScalar`** and **`determinantSign() -> Scalar`** — the
   log-determinant pair.
+- **`predictedFactorNonzeros()`** and **`setMaxFactorNonzeros(Index)`** — the shared fail-fast
+  fill guard (see the SupernodalLU [Diagnostics & queries](#diagnostics--queries) section). Both
+  solvers factor a symmetric pattern, so both can predict an infeasible factor on matrices without
+  good separators; the guard turns that into a clean `NumericalIssue` before allocating.
 - **`setMaxBlockSize`** (default 128) doubles as PARDISO's ~80-column panel cap and keeps the
   complete-pivoting search on a small dense block; the intra-supernode chunking `SupernodalLU`
   exposes is **not** present (the async scheduler can't nest a fork-join inside a worker, and

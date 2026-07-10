@@ -60,6 +60,7 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <iterator>
 #include <mutex>
 #include <vector>
@@ -283,6 +284,21 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   void setMaxBlockSize(Index maxBlockSize) { m_maxBlockSize = maxBlockSize; }
   Index maxBlockSize() const { return m_maxBlockSize; }
 
+  /** Fail-fast fill guard. A symmetric-pattern factorization can require far more
+   *  fill than an unsymmetric solver on matrices that lack good vertex separators
+   *  (e.g. some 3D FEM systems): the predicted L/U factor can reach hundreds of
+   *  GB where Eigen::SparseLU / PARDISO stay in the sub-GB range. When `limit`
+   *  (in scalars; memory is limit*sizeof(Scalar)) is > 0, factorize() compares it
+   *  against predictedFactorNonzeros() -- computed from the symbolic structure
+   *  alone, in milliseconds -- and, if exceeded, ABORTS BEFORE allocating the
+   *  arenas, setting info()==NumericalIssue and a descriptive lastErrorMessage()
+   *  instead of attempting a doomed multi-hundred-GB allocation. Default 0 (off):
+   *  behavior is unchanged unless you set a limit. Recommended when factoring
+   *  matrices of unknown structure; pair with predictedFactorNonzeros() to size
+   *  the limit to your machine's memory. */
+  void setMaxFactorNonzeros(Index limit) { m_maxFactorNonzeros = limit; }
+  Index maxFactorNonzeros() const { return m_maxFactorNonzeros; }
+
   /** Row/column equilibration (Ruiz). On by default; folded transparently into
    *  solve()/transpose()/determinant(). */
   void setEquilibration(bool on) { m_equilibrate = on; }
@@ -318,6 +334,22 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   Index nnzL() const { return m_nnzL; }
   Index nnzU() const { return m_nnzU; }
   Index supernodeCount() const { return static_cast<Index>(m_supernodes.size()); }
+
+  /** Predicted total scalars in the L and U factor arenas, computable right
+   *  after analyzePattern() and BEFORE factorize() allocates them. Each L panel
+   *  is (width+offDiag)*width (packed diagonal block + lower panel) and each U
+   *  panel is width*offDiag; the sum, times sizeof(Scalar), is the factor memory
+   *  factorize() is about to request. Use it to gauge memory or bail out on an
+   *  infeasible fill without attempting the allocation. Valid after
+   *  analyzePattern(). (nnzL()/nnzU() report the same structure post-factorize.) */
+  Index predictedFactorNonzeros() const {
+    Index total = 0;
+    for (const Supernode& sn : m_supernodes) {
+      const Index w = sn.width(), r = sn.offDiagonalRowCount;
+      total += (w + r) * w + w * r;
+    }
+    return total;
+  }
 
   /** Number of assembly-tree levels (a diagnostic; the dynamic scheduler does not
    *  use levels to schedule -- there are no level barriers). */
@@ -483,6 +515,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_maxAmalgamationZeroRows = 4;
     m_amalgamationFillFraction = 0.3;
     m_maxBlockSize = 128;
+    m_maxFactorNonzeros = 0;  // fail-fast fill guard off by default
     m_equilibrate = true;
     m_useMatching = true;
     m_pivoting = left_right_lu::Pivoting::Complete;
@@ -634,6 +667,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   Index m_maxAmalgamationZeroRows;
   double m_amalgamationFillFraction;
   Index m_maxBlockSize;
+  Index m_maxFactorNonzeros;  // fail-fast fill guard (0 = off)
   bool m_equilibrate;
   bool m_useMatching;
   left_right_lu::Pivoting m_pivoting;
@@ -1204,6 +1238,31 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
   m_replacedPivots = 0;
   m_factorized = false;
   m_info = Success;
+
+  // Fail-fast fill guard: abort BEFORE allocating the factor arenas if the
+  // symbolic structure predicts a factor larger than the configured limit. This
+  // turns an (unrecoverable) multi-hundred-GB bad_alloc / OOM kill into a clean
+  // NumericalIssue with a diagnostic -- the symmetric-pattern fill of some
+  // matrices (e.g. FEM systems without good separators) is orders of magnitude
+  // larger than an unsymmetric solver would need. Off by default (limit 0).
+  if (m_maxFactorNonzeros > 0) {
+    const Index predicted = predictedFactorNonzeros();
+    if (predicted > m_maxFactorNonzeros) {
+      char buf[512];
+      std::snprintf(buf, sizeof(buf),
+                    "LeftRightLU: predicted factor size %lld scalars (~%.1f GB) exceeds the "
+                    "configured limit of %lld (setMaxFactorNonzeros). This symmetric-pattern "
+                    "fill is very large -- the matrix likely lacks good vertex separators; an "
+                    "iterative (e.g. BiCGSTAB+ILUT) or unsymmetric (SparseLU/PARDISO) solver is "
+                    "the right tool. Raise or clear the limit to force the factorization.",
+                    static_cast<long long>(predicted),
+                    static_cast<double>(predicted) * static_cast<double>(sizeof(Scalar)) / 1e9,
+                    static_cast<long long>(m_maxFactorNonzeros));
+      m_lastError = buf;
+      m_info = NumericalIssue;
+      return;  // nothing allocated; factors remain absent (isFactorized() stays false)
+    }
+  }
 
   m_originalMatrix = matrix;
 

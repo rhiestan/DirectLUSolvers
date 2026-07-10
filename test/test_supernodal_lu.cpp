@@ -294,6 +294,36 @@ void testHonestFailure() {
         "honest check: status recovers on a consistent RHS", resid2);
 }
 
+// Fail-fast fill guard: predictedFactorNonzeros() after analyze exactly matches
+// the realized fill; setMaxFactorNonzeros() below the real fill aborts factorize
+// cleanly (NumericalIssue, nothing allocated); above it, it proceeds normally.
+void testFillGuard() {
+  SparseMatrix<double> A = laplacian2d(20, 20);
+  const int n = static_cast<int>(A.rows());
+
+  Eigen::SupernodalLU<SparseMatrix<double>> probe;
+  probe.analyzePattern(A);
+  const long long predicted = probe.predictedFactorNonzeros();
+  check(predicted > 0, "predictedFactorNonzeros() > 0 after analyze", predicted > 0 ? 0.0 : 1.0);
+
+  Eigen::SupernodalLU<SparseMatrix<double>> guarded;
+  guarded.setMaxFactorNonzeros(1000);  // far below the true fill -> must trip
+  guarded.compute(A);
+  check(guarded.info() == Eigen::NumericalIssue && !guarded.isFactorized(),
+        "fill guard aborts factorize below limit", guarded.isFactorized() ? 1.0 : 0.0);
+
+  Eigen::SupernodalLU<SparseMatrix<double>> ok;
+  ok.setMaxFactorNonzeros(predicted + 1);  // generous -> normal factorization
+  ok.compute(A);
+  const bool factored = ok.info() == Eigen::Success && ok.isFactorized();
+  const long long realized = static_cast<long long>(ok.nnzL()) + ok.nnzU() - n;
+  check(factored && realized == predicted, "guard passes; prediction == realized fill (nnzL+U-n)",
+        factored && realized == predicted ? 0.0 : 1.0);
+  VectorXd b = A * VectorXd::Random(n);
+  const double resid = (A * ok.solve(b) - b).norm() / b.norm();
+  check(resid < 1e-8, "guarded (passing) solve is correct", resid);
+}
+
 void testMultipleRhs() {
   SparseMatrix<double> A = laplacian2d(8, 8);
   const int n = static_cast<int>(A.rows());
@@ -330,6 +360,7 @@ int main() {
   testEquilibration();
   testKrylovRefinement();
   testHonestFailure();
+  testFillGuard();
 
   std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
               g_failures, g_failures == 1 ? "" : "s");

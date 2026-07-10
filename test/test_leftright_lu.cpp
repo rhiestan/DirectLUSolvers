@@ -305,6 +305,38 @@ void testHonestFailure() {
         "honest check: status recovers on a consistent RHS", resid2);
 }
 
+// Fail-fast fill guard: predictedFactorNonzeros() is available after analyze and
+// exactly matches the realized fill; setMaxFactorNonzeros() below the real fill
+// makes factorize() abort cleanly (NumericalIssue, nothing allocated) instead of
+// attempting the allocation; above it, factorization proceeds normally.
+void testFillGuard() {
+  SparseMatrix<double> A = laplacian2d(20, 20);
+  const int n = static_cast<int>(A.rows());
+
+  Eigen::LeftRightLU<SparseMatrix<double>> probe;
+  probe.analyzePattern(A);
+  const long long predicted = probe.predictedFactorNonzeros();
+  check(predicted > 0, "predictedFactorNonzeros() > 0 after analyze", predicted > 0 ? 0.0 : 1.0);
+
+  Eigen::LeftRightLU<SparseMatrix<double>> guarded;
+  guarded.setMaxFactorNonzeros(1000);  // far below the true fill -> must trip
+  guarded.compute(A);
+  check(guarded.info() == Eigen::NumericalIssue && !guarded.isFactorized(),
+        "fill guard aborts factorize below limit", guarded.isFactorized() ? 1.0 : 0.0);
+
+  Eigen::LeftRightLU<SparseMatrix<double>> ok;
+  ok.setMaxFactorNonzeros(predicted + 1);  // generous -> normal factorization
+  ok.compute(A);
+  const bool factored = ok.info() == Eigen::Success && ok.isFactorized();
+  const long long realized = static_cast<long long>(ok.nnzL()) + ok.nnzU() - n;
+  check(factored && realized == predicted, "guard passes; prediction == realized fill (nnzL+U-n)",
+        factored && realized == predicted ? 0.0 : 1.0);
+  VectorXd b = A * VectorXd::Random(n);
+  const double resid = (A * ok.solve(b) - b).norm() / b.norm();
+  check(resid < 1e-8, "guarded (passing) solve is correct", resid);
+  std::printf("        predicted=%lld  realized(nnzL+U-n)=%lld\n", predicted, realized);
+}
+
 // Parallel dynamic scheduler vs serial: same matrix, StdThreadExecutor vs the
 // serial default must agree to solver accuracy (bit-identity is NOT a goal). Also
 // checks the scheduler completes without deadlock and reports no error.
@@ -381,6 +413,7 @@ int main() {
   testLogDeterminant();
   testEquilibration();
   testHonestFailure();
+  testFillGuard();
   testParallelVsSerial();
 
   std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
