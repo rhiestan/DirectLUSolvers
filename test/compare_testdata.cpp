@@ -72,6 +72,7 @@
 #include <vector>
 
 #include "SupernodalLU.h"
+#include "LeftRightLU.h"  // PARDISO-style sibling solver (left-right-looking + complete pivoting)
 
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
@@ -220,6 +221,16 @@ Result runSupernodal(const SparseMatrix<double>& A, const VectorXd& b, const Vec
   return runSupernodalWith<Eigen::SupernodalLU<SparseMatrix<double>>>(A, b, xTrue, amalgamate);
 }
 
+// LeftRightLU (PARDISO-style): reuses the same result-collection body -- it
+// exposes the same nnzL/nnzU/replacedPivots/supernodeCount/iterativeRefinements
+// surface -- and, like SupernodalLU, factors a symmetric pattern (so it also
+// gets Asym). Default settings: complete pivoting + dynamic scheduler (serial
+// executor here, matching the single-threaded SupernodalLU column).
+Result runLeftRight(const SparseMatrix<double>& A, const VectorXd& b, const VectorXd& xTrue,
+                    bool amalgamate) {
+  return runSupernodalWith<Eigen::LeftRightLU<SparseMatrix<double>>>(A, b, xTrue, amalgamate);
+}
+
 #ifdef HAVE_METIS
 // Same solver, but with the METIS nested-dissection ordering wired in. Uses the
 // default (amalgamated) supernode settings, like the AMD "amalgamated" run, so
@@ -345,9 +356,9 @@ int main(int argc, char** argv) {
   std::vector<std::string> files(matrices);
   if (argc > 1) files.assign(argv + 1, argv + argc);
 
-  std::printf("Precision / time comparison: SupernodalLU vs Eigen::SparseLU"
+  std::printf("Precision / time comparison: SupernodalLU vs LeftRightLU vs Eigen::SparseLU"
 #ifdef HAVE_METIS
-              " vs SupernodalLU+METIS vs SupernodalLU+Auto"
+              " (+SupernodalLU METIS/Auto)"
 #endif
 #ifdef HAVE_PARDISO
               " vs MKL PARDISO"
@@ -367,6 +378,7 @@ int main(int argc, char** argv) {
   solverHead(" SupernodalLU+METIS");
   solverHead(" SupernodalLU+Auto");
 #endif
+  solverHead(" LeftRightLU");
   solverHead(" Eigen SparseLU");
 #ifdef HAVE_PARDISO
   solverHead(" MKL PARDISO");
@@ -378,6 +390,7 @@ int main(int argc, char** argv) {
   solverSub();
   solverSub();
 #endif
+  solverSub();
   solverSub();
 #ifdef HAVE_PARDISO
   solverSub();
@@ -437,6 +450,11 @@ int main(int argc, char** argv) {
     std::printf(" |");
     printCell(autoOrd);
 #endif
+    Result lrlu;
+    if (!runSnlu) lrlu.skipped = true;
+    else lrlu = runLeftRight(Asym, b, xTrue, /*amalgamate=*/true);
+    std::printf(" |");
+    printCell(lrlu);
     Result ref = runSparseLU(A, b, xTrue);
     std::printf(" |");
     printCell(ref);
@@ -447,11 +465,13 @@ int main(int argc, char** argv) {
 #endif
     std::printf("\n");
 
-    if (!snlu.skipped &&
-        !(snlu.ok && std::isfinite(snlu.resid) && snlu.resid < 1e-6))
-      ++failures;
+    auto reachedTolerance = [](const Result& r) {
+      return r.skipped || (r.ok && std::isfinite(r.resid) && r.resid < 1e-6);
+    };
+    if (!reachedTolerance(snlu) || !reachedTolerance(lrlu)) ++failures;
   }
 
-  std::printf("\n%d matrix(es) where SupernodalLU did not reach resid < 1e-6.\n", failures);
+  std::printf("\n%d matrix(es) where SupernodalLU or LeftRightLU did not reach resid < 1e-6.\n",
+              failures);
   return failures == 0 ? 0 : 1;
 }

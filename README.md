@@ -16,6 +16,14 @@ solver.compute(A);                 // A: general values, SYMMETRIC nonzero patte
 Eigen::VectorXd x = solver.solve(b);
 ```
 
+> **Sibling solver: [`LeftRightLU`](#leftrightlu--pardiso-style-sibling-solver).** This
+> directory also ships `Eigen::LeftRightLU`, a same-interface solver built on the
+> algorithmic design of **PARDISO** instead of PaStiX: a *left-right-looking* numeric
+> factorization driven by a **barrier-free dynamic scheduler**, with in-block **complete
+> pivoting**. It reuses this module's analysis/solve pipeline and shared headers; see the
+> [LeftRightLU section](#leftrightlu--pardiso-style-sibling-solver) below and
+> `pardiso_algorithms.md` for the design background.
+
 ## Scope — read this first
 
 SupernodalLU factors **`A = P^T L U P`** for matrices with **general (unsymmetric) values but a
@@ -55,6 +63,8 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 |---|---|
 | `src/SupernodalLU.h` | The solver itself. No dependencies beyond Eigen — always safe to include. |
 | `src/SupernodalLU` | Eigen-style umbrella header, `#include <SupernodalLU>` (no extension), forwards to `SupernodalLU.h`. |
+| `src/LeftRightLU.h` | The PARDISO-style sibling solver (see [below](#leftrightlu--pardiso-style-sibling-solver)). Reuses the shared support/matching/executor headers; self-contained otherwise. |
+| `src/LeftRightLU` | Umbrella header for `LeftRightLU`, `#include <LeftRightLU>`. |
 | `src/SupernodalLUSupport.h` | Plain data structures shared by the analysis/factorization phases (`Supernode`, `RowBlock`, `UpdateSource`). |
 | `src/SupernodalLUMatching.h` | The maximum-transversal matching + permutation-sign helpers used by `setMatching()`. |
 | `src/SupernodalLUExecutor.h` | The `Executor` concept, plus the bundled `SerialExecutor` and `StdThreadExecutor` backends. No dependency beyond `<thread>`. |
@@ -63,6 +73,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `src/SupernodalLUMetis.h` | `SupernodalLUMetis<Mat[,Executor]>` alias wiring in METIS nested dissection. Optional, requires METIS + GKlib. |
 | `src/SupernodalLUAutoOrdering.h` | `SupernodalLUAuto<Mat[,Executor]>` alias: tries AMD and several METIS restarts, keeps the least-fill one. Optional, requires METIS + GKlib. |
 | `test/test_supernodal_lu.cpp` | Correctness tests (dependency-free — only needs Eigen). |
+| `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
 
@@ -650,6 +661,103 @@ clang++ -std=c++17 -O2 -I eigen -I DirectLUSolvers/src \
     DirectLUSolvers/test/compare_testdata.cpp -o build/compare_testdata
 ./build/compare_testdata
 ```
+
+## LeftRightLU — PARDISO-style sibling solver
+
+`Eigen::LeftRightLU` (`src/LeftRightLU.h`, `#include <LeftRightLU>`) is a second sparse
+direct LU solver in this directory with the **same `Eigen::SparseLU`-compatible interface**
+as `SupernodalLU`, but built on the algorithmic design of **PARDISO** (see
+`pardiso_algorithms.md`) rather than PaStiX. It **reuses `SupernodalLU`'s symbolic analysis
+and solve pipeline verbatim** — matching, ordering, elimination tree, supernode detection
+with amalgamation/splitting, block symbolic factorization, Ruiz equilibration, and the
+block triangular solve with iterative/Krylov refinement (it shares the same
+`SupernodalLUSupport.h` / `SupernodalLUMatching.h` / `SupernodalLUExecutor.h` headers) — and
+replaces only the **numeric core** with PARDISO's two distinctive ideas.
+
+```cpp
+#include <LeftRightLU.h>
+
+Eigen::LeftRightLU<Eigen::SparseMatrix<double>> solver;
+solver.compute(A);                 // A: general values, SYMMETRIC nonzero pattern
+Eigen::VectorXd x = solver.solve(b);
+```
+
+### What's different from SupernodalLU
+
+1. **Left-right-looking, barrier-free dynamic scheduling** (the single largest
+   architectural gap `pardiso_algorithms.md` §7.2 identifies against `SupernodalLU`).
+   `SupernodalLU` factors bulk-synchronously: one `parallelFor` per elimination-tree level
+   with a **hard barrier between levels**, so the big root separators serialize a whole
+   level. `LeftRightLU` instead gives each supernode an **atomic count of unfinished update
+   sources** (its in-degree in the assembly DAG). A worker takes a *ready* supernode (count
+   0), **gathers** its updates from the already-finished sources (left-looking), factors it,
+   then **pushes** readiness to its consumers (right-looking) — decrementing their counters
+   and enqueuing any that reach zero. No worker ever blocks on a dependency; it always takes
+   the next ready node, so there are **no level barriers**. A LIFO ready-stack gives
+   depth-first subtree affinity (PARDISO's cooperative subtree ownership, minus the NUMA
+   placement, which is out of scope). This runs as a single `parallelFor(0, P, worker)` over
+   the same pluggable `Executor` — each worker is itself a complete sequential scheduler, so
+   even a serial or fork-join executor drives it correctly (verified with the serial,
+   `StdThreadExecutor`, and `OpenMPExecutor` backends).
+
+2. **In-block complete pivoting** (PARDISO `DGETC2`, unsymmetric `MTYPE=11/13`). Where
+   `SupernodalLU` does row-only restricted pivoting, `LeftRightLU` factors each supernode's
+   dense diagonal block with **both row and column interchanges** confined to that block,
+   giving per-supernode row (`P_s`) and column (`Q_s`) permutations. Because the search never
+   leaves the block, the precomputed symbolic structure is never invalidated (the Schur
+   update a supernode sends is invariant under `P_s`/`Q_s` — the local permutations cancel).
+   The column permutation is folded transparently through `solve()`, `transpose()`/
+   `adjoint()`, and `determinant()`. Selectable via `setPivoting(Pivoting::{None, Partial,
+   Complete})`; default **Complete**.
+
+3. **Refinement gated on perturbation** (PARDISO `IPARM(8)=0`). By default `solve()` runs
+   refinement **only if the factorization actually bumped a static pivot**
+   (`replacedPivots() > 0`); an un-perturbed factorization is already backward-stable, so
+   refinement is skipped. Toggle with `setRefineOnlyIfPerturbed(false)` to always refine.
+
+4. **Log-determinant** (PARDISO `IPARM(33)`): `logAbsDeterminant()` returns `log|det(A)|` as
+   a sum of logs (stays finite where `determinant()` would overflow), paired with
+   `determinantSign()`.
+
+**Excluded by design** (project scope): NUMA-aware data placement, out-of-core
+factorization, MPI, and the symmetric-indefinite Bunch-Kaufman `LDLᵀ` path (a documented
+follow-up — this first version is the unsymmetric LU path). Bit-reproducibility across thread
+counts is **not** a goal: the dynamic scheduler reassociates floating-point updates, so the
+parallel result may differ from the serial one at the ~1e-14 level (the true residual is
+unaffected and refinement cleans up the rest).
+
+### Option reference (deltas from SupernodalLU)
+
+`LeftRightLU` shares SupernodalLU's full option surface (static-pivot threshold, refinement
+method/tolerance, matching, equilibration, amalgamation, `setMaxBlockSize`, the `Executor`
+accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, the honest
+`info()`/`solveResidual()` failure check, …). The differences:
+
+- **`setPivoting(left_right_lu::Pivoting mode)`** — `None` / `Partial` (row-only) / `Complete`
+  (row + column, **default**). `setDiagonalPivoting(true|false)` remains as a convenience
+  alias mapping to `Complete` / `None`.
+- **`setRefineOnlyIfPerturbed(bool)`** (default **true**) — PARDISO-style refinement gating.
+- **`logAbsDeterminant() -> RealScalar`** and **`determinantSign() -> Scalar`** — the
+  log-determinant pair.
+- **`setMaxBlockSize`** (default 128) doubles as PARDISO's ~80-column panel cap and keeps the
+  complete-pivoting search on a small dense block; the intra-supernode chunking `SupernodalLU`
+  exposes is **not** present (the async scheduler can't nest a fork-join inside a worker, and
+  the dynamic schedule already shrinks the serial tail to a single node).
+- `levelCount()`/`widestLevel()` remain as **diagnostics only** — the scheduler does not use
+  levels to schedule (there are no level barriers).
+
+### Testing
+
+```sh
+clang++ -std=c++17 -O2 -pthread -I eigen -I DirectLUSolvers/src \
+    DirectLUSolvers/test/test_leftright_lu.cpp -o build/test_leftright_lu
+./build/test_leftright_lu
+```
+
+`test/test_leftright_lu.cpp` covers direct/multi-RHS solves, factor accessors, transpose/
+adjoint, all three pivoting modes, the forced column-swap path (matching off + weak diagonal)
+with its solve/transpose/determinant folding, log-determinant, equilibration, honest failure
+reporting, and parallel(dynamic-scheduler)-vs-serial agreement plus a deadlock-stress loop.
 
 ## License
 
