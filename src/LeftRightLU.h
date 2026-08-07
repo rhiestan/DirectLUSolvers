@@ -58,9 +58,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <iterator>
 #include <mutex>
 #include <vector>
@@ -1362,36 +1364,113 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
       }
     }
   } else {
-    // Parallel dynamic DAG scheduler. remaining[s] = number of unfinished sources.
+    // Parallel dynamic DAG scheduler with PER-WORKER DEQUES AND WORK STEALING.
+    // remaining[s] = number of unfinished update sources of s.
+    //
+    // The previous implementation kept one global mutex-guarded ready stack and
+    // called notify_all() after every completed supernode. That serialized every
+    // task acquisition and every push behind a single lock, and woke all P
+    // workers per supernode when at most a couple could make progress. Measured
+    // on 32 threads it stopped scaling around 8 and then went BACKWARDS
+    // (lap2d_300^2 56.3ms at 16 threads -> 72.6ms at 32; lap3d_30^3 542 -> 634),
+    // which is the classic shape of ready-queue contention rather than of a
+    // parallelism shortage. It also defeated the depth-first subtree affinity
+    // the LIFO was there to provide: a worker pushed its freshly-readied
+    // children onto the shared stack where any other worker took them
+    // immediately, so a subtree's data never stayed on one core.
+    //
+    // Each worker now owns a deque and pushes the consumers IT readied onto its
+    // own back, popping from its own back as well: depth-first, and the node it
+    // just produced (whose data is hot in this core's cache) is the node it
+    // takes next. Only when its own deque runs dry does it steal, and it steals
+    // from the FRONT of a victim -- the oldest entry, furthest from the victim's
+    // hot end, so stealing rarely collides with the owner and tends to move a
+    // whole coarse subtree rather than one leaf.
     std::vector<std::atomic<int>> remaining(static_cast<std::size_t>(supernodeNbr));
     for (StorageIndex s = 0; s < supernodeNbr; ++s)
       remaining[s].store(static_cast<int>(m_updateSources[s].size()), std::memory_order_relaxed);
 
-    std::mutex qmutex;
-    std::condition_variable qcv;
-    std::vector<StorageIndex> readyStack;  // LIFO: depth-first subtree affinity
-    readyStack.reserve(static_cast<std::size_t>(supernodeNbr));
-    for (StorageIndex s = 0; s < supernodeNbr; ++s)
-      if (remaining[s].load(std::memory_order_relaxed) == 0) readyStack.push_back(s);
+    // One deque per lane, each cache-line aligned so two workers' locks and
+    // bookkeeping never share a line.
+    struct alignas(64) WorkerDeque {
+      std::mutex mutex;
+      std::deque<StorageIndex> items;
+    };
+    std::vector<WorkerDeque> queues(static_cast<std::size_t>(lanes));
+
+    // Seed the initially-ready supernodes round-robin, so the sweep starts with
+    // every lane holding work instead of one lane holding all of it.
+    {
+      std::size_t lane = 0;
+      for (StorageIndex s = 0; s < supernodeNbr; ++s)
+        if (remaining[s].load(std::memory_order_relaxed) == 0) {
+          queues[lane].items.push_back(s);
+          lane = (lane + 1) % static_cast<std::size_t>(lanes);
+        }
+    }
+
     std::atomic<StorageIndex> completed{0};
     std::atomic<bool> failed{false};
 
-    auto worker = [&](Index) {
+    // Idle workers park here rather than spinning. `sleepers` lets a producer
+    // skip the notify entirely in the common case where nobody is parked, which
+    // is what removes the per-supernode notify_all cost. Waits are bounded, so a
+    // notify that races with a worker about to park costs latency, never a hang.
+    std::mutex idleMutex;
+    std::condition_variable idleCv;
+    std::atomic<int> sleepers{0};
+
+    auto pushLocal = [&](std::size_t lane, StorageIndex t) {
+      {
+        std::lock_guard<std::mutex> lk(queues[lane].mutex);
+        queues[lane].items.push_back(t);
+      }
+      if (sleepers.load(std::memory_order_acquire) > 0) idleCv.notify_one();
+    };
+
+    auto popLocal = [&](std::size_t lane) -> StorageIndex {
+      std::lock_guard<std::mutex> lk(queues[lane].mutex);
+      if (queues[lane].items.empty()) return StorageIndex(-1);
+      const StorageIndex s = queues[lane].items.back();  // LIFO: hottest first
+      queues[lane].items.pop_back();
+      return s;
+    };
+
+    auto trySteal = [&](std::size_t lane) -> StorageIndex {
+      for (std::size_t k = 1; k < static_cast<std::size_t>(lanes); ++k) {
+        const std::size_t victim = (lane + k) % static_cast<std::size_t>(lanes);
+        std::lock_guard<std::mutex> lk(queues[victim].mutex);
+        if (queues[victim].items.empty()) continue;
+        const StorageIndex s = queues[victim].items.front();  // oldest, coldest
+        queues[victim].items.pop_front();
+        return s;
+      }
+      return StorageIndex(-1);
+    };
+
+    auto worker = [&](Index laneIndex) {
+      const std::size_t lane = static_cast<std::size_t>(laneIndex);
       std::vector<StorageIndex> newReady;
       for (;;) {
-        StorageIndex s = StorageIndex(-1);
-        {
-          std::unique_lock<std::mutex> lk(qmutex);
-          qcv.wait(lk, [&] {
-            return !readyStack.empty() || completed.load(std::memory_order_acquire) == supernodeNbr ||
-                   failed.load(std::memory_order_acquire);
-          });
-          if (failed.load(std::memory_order_acquire) ||
-              completed.load(std::memory_order_acquire) == supernodeNbr)
-            return;
-          if (readyStack.empty()) continue;
-          s = readyStack.back();
-          readyStack.pop_back();
+        if (failed.load(std::memory_order_acquire)) return;
+
+        StorageIndex s = popLocal(lane);
+        if (s < 0) s = trySteal(lane);
+
+        if (s < 0) {
+          // Nothing anywhere right now. The DAG may still produce more, so this
+          // is not a termination condition -- only the completed count is.
+          if (completed.load(std::memory_order_acquire) == supernodeNbr) return;
+          sleepers.fetch_add(1, std::memory_order_release);
+          {
+            std::unique_lock<std::mutex> lk(idleMutex);
+            idleCv.wait_for(lk, std::chrono::microseconds(200), [&] {
+              return completed.load(std::memory_order_acquire) == supernodeNbr ||
+                     failed.load(std::memory_order_acquire);
+            });
+          }
+          sleepers.fetch_sub(1, std::memory_order_release);
+          continue;
         }
 
         bool localSingular = false;
@@ -1399,21 +1478,19 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
         if (localSingular) {
           singularPerSupernode[s] = 1;
           failed.store(true, std::memory_order_release);
-          qcv.notify_all();
+          idleCv.notify_all();
           return;
         }
 
-        // RIGHT-LOOKING push: notify consumers, collect the newly-ready ones.
+        // RIGHT-LOOKING push: decrement each consumer's in-degree and keep the
+        // ones that just became ready on THIS lane (subtree affinity).
         newReady.clear();
         for (StorageIndex t : m_consumers[s])
           if (remaining[t].fetch_sub(1, std::memory_order_acq_rel) == 1) newReady.push_back(t);
         const StorageIndex done = completed.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-        if (!newReady.empty()) {
-          std::lock_guard<std::mutex> lk(qmutex);
-          for (StorageIndex t : newReady) readyStack.push_back(t);
-        }
-        if (!newReady.empty() || done == supernodeNbr) qcv.notify_all();
+        for (StorageIndex t : newReady) pushLocal(lane, t);
+        if (done == supernodeNbr) idleCv.notify_all();  // wake everyone to exit
       }
     };
     m_executor.parallelFor(Index(0), static_cast<Index>(lanes), worker);

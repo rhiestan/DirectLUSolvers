@@ -761,12 +761,12 @@ from 1 to 32 threads.
 | `laoss_1` (251k) | analyze (symbolic) | 664 | 640 | 628 | **1.06x** |
 | | factor, levels only | 2111 | 1402 | 1330 | 1.59x |
 | | factor, levels+intra | 2097 | 987 | 829 | **2.53x** |
-| | factor, LRLU DAG | 2187 | 1304 | 1251 | 1.75x |
+| | factor, LRLU DAG | 2162 | 1325 | 1227 | 1.76x |
 | | solve, 1 rhs | 71.1 | 71.1 | 71.3 | **1.00x** |
 | | solve, 8 rhs | 215 | 211 | 209 | **1.03x** |
 | `lap3d_30³` | factor, levels only | 612 | 530 | 534 | 1.15x |
 | | factor, levels+intra | 616 | 279 | 265 | **2.33x** |
-| | factor, LRLU DAG | 645 | 559 | 634 | 1.02x |
+| | factor, LRLU DAG | 645 | 539 | 543 | 1.19x |
 
 Four things this says, none of them visible from a single-thread-count timing:
 
@@ -783,16 +783,56 @@ Four things this says, none of them visible from a single-thread-count timing:
    parallelism.** On the 3D Laplacian, levels alone give 1.15x while adding
    intra-supernode chunking gives 2.33x. Level parallelism on its own never
    exceeded 1.65x on any matrix here.
-4. **`LeftRightLU`'s barrier-free scheduler currently loses to
-   `SupernodalLU`'s bulk-synchronous levels + chunking** (1.75x vs 2.53x on
-   `laoss_1`; 1.02x vs 2.33x on `lap3d_30³`), and *regresses* past 16 threads on
-   two matrices (`lap2d_300²` 56.3ms at 16t → 72.6ms at 32t; `lap3d_30³` 542ms →
-   634ms). The scheduler's ready queue is a single mutex-guarded stack with
-   `notify_all()` on every completed supernode, which is the expected shape of
-   that curve. The design advantage it was built for has not been realized yet.
+4. **`LeftRightLU`'s barrier-free scheduler still trails `SupernodalLU`'s
+   levels + chunking on 3D** (1.19x vs 2.33x on `lap3d_30³`; 1.76x vs 2.53x on
+   `laoss_1`) — see [Work-stealing ready queue](#work-stealing-ready-queue)
+   below for what that residual gap is and is not.
 
 Across the board, most of the available gain arrives by 8 threads; 8 → 32
 adds little.
+
+#### Work-stealing ready queue
+
+The first version of the dynamic scheduler kept **one** global mutex-guarded
+ready stack and called `notify_all()` after every completed supernode. That
+serialized every task acquisition behind a single lock and woke all *P* workers
+per supernode when at most a couple could proceed. It also defeated the
+depth-first subtree affinity the LIFO existed to provide: a worker pushed its
+freshly-readied children onto the shared stack, where any other worker took them
+immediately.
+
+It was replaced (2026-08-07) with **per-worker deques and work stealing**: a
+worker pushes the consumers it readied onto its own back and pops from its own
+back, so the node whose data is hot in that core's cache is the node it takes
+next; only when its deque runs dry does it steal, from the *front* of a victim —
+the entry furthest from the victim's hot end, so steals rarely collide with the
+owner and tend to move a coarse subtree rather than a leaf. Idle workers park on
+a shared condition variable with a bounded wait, and producers skip the notify
+entirely unless someone is actually parked.
+
+Measured effect (same setup as the table above), LRLU factorization:
+
+| matrix | before, 16t → 32t | after, 16t → 32t | speedup 1→32 |
+|---|---|---|---|
+| `lap2d_300²` | 56.3 → **72.6** ms *(regressed)* | 58.1 → **53.9** ms | 1.69x → **2.30x** |
+| `lap3d_30³` | 542 → **634** ms *(regressed)* | 536 → 543 ms | 1.02x → **1.19x** |
+| `laoss_2` (100k) | 311 → 312 ms | 298 → 301 ms | 1.82x → 1.85x |
+| `laoss_1` (251k) | 1262 → 1251 ms | 1259 → 1227 ms | 1.75x → 1.76x |
+
+Read this honestly: **the change removes the high-thread-count regressions and
+is a large win on `lap2d_300²`, but is roughly neutral on the two real FEM
+matrices.** That split is consistent — `lap2d_300²` factors in ~120 ms across
+32919 supernodes, so per-task queue overhead is a large fraction of task cost
+and queue throughput dominates; `laoss_1` spends 2.1 s over 49350 supernodes, so
+its tasks are far coarser and the queue was never the limiter there.
+
+The remaining `lap3d_30³` gap to `SupernodalLU` (1.19x vs 2.33x) is therefore
+**not** a queue problem. It is the absence of intra-supernode parallelism:
+`LeftRightLU` deliberately has no equivalent of `setIntraSupernodeParallelism`
+(the async scheduler cannot nest a fork-join inside a worker), so the few huge
+root-separator supernodes remain single tasks that one thread must chew through
+— and the measurements above show that mechanism, not level/DAG parallelism, is
+what carries 3D scaling.
 
 ## LeftRightLU — PARDISO-style sibling solver
 
@@ -825,9 +865,11 @@ Eigen::VectorXd x = solver.solve(b);
    0), **gathers** its updates from the already-finished sources (left-looking), factors it,
    then **pushes** readiness to its consumers (right-looking) — decrementing their counters
    and enqueuing any that reach zero. No worker ever blocks on a dependency; it always takes
-   the next ready node, so there are **no level barriers**. A LIFO ready-stack gives
+   the next ready node, so there are **no level barriers**. Each worker owns a **LIFO deque
+   and steals from the front of a victim's** when it runs dry, which gives genuine
    depth-first subtree affinity (PARDISO's cooperative subtree ownership, minus the NUMA
-   placement, which is out of scope). This runs as a single `parallelFor(0, P, worker)` over
+   placement, which is out of scope) — see [Work-stealing ready
+   queue](#work-stealing-ready-queue) for the measurements that motivated it. This runs as a single `parallelFor(0, P, worker)` over
    the same pluggable `Executor` — each worker is itself a complete sequential scheduler, so
    even a serial or fork-join executor drives it correctly (verified with the serial,
    `StdThreadExecutor`, and `OpenMPExecutor` backends).
