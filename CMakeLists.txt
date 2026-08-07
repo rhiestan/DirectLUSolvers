@@ -242,6 +242,12 @@ add_dlu_test(test_regression SOURCE test/test_regression.cpp
 add_dlu_test(compare_testdata SOURCE test/compare_testdata.cpp
              ARGS --tier large LABELS "testdata;benchmark" LINK ${DLU_COMPARE_LINK})
 
+# Thread-count scaling sweep with per-phase timing. Registered with --quick
+# (synthetic matrices only) so CTest exercises the code path without spending
+# minutes on the large 3D FEM systems; run the binary bare for the full sweep.
+add_dlu_test(bench_parallel SOURCE test/bench_parallel.cpp
+             ARGS --quick --reps 1 --threads 1,4 LABELS "benchmark;parallel")
+
 # The regression suite also has a synthetic-only mode that needs no testdata and
 # runs in well under a second -- worth having in the "quick" set so the fill
 # guard is exercised even on a checkout without the benchmark matrices.

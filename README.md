@@ -79,10 +79,12 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](#fill-regression-baselines). |
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
+| `test/bench_parallel.cpp` | Thread-count scaling sweep with per-phase timing (analyze / factor / solve), per mechanism. See [Parallel scaling](#parallel-scaling-measured). |
 | `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
 | `test/testing/TestData.h` | The benchmark-matrix registry: one list of `testdata/` matrices, with size tiers, shared by every suite. |
+| `test/testing/PooledExecutor.h` | A copy-assignable `Executor` wrapping a shared `StdThreadExecutor` pool, so a solver's thread count can be changed after construction (which `StdThreadExecutor` itself cannot do). |
 
 ## Requirements
 
@@ -738,6 +740,59 @@ ctest --test-dir build -R test_regression --output-on-failure
 Re-baseline only once you understand why the fill moved: `--update` rewrites
 every entry, so read the diff before committing it. A fill change is a real
 change.
+
+### Parallel scaling (measured)
+
+`bench_parallel` sweeps thread counts and times each phase separately, with the
+intra-supernode mechanism toggled on and off:
+
+```sh
+./build/bench_parallel                            # the built-in scaling set
+./build/bench_parallel --threads 1,4,16 --reps 5
+./build/bench_parallel --quick                    # synthetic matrices only
+```
+
+Measured 2026-08-07, 32 hardware threads, `StdThreadExecutor` via
+`PooledExecutor`, best of 3, AMD ordering. Times in ms; "32t" is the speedup
+from 1 to 32 threads.
+
+| matrix | phase | 1t | 8t | 32t | speedup |
+|---|---|---:|---:|---:|---:|
+| `laoss_1` (251k) | analyze (symbolic) | 664 | 640 | 628 | **1.06x** |
+| | factor, levels only | 2111 | 1402 | 1330 | 1.59x |
+| | factor, levels+intra | 2097 | 987 | 829 | **2.53x** |
+| | factor, LRLU DAG | 2187 | 1304 | 1251 | 1.75x |
+| | solve, 1 rhs | 71.1 | 71.1 | 71.3 | **1.00x** |
+| | solve, 8 rhs | 215 | 211 | 209 | **1.03x** |
+| `lap3d_30³` | factor, levels only | 612 | 530 | 534 | 1.15x |
+| | factor, levels+intra | 616 | 279 | 265 | **2.33x** |
+| | factor, LRLU DAG | 645 | 559 | 634 | 1.02x |
+
+Four things this says, none of them visible from a single-thread-count timing:
+
+1. **`solve()` does not parallelize at all** — 1.00x on every matrix, by
+   construction: `solveTriangular` walks the supernodes sequentially and never
+   touches the `Executor`. For the "many right-hand sides against one
+   factorization" use case this README advertises as the sweet spot, that is a
+   hard ceiling.
+2. **`analyzePattern()` is serial and is often the *largest* remaining term.**
+   At 32 threads it is 41% of a single factor+solve on `laoss_1`, 44% on
+   `laoss_2`, and 57% on `lap2d_300²` — more than the factorization it feeds.
+   Improving factorization scaling further buys little until this moves.
+3. **Intra-supernode chunking is the mechanism that pays, not level
+   parallelism.** On the 3D Laplacian, levels alone give 1.15x while adding
+   intra-supernode chunking gives 2.33x. Level parallelism on its own never
+   exceeded 1.65x on any matrix here.
+4. **`LeftRightLU`'s barrier-free scheduler currently loses to
+   `SupernodalLU`'s bulk-synchronous levels + chunking** (1.75x vs 2.53x on
+   `laoss_1`; 1.02x vs 2.33x on `lap3d_30³`), and *regresses* past 16 threads on
+   two matrices (`lap2d_300²` 56.3ms at 16t → 72.6ms at 32t; `lap3d_30³` 542ms →
+   634ms). The scheduler's ready queue is a single mutex-guarded stack with
+   `notify_all()` on every completed supernode, which is the expected shape of
+   that curve. The design advantage it was built for has not been realized yet.
+
+Across the board, most of the available gain arrives by 8 threads; 8 → 32
+adds little.
 
 ## LeftRightLU — PARDISO-style sibling solver
 
