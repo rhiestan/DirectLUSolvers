@@ -1,8 +1,9 @@
 // Correctness tests for Eigen::LeftRightLU (PARDISO-style left-right-looking LU
 // with a barrier-free dynamic scheduler and in-block complete pivoting).
-// Build (from repo root):
-//   clang++ -std=c++17 -O2 -pthread -I eigen -I DirectLUSolvers/src \
-//       DirectLUSolvers/test/test_leftright_lu.cpp -o build/test_leftright_lu
+//
+// Build + run via CTest (from the DirectLUSolvers directory):
+//   cmake -S . -B build -G Ninja && cmake --build build
+//   ctest --test-dir build -R test_leftright_lu --output-on-failure
 //
 // Covers: direct solves, multiple RHS, factor accessors, transpose/adjoint,
 // equilibration, complete vs partial vs no in-block pivoting, log-determinant,
@@ -18,81 +19,19 @@
 #include <vector>
 
 #include "LeftRightLU.h"
+#include "testing/Check.h"
+#include "testing/TestMatrices.h"
 
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
 using Eigen::MatrixXd;
+using lu_testing::check;
+using lu_testing::laplacian2d;
+using lu_testing::randomSymmetricPattern;
+using lu_testing::weakDiagonal;
 namespace lr = Eigen::left_right_lu;
 
 namespace {
-
-int g_failures = 0;
-
-void check(bool ok, const char* name, double residual) {
-  std::printf("  [%s] %-46s residual = %.3e\n", ok ? "PASS" : "FAIL", name, residual);
-  if (!ok) ++g_failures;
-}
-
-SparseMatrix<double> randomSymmetricPattern(int n, double offDiagProb, unsigned seed) {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<double> uni(-1.0, 1.0);
-  std::uniform_real_distribution<double> prob(0.0, 1.0);
-  std::vector<Eigen::Triplet<double>> triplets;
-  for (int i = 0; i < n; ++i)
-    for (int j = i + 1; j < n; ++j)
-      if (prob(rng) < offDiagProb) {
-        triplets.emplace_back(i, j, uni(rng));
-        triplets.emplace_back(j, i, uni(rng));
-      }
-  for (int i = 0; i < n; ++i) triplets.emplace_back(i, i, n + uni(rng));
-  SparseMatrix<double> A(n, n);
-  A.setFromTriplets(triplets.begin(), triplets.end());
-  A.makeCompressed();
-  return A;
-}
-
-SparseMatrix<double> laplacian2d(int gx, int gy) {
-  const int n = gx * gy;
-  std::vector<Eigen::Triplet<double>> triplets;
-  auto id = [gx](int x, int y) { return y * gx + x; };
-  for (int y = 0; y < gy; ++y)
-    for (int x = 0; x < gx; ++x) {
-      const int i = id(x, y);
-      triplets.emplace_back(i, i, 4.0);
-      if (x > 0) triplets.emplace_back(i, id(x - 1, y), -1.0);
-      if (x + 1 < gx) triplets.emplace_back(i, id(x + 1, y), -1.0);
-      if (y > 0) triplets.emplace_back(i, id(x, y - 1), -1.0);
-      if (y + 1 < gy) triplets.emplace_back(i, id(x, y + 1), -1.0);
-    }
-  SparseMatrix<double> A(n, n);
-  A.setFromTriplets(triplets.begin(), triplets.end());
-  A.makeCompressed();
-  return A;
-}
-
-// A symmetric-pattern matrix with a numerically WEAK diagonal but strong
-// off-diagonal entries: exactly the case where in-block pivoting matters. The
-// diagonal is small; large entries sit off-diagonal (still pattern-symmetric).
-SparseMatrix<double> weakDiagonal(int n, unsigned seed) {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<double> uni(-1.0, 1.0);
-  std::vector<Eigen::Triplet<double>> triplets;
-  for (int i = 0; i + 1 < n; ++i) {
-    // strong off-diagonal couplings
-    triplets.emplace_back(i, i + 1, 2.0 + uni(rng));
-    triplets.emplace_back(i + 1, i, 2.0 + uni(rng));
-  }
-  for (int i = 0; i < n; i += 3) {  // a few longer-range couplings for real fill
-    const int j = (i + 5) % n;
-    triplets.emplace_back(std::min(i, j), std::max(i, j), 1.5 + uni(rng));
-    triplets.emplace_back(std::max(i, j), std::min(i, j), 1.5 + uni(rng));
-  }
-  for (int i = 0; i < n; ++i) triplets.emplace_back(i, i, 1e-3 * uni(rng));  // weak diagonal
-  SparseMatrix<double> A(n, n);
-  A.setFromTriplets(triplets.begin(), triplets.end());
-  A.makeCompressed();
-  return A;
-}
 
 template <typename Solver>
 double solveResidual(Solver& solver, const SparseMatrix<double>& A, const VectorXd& b) {
@@ -109,7 +48,7 @@ double solveAndMeasure(const SparseMatrix<double>& A, const char* name) {
   solver.compute(A);
   if (solver.info() != Eigen::Success) {
     std::printf("  [FAIL] %-46s factorization failed: %s\n", name, solver.lastErrorMessage().c_str());
-    ++g_failures;
+    ++lu_testing::failureCount();
     return 1.0;
   }
   VectorXd x = solver.solve(b);
@@ -358,7 +297,7 @@ void testParallelVsSerial() {
   if (parallel.info() != Eigen::Success) {
     std::printf("  [FAIL] %-46s parallel factorization failed: %s\n", "parallel scheduler",
                 parallel.lastErrorMessage().c_str());
-    ++g_failures;
+    ++lu_testing::failureCount();
     return;
   }
   const VectorXd xp = parallel.solve(b);
@@ -416,7 +355,5 @@ int main() {
   testFillGuard();
   testParallelVsSerial();
 
-  std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
-              g_failures, g_failures == 1 ? "" : "s");
-  return g_failures == 0 ? 0 : 1;
+  return lu_testing::summarize("LeftRightLU correctness");
 }

@@ -72,10 +72,17 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `src/SupernodalLUExecutorTBB.h` | `TBBExecutor` — optional, requires oneAPI Threading Building Blocks (see [below](#tbbexecutor)). |
 | `src/SupernodalLUMetis.h` | `SupernodalLUMetis<Mat[,Executor]>` alias wiring in METIS nested dissection. Optional, requires METIS + GKlib. |
 | `src/SupernodalLUAutoOrdering.h` | `SupernodalLUAuto<Mat[,Executor]>` alias: tries AMD and several METIS restarts, keeps the least-fill one. Optional, requires METIS + GKlib. |
+| `CMakeLists.txt` | Builds and registers every suite with CTest. See [Testing](#testing). |
 | `test/test_supernodal_lu.cpp` | Correctness tests (dependency-free — only needs Eigen). |
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
+| `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
+| `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](#fill-regression-baselines). |
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
+| `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
+| `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
+| `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
+| `test/testing/TestData.h` | The benchmark-matrix registry: one list of `testdata/` matrices, with size tiers, shared by every suite. |
 
 ## Requirements
 
@@ -679,23 +686,58 @@ solver.compute(A);
 
 ## Testing
 
+The suites build with CMake and run under CTest. From the `DirectLUSolvers`
+directory:
+
 ```sh
-# Core correctness suite (no external dependencies)
-clang++ -std=c++17 -O2 -I eigen -I DirectLUSolvers/src \
-    DirectLUSolvers/test/test_supernodal_lu.cpp -o build/test_supernodal_lu
-./build/test_supernodal_lu
-
-# Parallel-vs-serial agreement + speedup (StdThreadExecutor)
-clang++ -std=c++17 -O2 -pthread -I eigen -I DirectLUSolvers/src \
-    DirectLUSolvers/test/test_parallel_lu.cpp -o build/test_parallel_lu
-./build/test_parallel_lu
-
-# Benchmark vs Eigen::SparseLU (add -DHAVE_METIS / -DHAVE_PARDISO for those columns;
-# see compare_testdata.cpp's own header comment for the exact linker flags needed)
-clang++ -std=c++17 -O2 -I eigen -I DirectLUSolvers/src \
-    DirectLUSolvers/test/compare_testdata.cpp -o build/compare_testdata
-./build/compare_testdata
+cmake -S . -B build -G Ninja
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
+
+`ctest -L quick` runs only the fast subset (synthetic matrices, seconds); the
+unlabelled remainder reads the benchmark matrices and takes substantially
+longer. Optional dependencies are independent switches, all default `OFF`:
+
+```sh
+cmake -S . -B build -G Ninja -DDLU_WITH_METIS=ON -DDLU_WITH_PARDISO=ON
+```
+
+`DLU_EIGEN_DIR`, `DLU_TESTDATA_DIR`, `DLU_METIS_DIR` and `DLU_MKL_DIR` default
+to this project's layout (siblings of `DirectLUSolvers/`); override them if
+yours differs. **An in-tree Eigen is preferred over an installed one on
+purpose** — `find_package(Eigen3)` resolves against the user's CMake package
+registry, which is frequently an unrelated version, and the fill baselines below
+were recorded against the Eigen that ships beside these solvers.
+
+The build defaults to **Release**, and the default is set *before* `project()`
+deliberately. On a toolchain targeting MSVC (including `clang++` with a
+`*-windows-msvc` triple) `Platform/Windows-MSVC.cmake` sets
+`CMAKE_BUILD_TYPE_INIT` to `Debug`, so the usual `if(NOT CMAKE_BUILD_TYPE)`
+guard placed *after* `project()` never fires and you silently get `-O0`. For
+this project that is a 50-100x timing error — enough to make every benchmark
+number meaningless. `cmake` prints the resolved type at configure time; check it
+before quoting a measurement.
+
+### Fill regression baselines
+
+`test_regression` is the suite that guards the failure mode the others cannot
+see. Every other check gates on the residual — but the ordering-direction bug
+fixed in 2026-07 left every residual at machine precision while inflating 3D
+factors 250-350x. Fill is a deterministic function of the pattern and the
+ordering, so `test_regression` pins `nnzL + nnzU` per (matrix, solver) against
+`test/baselines/testdata.baseline` and fails on drift beyond 5%.
+
+```sh
+ctest --test-dir build -R test_regression --output-on-failure
+./build/test_regression --synthetic-only     # no testdata/ needed
+./build/test_regression --tier small         # skip the large 3D FEM systems
+./build/test_regression --update             # re-record the baselines
+```
+
+Re-baseline only once you understand why the fill moved: `--update` rewrites
+every entry, so read the diff before committing it. A fill change is a real
+change.
 
 ## LeftRightLU — PARDISO-style sibling solver
 
@@ -816,9 +858,7 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
 ### Testing
 
 ```sh
-clang++ -std=c++17 -O2 -pthread -I eigen -I DirectLUSolvers/src \
-    DirectLUSolvers/test/test_leftright_lu.cpp -o build/test_leftright_lu
-./build/test_leftright_lu
+ctest --test-dir build -R test_leftright_lu --output-on-failure
 ```
 
 `test/test_leftright_lu.cpp` covers direct/multi-RHS solves, factor accessors, transpose/

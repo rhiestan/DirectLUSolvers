@@ -6,37 +6,23 @@
 // enables the SupernodalLU+Auto column (SupernodalLUAutoOrdering.h): AMD vs.
 // several METIS restarts, keeping whichever predicts the least fill.
 //
-// Plain build (SupernodalLU vs Eigen::SparseLU only, from repo root):
-//   clang++ -std=c++17 -O2 -I eigen -I DirectLUSolvers/src \
-//       DirectLUSolvers/test/compare_testdata.cpp -o build/compare_testdata
+// Build (from the DirectLUSolvers directory). The optional columns are CMake
+// switches; each is independent:
+//   cmake -S . -B build -G Ninja                            # SupernodalLU vs SparseLU
+//   cmake -S . -B build -G Ninja -DDLU_WITH_METIS=ON        # + METIS / Auto columns
+//   cmake -S . -B build -G Ninja -DDLU_WITH_PARDISO=ON      # + MKL PARDISO column
+//   cmake --build build
 //
-// PARDISO only (Eigen/PardisoSupport, statically linked MKL sequential LP64 -
-//   no MKL runtime DLLs needed; MKL_INT==int matches StorageIndex):
-//   clang++ -std=c++17 -O2 -DHAVE_PARDISO -I eigen -I DirectLUSolvers/src \
-//       -I mkl/include DirectLUSolvers/test/compare_testdata.cpp \
-//       -L mkl/lib -lmkl_intel_lp64 -lmkl_sequential -lmkl_core \
-//       -o build/compare_testdata
-//
-// With METIS, and the full combination, use clang-cl: the installed GKlib/metis
-// were built against the dynamic CRT (/MD), so everything must agree on /MD,
-// which means MKL must be linked dynamically too (mkl_rt) when combined. clang++
-// in its GNU driver does not inject the dynamic UCRT import libs cleanly, so
-// clang-cl is the reliable Windows linker here.
-//
-//   clang-cl /std:c++17 /O2 /EHsc /MD /DHAVE_METIS /DHAVE_PARDISO \
-//       /I eigen /I DirectLUSolvers/src /I mkl/include /I install/include \
-//       DirectLUSolvers/test/compare_testdata.cpp \
-//       /Fe:build/compare_testdata.exe \
-//       /link /LIBPATH:mkl/lib mkl_rt.lib /LIBPATH:install/lib metis.lib GKlib.lib
-//
-// (Drop /DHAVE_PARDISO and the mkl bits for a self-contained METIS-only build.)
-//
-// Run (from repo root, so relative testdata/ paths resolve). When PARDISO was
-// linked via mkl_rt, put mkl/bin on PATH and pick a threading layer that does
-// not need libiomp5md.dll:
+// Run. The testdata location is baked in at configure time (DLU_TESTDATA_DIR),
+// so this does not depend on the working directory. When PARDISO was linked via
+// mkl_rt, put mkl/bin on PATH and pick a threading layer that does not need
+// libiomp5md.dll:
 //   set MKL_THREADING_LAYER=SEQUENTIAL && set PATH=mkl\bin;%PATH%
-//   ./build/compare_testdata                 # runs the built-in matrix list
+//   ./build/compare_testdata                 # runs the shared matrix registry
 //   ./build/compare_testdata path/to/A.mtx   # or an explicit list
+//
+// Note that this is a BENCHMARK, gated only on resid < 1e-6. It does not detect
+// a fill regression -- see test_regression.cpp for that.
 //
 // For each matrix we build b = A*xTrue with a known xTrue, then solve A x = b
 // with each solver and print one row of a precision/time table: relative error
@@ -59,114 +45,31 @@
 #include "SupernodalLUAutoOrdering.h"  // SupernodalLUAuto = SupernodalLU + AutoOrdering (AMD vs METIS restarts)
 #endif
 
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <fstream>
-#include <limits>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "SupernodalLU.h"
 #include "LeftRightLU.h"  // PARDISO-style sibling solver (left-right-looking + complete pivoting)
+#include "testing/Check.h"
+#include "testing/MatrixMarket.h"
+#include "testing/TestData.h"
+#include "testing/TestMatrices.h"
 
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
-using Eigen::Triplet;
-using Clock = std::chrono::steady_clock;
+using lu_testing::loadMatrixMarket;
+using lu_testing::matrixLabel;
+using lu_testing::ms;
+using lu_testing::patternIsSymmetric;
+using lu_testing::symmetrizePattern;
+using Clock = lu_testing::Clock;
 
 namespace {
-
-// Minimal MatrixMarket coordinate reader for real (or pattern) matrices.
-// Mirrors the lower triangle when the banner says "symmetric".
-SparseMatrix<double> loadMatrixMarket(const std::string& path) {
-  std::ifstream in(path);
-  if (!in) throw std::runtime_error("cannot open " + path);
-
-  std::string line;
-  if (!std::getline(in, line)) throw std::runtime_error("empty file " + path);
-
-  // Banner: %%MatrixMarket matrix coordinate <field> <symmetry>
-  bool symmetric = false;
-  bool patternOnly = false;
-  {
-    std::string lower = line;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("symmetric") != std::string::npos) symmetric = true;
-    if (lower.find("pattern") != std::string::npos) patternOnly = true;
-  }
-
-  // Skip comment lines, then read the size line.
-  do {
-    if (!std::getline(in, line)) throw std::runtime_error("unexpected EOF in " + path);
-  } while (!line.empty() && line[0] == '%');
-
-  int rows = 0, cols = 0;
-  long long nnz = 0;
-  {
-    std::istringstream iss(line);
-    iss >> rows >> cols >> nnz;
-  }
-
-  std::vector<Triplet<double>> triplets;
-  triplets.reserve(static_cast<size_t>(symmetric ? 2 * nnz : nnz));
-
-  for (long long k = 0; k < nnz; ++k) {
-    if (!std::getline(in, line)) throw std::runtime_error("unexpected EOF reading entries in " + path);
-    if (line.empty()) { --k; continue; }
-    std::istringstream iss(line);
-    int i = 0, j = 0;
-    double v = 1.0;
-    iss >> i >> j;
-    if (!patternOnly) iss >> v;
-    --i; --j;  // MatrixMarket is 1-based
-    triplets.emplace_back(i, j, v);
-    if (symmetric && i != j) triplets.emplace_back(j, i, v);
-  }
-
-  SparseMatrix<double> A(rows, cols);
-  A.setFromTriplets(triplets.begin(), triplets.end());
-  A.makeCompressed();
-  return A;
-}
-
-// Return a copy of A whose sparsity pattern is symmetric, by inserting explicit
-// zeros at (j,i) wherever (i,j) is present but (j,i) is not. This does not change
-// the linear system; it only gives SupernodalLU the symmetric pattern it needs.
-SparseMatrix<double> symmetrizePattern(const SparseMatrix<double>& A) {
-  std::vector<Triplet<double>> triplets;
-  triplets.reserve(static_cast<size_t>(A.nonZeros()) * 2);
-  for (int col = 0; col < A.outerSize(); ++col)
-    for (SparseMatrix<double>::InnerIterator it(A, col); it; ++it) {
-      triplets.emplace_back(it.row(), it.col(), it.value());
-      triplets.emplace_back(it.col(), it.row(), 0.0);  // structural mirror
-    }
-  SparseMatrix<double> S(A.rows(), A.cols());
-  S.setFromTriplets(triplets.begin(), triplets.end());  // sums dup -> keeps real value
-  S.makeCompressed();
-  return S;
-}
-
-bool patternIsSymmetric(const SparseMatrix<double>& A) {
-  SparseMatrix<double> AT = A.transpose();
-  AT.makeCompressed();
-  if (AT.nonZeros() != A.nonZeros()) return false;
-  // Compare inner-index sets column by column.
-  for (int col = 0; col < A.outerSize(); ++col) {
-    if (A.outerIndexPtr()[col] != AT.outerIndexPtr()[col]) return false;
-  }
-  for (int k = 0; k < A.nonZeros(); ++k)
-    if (A.innerIndexPtr()[k] != AT.innerIndexPtr()[k]) return false;
-  return true;
-}
-
-double ms(Clock::time_point a, Clock::time_point b) {
-  return std::chrono::duration<double, std::milli>(b - a).count();
-}
 
 struct Result {
   bool ok = false;
@@ -307,20 +210,6 @@ Result runPardiso(const SparseMatrix<double>& A, const VectorXd& b, const Vector
 }
 #endif
 
-// Short label for a matrix: its parent directory name (e.g. "sherman1" from
-// "testdata/sherman1/sherman1.mtx", which also handles dirs whose .mtx file is
-// named differently, like setfos/spmatrix.mtx).
-std::string matrixLabel(const std::string& path) {
-  size_t slash = path.find_last_of("/\\");
-  std::string dir = (slash == std::string::npos) ? std::string() : path.substr(0, slash);
-  size_t slash2 = dir.find_last_of("/\\");
-  std::string parent = (slash2 == std::string::npos) ? dir : dir.substr(slash2 + 1);
-  if (!parent.empty()) return parent;
-  std::string file = (slash == std::string::npos) ? path : path.substr(slash + 1);
-  size_t dot = file.find_last_of('.');
-  return dot == std::string::npos ? file : file.substr(0, dot);
-}
-
 // One solver's cell in the table: relative error, relative residual, and
 // total (factor + solve) time in ms. 29 chars wide, matching the header.
 void printCell(const Result& r) {
@@ -337,24 +226,30 @@ void printCell(const Result& r) {
 int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-  const std::vector<std::string> matrices = {
-      "testdata/bcsstm13/bcsstm13.mtx",
-      "testdata/dendrimer/dendrimer.mtx",
-      "testdata/gemat11/gemat11.mtx",
-      "testdata/rdb2048_noL/rdb2048_noL.mtx",
-      "testdata/setfos/spmatrix.mtx",
-      "testdata/sherman1/sherman1.mtx",
-      "testdata/tomography/tomography.mtx",
-      "testdata/YaleB_10NN/YaleB_10NN.mtx",
-      "testdata/bayer05/bayer05.mtx",
-      // Large, hard circuit matrix (n=659k). Kept last: SupernodalLU's
-      // symmetric-pattern static-pivot factorization may run very long or
-      // exhaust memory here; the other solvers are still listed.
-      "testdata/pre2/pre2.mtx",
-  };
-  // Allow overriding the list on the command line.
-  std::vector<std::string> files(matrices);
-  if (argc > 1) files.assign(argv + 1, argv + argc);
+  // The shared corpus (testing/TestData.h). Tier::Small first, then the large
+  // 3D FEM systems, then the 659k circuit matrix pre2 -- which is kept last
+  // because SupernodalLU's symmetric-pattern static-pivot factorization may run
+  // very long or exhaust memory there; the other solvers are still listed.
+  //
+  // Default stays Tier::Huge (everything, pre2 included) so a manual run is
+  // unchanged. CTest passes `--tier large`: Eigen::SparseLU on pre2 alone runs
+  // for minutes at 3+ GB, which is not something a default `ctest` should do.
+  lu_testing::Tier maxTier = lu_testing::Tier::Huge;
+  std::vector<std::string> explicitFiles;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--tier" && i + 1 < argc) {
+      const std::string t = argv[++i];
+      if (t == "small") maxTier = lu_testing::Tier::Small;
+      else if (t == "large") maxTier = lu_testing::Tier::Large;
+      else if (t == "huge") maxTier = lu_testing::Tier::Huge;
+      else { std::printf("unknown tier '%s'\n", t.c_str()); return 2; }
+    } else {
+      explicitFiles.push_back(arg);  // an explicit matrix path
+    }
+  }
+  std::vector<std::string> files =
+      explicitFiles.empty() ? lu_testing::benchmarkPaths(maxTier) : explicitFiles;
 
   std::printf("Precision / time comparison: SupernodalLU vs LeftRightLU vs Eigen::SparseLU"
 #ifdef HAVE_METIS

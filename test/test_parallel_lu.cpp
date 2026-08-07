@@ -1,8 +1,8 @@
 // Correctness + speedup test for SupernodalLU with the StdThreadExecutor backend.
 //
-// Build (from repo root):
-//   clang++ -std=c++17 -O2 -pthread -I eigen -I DirectLUSolvers/src \
-//       DirectLUSolvers/test/test_parallel_lu.cpp -o build/test_parallel_lu
+// Build + run via CTest (from the DirectLUSolvers directory):
+//   cmake -S . -B build -G Ninja && cmake --build build
+//   ctest --test-dir build -R test_parallel_lu --output-on-failure
 //
 // Verifies the parallel factorization produces the same factor as the serial
 // one (identical determinant, machine-precision residual), then times both on
@@ -14,17 +14,21 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "SupernodalLU.h"
+#include "testing/Check.h"
+#include "testing/MatrixMarket.h"
+#include "testing/TestData.h"
+#include "testing/TestMatrices.h"
 
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
-using Eigen::Triplet;
-using Clock = std::chrono::steady_clock;
+using lu_testing::check;
+using lu_testing::laplacian2d;
+using lu_testing::ms;
+using Clock = lu_testing::Clock;
 
 using Serial = Eigen::SupernodalLU<SparseMatrix<double>>;
 using Parallel = Eigen::SupernodalLU<SparseMatrix<double>, Eigen::AMDOrdering<int>,
@@ -32,61 +36,8 @@ using Parallel = Eigen::SupernodalLU<SparseMatrix<double>, Eigen::AMDOrdering<in
 
 namespace {
 
-int g_failures = 0;
-
-void check(bool ok, const char* name, double value) {
-  std::printf("  [%s] %-44s %.3e\n", ok ? "PASS" : "FAIL", name, value);
-  if (!ok) ++g_failures;
-}
-
 SparseMatrix<double> loadSymmetrized(const std::string& path) {
-  std::ifstream in(path);
-  if (!in) throw std::runtime_error("cannot open " + path);
-  std::string line;
-  std::getline(in, line);
-  const bool symmetric = line.find("symmetric") != std::string::npos;
-  do { std::getline(in, line); } while (!line.empty() && line[0] == '%');
-  int rows, cols; long long nnz;
-  { std::istringstream s(line); s >> rows >> cols >> nnz; }
-  std::vector<Triplet<double>> t;
-  for (long long k = 0; k < nnz; ++k) {
-    std::getline(in, line);
-    std::istringstream s(line); int i, j; double v; s >> i >> j >> v;
-    --i; --j; t.emplace_back(i, j, v);
-    if (symmetric && i != j) t.emplace_back(j, i, v);
-  }
-  SparseMatrix<double> A(rows, cols); A.setFromTriplets(t.begin(), t.end()); A.makeCompressed();
-  std::vector<Triplet<double>> t2;
-  for (int c = 0; c < A.outerSize(); ++c)
-    for (SparseMatrix<double>::InnerIterator it(A, c); it; ++it) {
-      t2.emplace_back(it.row(), it.col(), it.value());
-      t2.emplace_back(it.col(), it.row(), 0.0);
-    }
-  SparseMatrix<double> S(rows, cols); S.setFromTriplets(t2.begin(), t2.end()); S.makeCompressed();
-  return S;
-}
-
-SparseMatrix<double> laplacian2d(int gx, int gy) {
-  const int n = gx * gy;
-  std::vector<Triplet<double>> t;
-  auto id = [gx](int x, int y) { return y * gx + x; };
-  for (int y = 0; y < gy; ++y)
-    for (int x = 0; x < gx; ++x) {
-      const int i = id(x, y);
-      t.emplace_back(i, i, 4.0);
-      if (x > 0) t.emplace_back(i, id(x - 1, y), -1.0);
-      if (x + 1 < gx) t.emplace_back(i, id(x + 1, y), -1.0);
-      if (y > 0) t.emplace_back(i, id(x, y - 1), -1.0);
-      if (y + 1 < gy) t.emplace_back(i, id(x, y + 1), -1.0);
-    }
-  SparseMatrix<double> A(n, n);
-  A.setFromTriplets(t.begin(), t.end());
-  A.makeCompressed();
-  return A;
-}
-
-double ms(Clock::time_point a, Clock::time_point b) {
-  return std::chrono::duration<double, std::milli>(b - a).count();
+  return lu_testing::ensureSymmetricPattern(lu_testing::loadMatrixMarket(path));
 }
 
 template <typename Solver>
@@ -108,8 +59,7 @@ void runMatrix(const std::string& path) {
   try {
     A = loadSymmetrized(path);
   } catch (const std::exception& e) {
-    std::printf("  load error: %s\n", e.what());
-    ++g_failures;
+    lu_testing::fail(std::string("load error: ") + e.what());
     return;
   }
   const int n = static_cast<int>(A.rows());
@@ -173,10 +123,10 @@ int main(int argc, char** argv) {
   std::printf("SupernodalLU parallel (StdThreadExecutor) tests\n");
 
   std::vector<std::string> files = {
-      "testdata/dendrimer/dendrimer.mtx",
-      "testdata/tomography/tomography.mtx",
-      "testdata/rdb2048_noL/rdb2048_noL.mtx",
-      "testdata/YaleB_10NN/YaleB_10NN.mtx",
+      lu_testing::testdataPath("dendrimer/dendrimer.mtx"),
+      lu_testing::testdataPath("tomography/tomography.mtx"),
+      lu_testing::testdataPath("rdb2048_noL/rdb2048_noL.mtx"),
+      lu_testing::testdataPath("YaleB_10NN/YaleB_10NN.mtx"),
   };
   if (argc > 1) files.assign(argv + 1, argv + argc);
   for (const std::string& f : files) runMatrix(f);
@@ -186,7 +136,5 @@ int main(int argc, char** argv) {
   runLaplacian(200);
   runLaplacian(300);
 
-  std::printf("\n%s (%d failure%s)\n", g_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED",
-              g_failures, g_failures == 1 ? "" : "s");
-  return g_failures == 0 ? 0 : 1;
+  return lu_testing::summarize("SupernodalLU parallel");
 }

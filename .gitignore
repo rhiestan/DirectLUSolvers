@@ -1,0 +1,14 @@
+# CMake build trees
+build/
+build-*/
+cmake-build-*/
+
+# CMake / IDE artifacts
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+.cache/
+
+# Downloaded matrix corpora (fetched on demand, never committed)
+test/matrices/cache/
+*.mtx.gz
