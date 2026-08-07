@@ -645,14 +645,26 @@ solver.compute(A);
 - It can be **more robust** than `Eigen::SparseLU` on structurally awkward matrices (matching +
   restricted diagonal pivoting + BiCGStab refinement handles some singular/near-singular cases
   `Eigen::SparseLU` fails outright on).
-- Ordering matters more than any kernel-level tuning: `SupernodalLUAuto` never loses to plain
-  AMD in testing and can win substantially (up to ~1000x tighter solve error observed on one
-  near-singular matrix), at the cost of extra `analyzePattern()` time on small matrices. For
-  **large, well-separated 3D FEM systems, use `MetisOrdering`** (nested dissection) — on such
-  matrices the symmetric-pattern factorization is competitive with, and sometimes beats, both
-  `Eigen::SparseLU` and MKL PARDISO on fill and memory (e.g. a 251k×251k FEM matrix: ~12x fill,
-  ~0.4 GB, matching PARDISO and using less memory than SparseLU); the remaining gap to PARDISO is
-  factorization *speed*, not fill.
+- Ordering matters more than any kernel-level tuning: `SupernodalLUAuto` never loses to plain AMD
+  in testing and can win, though the size of the win is ordering-seed- and matrix-dependent — e.g.
+  on `bayer05` (a near-singular pathological matrix; resid stays ~1e-16..1e-18 regardless of
+  ordering, so *err* is the meaningful metric there) plain AMD gives solve error ~2.2, METIS/Auto
+  bring it to ~1.5 — a real but modest improvement (re-measure before quoting a specific factor;
+  this number moves as the solver evolves and has shifted in this project's history — see the
+  ordering-direction note below), at the cost of extra `analyzePattern()` time on small matrices.
+  For **large, well-separated 3D FEM systems, use `MetisOrdering`** (nested dissection) — on this
+  project's `laoss_1` benchmark (251k rows, 3.5M nnz, 3D FEM), METIS ordering gives **~11.9x
+  fill** (41.8M scalars, ~330 MB), matching MKL PARDISO's ~12x/~0.5GB and beating
+  `Eigen::SparseLU`'s ~24.2x/85.1M-scalar/~680MB factor by roughly 2x. Even the *default* AMD
+  ordering alone already beats SparseLU on fill here (~16.5x, 57.8M scalars) and is **faster in
+  absolute wall-clock time**: factor+solve 3.0s vs SparseLU's 10.1s (3.4x faster) vs PARDISO's
+  1.6s (SupernodalLU ~1.9x behind PARDISO). `laoss_2` (100k rows, 1.4M nnz) shows the same shape:
+  0.86s vs SparseLU's 2.6s (3.0x faster) vs PARDISO's 0.49s. `LeftRightLU` tracks these numbers
+  closely (3.0s / 0.88s on laoss_1/laoss_2, single-threaded) since it reuses the same analysis
+  pipeline and only its numeric core differs — see its own
+  [Performance notes](#performance-notes-honest-summary-1) below. (Measured 2026-07-14 with
+  `DirectLUSolvers/test/compare_testdata.cpp`; the remaining gap to PARDISO is factorization
+  *speed*, not fill.)
 - **Get the ordering direction right.** These solvers consume the fill-reducing permutation as the
   *inverse* of what `Eigen`'s `AMDOrdering`/`MetisOrdering` put in `indices()` (see the note in
   `analyzePattern`). This was a bug until 2026-07: the ordering was applied backwards, which is
@@ -748,6 +760,34 @@ follow-up — this first version is the unsymmetric LU path). Bit-reproducibilit
 counts is **not** a goal: the dynamic scheduler reassociates floating-point updates, so the
 parallel result may differ from the serial one at the ~1e-14 level (the true residual is
 unaffected and refinement cleans up the rest).
+
+### Performance notes (honest summary)
+
+Measured 2026-07-14 with `DirectLUSolvers/test/compare_testdata.cpp`, single-threaded
+(`SerialExecutor`) — the numbers below do **not** yet exercise the barrier-free dynamic
+scheduler's headline advantage (that requires a parallel executor and hasn't been separately
+benchmarked in this doc; see [Parallelism](#parallelism) for the mechanism).
+
+- On this project's real-world `testdata/` set, `LeftRightLU` tracks `SupernodalLU`'s
+  factor+solve time closely (both reuse the same analysis pipeline and static-pivoting numeric
+  design — only in-block pivoting and scheduling differ): e.g. gemat11 1573ms vs 1496ms,
+  bayer05 329ms vs 304ms, dendrimer 14.4ms vs 13.5ms. Same story on the large 3D FEM matrices —
+  laoss_1 (251k rows) 3.0s vs SupernodalLU's 3.0s, laoss_2 (100k rows) 0.88s vs 0.86s — both well
+  ahead of `Eigen::SparseLU` there (see the [SupernodalLU performance
+  notes](#performance-notes-honest-summary) above for the SparseLU/PARDISO comparison).
+- One measured, mechanistic difference: on a couple of already well-conditioned matrices
+  (tomography, YaleB_10NN) `LeftRightLU` lands on a visibly looser — but still safely
+  small — residual than `SupernodalLU` (tomography resid 2.2e-12 vs 2.8e-16; YaleB 1.0e-13 vs
+  2.0e-16; both far under the 1e-6 `solveFailureThreshold()`). This is the documented
+  **`setRefineOnlyIfPerturbed`** default at work: `LeftRightLU` skips refinement entirely when
+  `replacedPivots()==0`, while `SupernodalLU`'s default BiCGStab refinement always runs at least
+  one matvec check (and polishes further) even on an already-accurate direct solve. Not a bug —
+  call `setRefineOnlyIfPerturbed(false)` if you want the tighter residual at the cost of that
+  extra matvec.
+- Complete (row+col) pivoting costs nothing extra over `SupernodalLU`'s row-only restricted
+  pivoting in these measurements — both are confined to the small dense diagonal block
+  (`setMaxBlockSize`, default 128), so the search cost is the same order regardless of how many
+  interchange directions it considers.
 
 ### Option reference (deltas from SupernodalLU)
 
