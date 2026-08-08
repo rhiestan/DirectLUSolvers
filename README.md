@@ -783,9 +783,18 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest -L quick` runs only the fast subset (synthetic matrices, seconds); the
-unlabelled remainder reads the benchmark matrices and takes substantially
-longer. Optional dependencies are independent switches, all default `OFF`:
+`ctest -L quick` runs only the fast subset — synthetic matrices, no external
+data, a few seconds — while the remainder reads the benchmark matrices and takes
+substantially longer. That split is what makes CI possible: **Eigen and
+`testdata/` live outside this repository**, so `.github/workflows/ci.yml` runs
+the `quick` label on every push (gcc, clang, MSVC) and a scheduled job fetches
+the SuiteSparse corpus for a real-matrix sweep.
+
+CI **pins Eigen to an exact commit**, deliberately. The fill baselines below
+depend on the fill-reducing ordering, which comes from Eigen's AMD
+implementation; a different Eigen can legitimately produce a different
+permutation and therefore different fill. Bump the pin and re-record the
+baselines together, never separately. Optional dependencies are independent switches, all default `OFF`:
 
 ```sh
 cmake -S . -B build -G Ninja -DDLU_WITH_METIS=ON -DDLU_WITH_PARDISO=ON

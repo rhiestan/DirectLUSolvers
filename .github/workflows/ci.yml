@@ -1,0 +1,105 @@
+# Continuous integration for DirectLUSolvers.
+#
+# WHAT CAN AND CANNOT RUN HERE
+#
+# This repository contains only the solvers and their tests. Eigen and the
+# testdata/ benchmark matrices live OUTSIDE it (as sibling directories in the
+# developer's tree), so CI must supply Eigen itself and cannot see testdata/ at
+# all. The suites are labelled accordingly: everything tagged `quick` is
+# synthetic and needs no external matrices, which is exactly the subset CI runs
+# on every push. It completes in a few seconds.
+#
+# The SuiteSparse corpus is different -- it is *downloadable*, so a scheduled job
+# fetches it and runs the real-matrix correctness sweep. That gives coverage on
+# genuine matrices without needing the developer's private testdata/.
+#
+# EIGEN IS PINNED TO AN EXACT COMMIT, deliberately. The fill baselines in
+# test/baselines/ record nnzL+nnzU per matrix, and fill depends on the
+# fill-reducing ordering, which comes from Eigen's AMD implementation. A
+# different Eigen can legitimately produce a different permutation and therefore
+# different fill, which would fail the regression suite for no good reason. The
+# pin below is the version the baselines were recorded against; bump it and
+# re-record together, never separately.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  schedule:
+    - cron: '0 3 * * 1'   # Mondays, for the SuiteSparse sweep
+  workflow_dispatch:
+
+env:
+  # Eigen master snapshot the fill baselines were recorded against.
+  EIGEN_COMMIT: 94152044e
+
+jobs:
+  quick:
+    name: quick (${{ matrix.os }}, ${{ matrix.cxx }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # one compiler failing should not hide the others
+      matrix:
+        include:
+          - { os: ubuntu-latest,  cc: gcc,   cxx: g++ }
+          - { os: ubuntu-latest,  cc: clang, cxx: clang++ }
+          - { os: windows-latest, cc: '',    cxx: cl }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned Eigen
+        run: |
+          git clone --filter=blob:none https://gitlab.com/libeigen/eigen.git eigen-src
+          cd eigen-src && git checkout ${{ env.EIGEN_COMMIT }}
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDLU_EIGEN_DIR="$PWD/eigen-src" \
+            ${{ matrix.cc != '' && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # Only the `quick` label: the rest needs testdata/, which is not in this
+      # repository. A failure here is a real failure, not a missing-data error.
+      - name: Test
+        run: ctest --test-dir build -C Release -L quick --output-on-failure
+
+  suitesparse:
+    name: SuiteSparse corpus
+    runs-on: ubuntu-latest
+    # Downloads ~59 MB and takes a couple of minutes, so not on every push.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned Eigen
+        run: |
+          git clone --filter=blob:none https://gitlab.com/libeigen/eigen.git eigen-src
+          cd eigen-src && git checkout ${{ env.EIGEN_COMMIT }}
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+
+      # The manifest is checked in; the matrices are not. Verify the manifest
+      # still matches the live collection before trusting a download.
+      - name: Verify manifest against the live index
+        run: python test/matrices/fetch_suitesparse.py --verify
+
+      - name: Fetch corpus
+        run: python test/matrices/fetch_suitesparse.py --tier quick
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDLU_EIGEN_DIR="$PWD/eigen-src"
+          cmake --build build --parallel
+
+      # The contract: a solver may solve, may decline, or may return a bad answer
+      # it flagged itself -- but never a silently wrong one.
+      - name: Correctness sweep
+        run: ctest --test-dir build -R test_suitesparse --output-on-failure

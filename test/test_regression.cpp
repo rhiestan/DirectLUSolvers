@@ -110,9 +110,11 @@ VectorXd deterministicRhs(const SparseMatrix<double>& A, unsigned seed) {
   return A * xTrue;
 }
 
-template <typename Solver>
+// `configure` runs before compute(), for solver options that are set at run time
+// rather than chosen by type (MC64 matching, for instance).
+template <typename Solver, typename Configure>
 Record measure(const std::string& matrix, const std::string& solverName,
-               const SparseMatrix<double>& A) {
+               const SparseMatrix<double>& A, Configure configure) {
   Record r;
   r.matrix = matrix;
   r.solver = solverName;
@@ -122,6 +124,7 @@ Record measure(const std::string& matrix, const std::string& solverName,
   const VectorXd b = deterministicRhs(A, 20260807u);
   try {
     Solver solver;
+    configure(solver);
     const auto t0 = Clock::now();
     solver.compute(A);
     if (solver.info() != Eigen::Success) return r;  // declined: nnzL stays -1
@@ -136,6 +139,12 @@ Record measure(const std::string& matrix, const std::string& solverName,
     r.nnzL = -1;
   }
   return r;
+}
+
+template <typename Solver>
+Record measure(const std::string& matrix, const std::string& solverName,
+               const SparseMatrix<double>& A) {
+  return measure<Solver>(matrix, solverName, A, [](Solver&) {});
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +373,13 @@ int main(int argc, char** argv) {
     std::vector<Record> row;
     row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>>>(c.label, "SupernodalLU", A));
     row.push_back(measure<Eigen::LeftRightLU<SparseMatrix<double>>>(c.label, "LeftRightLU", A));
+    // MC64 is a separate symbolic path -- a different permutation, so different
+    // fill -- and it is deterministic, so it is pinnable like the rest. Without
+    // this it would be the one code path a fill regression could slip through.
+    row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>>>(
+        c.label, "SupernodalLU+MC64", A, [](Eigen::SupernodalLU<SparseMatrix<double>>& s) {
+          s.setMatchingMethod(Eigen::supernodal_lu::MatchingMethod::MC64);
+        }));
 #ifdef HAVE_METIS
     row.push_back(
         measure<Eigen::SupernodalLUMetis<SparseMatrix<double>>>(c.label, "SupernodalLU+METIS", A));
