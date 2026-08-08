@@ -60,6 +60,20 @@ struct UpdateSource {
   StorageIndex facingRowBlock = 0;  // index (global) of the facing block in the source
 };
 
+// How to permute large entries onto the diagonal before the symbolic analysis.
+//
+//   None         no row permutation at all.
+//   Transversal  a maximum transversal that prefers large entries: a
+//                magnitude-greedy seed completed by augmenting paths. Cheap
+//                (near-linear in practice), but the augmenting phase optimizes
+//                only for COMPLETING the transversal, so it can displace good
+//                diagonal entries and is not guaranteed to beat the identity.
+//   MC64         the exact maximum-product assignment (Duff & Koster), which
+//                additionally yields dual scaling factors making every matched
+//                diagonal entry exactly 1 and no entry larger than 1. Costs
+//                O(n) shortest-path searches, so it is opt-in.
+enum class MatchingMethod { None, Transversal, MC64 };
+
 }  // namespace supernodal_lu
 }  // namespace Eigen
 

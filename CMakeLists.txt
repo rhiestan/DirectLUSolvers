@@ -287,6 +287,7 @@ add_dlu_test(test_regression SOURCE test/test_regression.cpp
 # SuiteSparse corpus sweep. The matrices are fetched on demand into a git-ignored
 # cache (test/matrices/fetch_suitesparse.py); with nothing downloaded the suite
 # reports how to get them and passes, so this is safe to register unconditionally.
+add_dlu_test(test_mc64         SOURCE test/test_mc64.cpp         LABELS "quick;correctness")
 add_dlu_test(test_scalar_types SOURCE test/test_scalar_types.cpp LABELS "quick;correctness")
 
 # Executor backends. StdThreadExecutor is always covered; OpenMP and TBB join in

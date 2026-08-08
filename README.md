@@ -66,7 +66,8 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `src/LeftRightLU.h` | The PARDISO-style sibling solver (see [below](#leftrightlu--pardiso-style-sibling-solver)). Reuses the shared support/matching/executor headers; self-contained otherwise. |
 | `src/LeftRightLU` | Umbrella header for `LeftRightLU`, `#include <LeftRightLU>`. |
 | `src/SupernodalLUSupport.h` | Plain data structures shared by the analysis/factorization phases (`Supernode`, `RowBlock`, `UpdateSource`). |
-| `src/SupernodalLUMatching.h` | The maximum-transversal matching + permutation-sign helpers used by `setMatching()`. |
+| `src/SupernodalLUMatching.h` | The maximum-transversal matching + permutation-sign helpers (`MatchingMethod::Transversal`). |
+| `src/SupernodalLUMC64.h` | Exact maximum-product matching with dual scaling (`MatchingMethod::MC64`). Eigen + standard library only. |
 | `src/SupernodalLUExecutor.h` | The `Executor` concept, plus the bundled `SerialExecutor` and `StdThreadExecutor` backends. No dependency beyond `<thread>`. |
 | `src/SupernodalLUExecutorOpenMP.h` | `OpenMPExecutor` — optional, requires an OpenMP-enabled build (see [below](#openmpexecutor)). |
 | `src/SupernodalLUExecutorTBB.h` | `TBBExecutor` — optional, requires oneAPI Threading Building Blocks (see [below](#tbbexecutor)). |
@@ -77,6 +78,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
+| `test/test_mc64.cpp` | MC64 optimality against a brute-force oracle, the dual-scaling property, and integration through both solvers. |
 | `test/test_scalar_types.cpp` | `float` and `std::complex<double>` coverage, including the `adjoint()`/`transpose()` distinction that only exists for complex. |
 | `test/test_executors.cpp` | One shared contract for every `Executor` backend — `StdThread`, `OpenMP`, `TBB` — checked against `SerialExecutor`. See [Testing the executor backends](#testing-the-executor-backends). |
 | `test/test_edge_cases.cpp` | Degenerate sizes (n = 0/1/2, diagonal-only, single dense supernode), the refactorize workflow, zero right-hand side, and a cross-solver differential. |
@@ -257,9 +259,45 @@ operation they describe has run at least once.
   >
   > There is no cheap a-priori test for which case you are in: diagonal-quality
   > scores predict only `Chebyshev3`, and fill does not correlate either
-  > (`cavity10` gets *less* fill with matching and a worse answer). The reliable
-  > move is empirical — if `info()` reports a bad solve, refactor with
-  > `setMatching(false)` and compare.
+  > (`cavity10` gets *less* fill with matching and a worse answer).
+  > **`setMatchingMethod(MatchingMethod::MC64)` fixes all of them properly** —
+  > see below.
+
+- **`setMatchingMethod(supernodal_lu::MatchingMethod m)`** — `None`,
+  `Transversal` (default), or `MC64`.
+
+  `MC64` is the exact **maximum-product assignment** (Duff & Koster), solved as a
+  linear assignment problem by shortest augmenting paths. Two things follow that
+  the transversal cannot offer:
+
+  1. It maximizes `∏|a_ij|` over *all* permutations, so **it can never choose a
+     worse diagonal than leaving the matrix alone** — exactly the guarantee whose
+     absence lets the transversal break otherwise-solvable matrices.
+  2. Its dual variables give scaling factors `Dr`, `Dc` making every matched
+     diagonal entry exactly 1 and no entry larger than 1. These seed
+     equilibration (Ruiz then composes on top), and are much of why MC64 works in
+     MUMPS/SuperLU_DIST. The transversal returns a permutation and nothing else.
+
+  Measured over the [SuiteSparse corpus](#the-suitesparse-corpus), MC64 **fixes
+  every one of the five failures that were the solver's fault rather than the
+  matrix's** — `Chebyshev3`, `CAG_mat1916`, `cavity10`, `nnc1374` and `lhr10c`
+  (the last of which otherwise needed `setMaxBlockSize(0)`) — and breaks nothing.
+  It also quietly improves others: `cavity17` goes from 197 bumped pivots to 0.
+  The three remaining failures are matrices `Eigen::SparseLU` cannot solve either.
+
+  **Why it is not the default.** Cost is O(n) shortest-path searches rather than
+  one greedy pass. On this project's `testdata/` that is free or better —
+  `laoss_1` analyze 703 → 659 ms, `laoss_2` 235 → 232 ms, and fill *drops* on
+  several (`tomography` 0.59x, `bayer05` 0.95x). But the worst case is bad:
+  `Pajek/foldoc`, a directed graph, goes 190 ms → 4.1 s. Since it can slow some
+  inputs down by an order of magnitude it stays opt-in — though on PDE/FEM-shaped
+  matrices there is no measured reason not to enable it.
+
+  ```cpp
+  solver.setMatchingMethod(Eigen::supernodal_lu::MatchingMethod::MC64);
+  ```
+
+  `setMatching(true|false)` remains, as an alias for `Transversal`/`None`.
 - **`setDiagonalPivoting(bool on)`** (default **on**) — factors each supernode's dense diagonal
   block with partial pivoting *confined to that block* (row swaps never leave the
   already-allocated dense panel, so the global symbolic structure — and therefore BLAS-3 shape
@@ -887,11 +925,10 @@ matrices that genuinely defeat the solvers, which nothing previously did.
 | `rw5151` | 0.49 | **fails** 7e-02 | the matrix |
 | `foldoc` | 0.48 | **fails** inf | structurally singular |
 
-So **5 of 8 are ours, not the matrix**, and a single setting recovers each. See
-the [`setMatching`](#matching--diagonal-pivoting-robustness) note for the
-mechanism and for why there is no cheap way to pick the right setting up front.
-`lhr10c` is the one case where the 128-column `setMaxBlockSize` cap is the
-binding constraint: widening it gives in-block pivoting enough candidate rows.
+So **5 of 8 are ours, not the matrix** — and **`setMatchingMethod(MatchingMethod::MC64)`
+now fixes all five at once**, including `lhr10c`. See
+[Matching & diagonal pivoting](#matching--diagonal-pivoting-robustness) for the
+mechanism and the cost trade-off.
 
 **A finding worth knowing: pattern symmetry does not predict success.** The
 intuition that `psym == 1.00` is safe and `psym < 0.5` is doomed is wrong in

@@ -70,6 +70,7 @@
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLUMatching.h"
+#include "SupernodalLUMC64.h"
 
 namespace Eigen {
 namespace left_right_lu {
@@ -308,8 +309,17 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 
   /** Maximum-transversal matching (MC64-style). On by default; permutes
    *  large-magnitude entries onto the diagonal before symbolic analysis. */
-  void setMatching(bool on) { m_useMatching = on; }
-  bool matching() const { return m_useMatching; }
+  void setMatching(bool on) {
+    m_matchingMethod = on ? supernodal_lu::MatchingMethod::Transversal
+                          : supernodal_lu::MatchingMethod::None;
+  }
+  bool matching() const { return m_matchingMethod != supernodal_lu::MatchingMethod::None; }
+
+  /** Select the matching algorithm; see SupernodalLU::setMatchingMethod. `MC64`
+   *  is the exact maximum-product assignment plus its dual scaling, and is
+   *  opt-in because it costs O(n) shortest-path searches. */
+  void setMatchingMethod(supernodal_lu::MatchingMethod method) { m_matchingMethod = method; }
+  supernodal_lu::MatchingMethod matchingMethod() const { return m_matchingMethod; }
   /** True if the last matching produced a full zero-free diagonal. */
   bool matchingIsPerfect() const { return m_matchingIsPerfect; }
 
@@ -519,7 +529,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_maxBlockSize = 128;
     m_maxFactorNonzeros = 0;  // fail-fast fill guard off by default
     m_equilibrate = true;
-    m_useMatching = true;
+    m_matchingMethod = supernodal_lu::MatchingMethod::Transversal;
     m_pivoting = left_right_lu::Pivoting::Complete;
     m_matchingIsPerfect = true;
     m_matchSign = 1;
@@ -671,7 +681,9 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   Index m_maxBlockSize;
   Index m_maxFactorNonzeros;  // fail-fast fill guard (0 = off)
   bool m_equilibrate;
-  bool m_useMatching;
+  supernodal_lu::MatchingMethod m_matchingMethod;
+  // MC64's dual scaling (original numbering), empty unless MC64 ran.
+  std::vector<RealScalar> m_mc64RowScale, m_mc64ColScale;
   left_right_lu::Pivoting m_pivoting;
   Index m_nnzL;
   Index m_nnzU;
@@ -943,7 +955,12 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   m_matchRow.assign(n, 0);
   m_matchRowInv.assign(n, 0);
   m_matchingIsPerfect = true;
-  if (m_useMatching && n > 0) {
+  m_mc64RowScale.clear();
+  m_mc64ColScale.clear();
+  if (m_matchingMethod == supernodal_lu::MatchingMethod::MC64 && n > 0) {
+    m_matchingIsPerfect =
+        supernodal_lu::mc64Matching(matrix, m_matchRow, m_mc64RowScale, m_mc64ColScale);
+  } else if (m_matchingMethod == supernodal_lu::MatchingMethod::Transversal && n > 0) {
     m_matchingIsPerfect = supernodal_lu::maximumWeightMatching(matrix, m_matchRow);
   } else {
     for (StorageIndex i = 0; i < n; ++i) m_matchRow[i] = i;
@@ -952,7 +969,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   m_matchSign = supernodal_lu::permutationSign(m_matchRow);
 
   MatrixType matched;
-  if (m_useMatching) {
+  if (m_matchingMethod != supernodal_lu::MatchingMethod::None) {
     std::vector<Triplet<Scalar, StorageIndex>> trips;
     trips.reserve(static_cast<std::size_t>(matrix.nonZeros()));
     for (StorageIndex j = 0; j < n; ++j)
@@ -962,7 +979,8 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
     matched.setFromTriplets(trips.begin(), trips.end());
     matched.makeCompressed();
   }
-  const MatrixType& B = m_useMatching ? matched : matrix;
+  const MatrixType& B =
+      m_matchingMethod != supernodal_lu::MatchingMethod::None ? matched : matrix;
 
   // 1) fill-reducing ordering of the pattern of B + B^T.
   PermutationType orderingPerm;
@@ -1084,6 +1102,14 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::computeEquilibration(const
   const StorageIndex n = m_size;
   m_rowScale.assign(n, RealScalar(1));
   m_colScale.assign(n, RealScalar(1));
+
+  // Seed with MC64's duals when it ran: they already put every matched diagonal
+  // entry at magnitude 1 with nothing above 1, and Ruiz below iterates on
+  // |value| * rowScale * colScale, so the two scalings compose.
+  if (!m_mc64RowScale.empty()) {
+    for (StorageIndex i = 0; i < n; ++i) m_rowScale[i] = m_mc64RowScale[i];
+    for (StorageIndex j = 0; j < n; ++j) m_colScale[j] = m_mc64ColScale[j];
+  }
   if (!m_equilibrate) return;
 
   std::vector<RealScalar> rowMax(n), colMax(n);

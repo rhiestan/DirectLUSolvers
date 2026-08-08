@@ -34,6 +34,7 @@
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLUMatching.h"
+#include "SupernodalLUMC64.h"
 
 namespace Eigen {
 namespace supernodal_lu {
@@ -331,8 +332,28 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
    *  zero diagonal (e.g. unsymmetric circuit matrices); it is a pure row
    *  permutation and does not change the static block structure. The matched
    *  pattern is symmetrized internally. */
-  void setMatching(bool on) { m_useMatching = on; }
-  bool matching() const { return m_useMatching; }
+  void setMatching(bool on) {
+    m_matchingMethod = on ? supernodal_lu::MatchingMethod::Transversal
+                          : supernodal_lu::MatchingMethod::None;
+  }
+  bool matching() const { return m_matchingMethod != supernodal_lu::MatchingMethod::None; }
+
+  /** Select which matching algorithm places large entries on the diagonal.
+   *
+   *  `Transversal` (default) is the cheap magnitude-greedy transversal. It is
+   *  NOT guaranteed to improve on the un-permuted diagonal, and on this
+   *  project's SuiteSparse corpus it makes four otherwise-solvable matrices
+   *  unsolvable -- see the README.
+   *
+   *  `MC64` is the exact maximum-product assignment (Duff & Koster), which by
+   *  construction can never choose a worse diagonal than any other permutation,
+   *  and additionally supplies dual scaling factors that make every matched
+   *  diagonal entry exactly 1 with no entry above 1. It costs O(n) shortest-path
+   *  searches instead of one greedy pass, which is why it is not the default;
+   *  turn it on when a solve fails or when robustness matters more than
+   *  analysis time. */
+  void setMatchingMethod(supernodal_lu::MatchingMethod method) { m_matchingMethod = method; }
+  supernodal_lu::MatchingMethod matchingMethod() const { return m_matchingMethod; }
   /** True if the last matching produced a full zero-free diagonal (perfect
    *  transversal). False indicates a structurally singular matrix. */
   bool matchingIsPerfect() const { return m_matchingIsPerfect; }
@@ -584,7 +605,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_intraParallel = true;
     m_parallelSolve = true;
     m_equilibrate = true;
-    m_useMatching = true;
+    m_matchingMethod = supernodal_lu::MatchingMethod::Transversal;
     m_diagonalPivoting = true;
     m_matchingIsPerfect = true;
     m_matchSign = 1;
@@ -894,7 +915,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   bool m_intraParallel;               // parallelize inside supernodes on narrow levels
   bool m_parallelSolve;               // dispatch the triangular sweeps over the executor
   bool m_equilibrate;                 // apply Ruiz row/column scaling
-  bool m_useMatching;                 // apply MC64-style maximum-transversal matching
+  supernodal_lu::MatchingMethod m_matchingMethod;  // which matching to apply
+  // MC64's dual scaling (original numbering), empty unless MC64 ran. Seeds
+  // equilibration so the matched diagonal starts at magnitude 1.
+  std::vector<RealScalar> m_mc64RowScale, m_mc64ColScale;
   bool m_diagonalPivoting;            // restricted (in-block) partial pivoting
   Index m_nnzL;
   Index m_nnzU;
@@ -1322,7 +1346,16 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
   m_matchRow.assign(n, 0);
   m_matchRowInv.assign(n, 0);
   m_matchingIsPerfect = true;
-  if (m_useMatching && n > 0) {
+  m_mc64RowScale.clear();
+  m_mc64ColScale.clear();
+  if (m_matchingMethod == supernodal_lu::MatchingMethod::MC64 && n > 0) {
+    // The exact maximum-product assignment, which also returns dual scaling
+    // factors. Those are kept and used to seed equilibration in factorize():
+    // they are most of what makes MC64 effective, and the transversal variant
+    // cannot supply them.
+    m_matchingIsPerfect =
+        supernodal_lu::mc64Matching(matrix, m_matchRow, m_mc64RowScale, m_mc64ColScale);
+  } else if (m_matchingMethod == supernodal_lu::MatchingMethod::Transversal && n > 0) {
     m_matchingIsPerfect = supernodal_lu::maximumWeightMatching(matrix, m_matchRow);
   } else {
     for (StorageIndex i = 0; i < n; ++i) m_matchRow[i] = i;
@@ -1334,7 +1367,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
   // matching is the identity this is a copy of A. B is generally pattern-
   // unsymmetric; the helpers below symmetrize its pattern (structural zeros).
   MatrixType matched;
-  if (m_useMatching) {
+  if (m_matchingMethod != supernodal_lu::MatchingMethod::None) {
     std::vector<Triplet<Scalar, StorageIndex>> trips;
     trips.reserve(static_cast<std::size_t>(matrix.nonZeros()));
     for (StorageIndex j = 0; j < n; ++j)
@@ -1344,7 +1377,8 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
     matched.setFromTriplets(trips.begin(), trips.end());
     matched.makeCompressed();
   }
-  const MatrixType& B = m_useMatching ? matched : matrix;
+  const MatrixType& B =
+      m_matchingMethod != supernodal_lu::MatchingMethod::None ? matched : matrix;
 
   // 1) fill-reducing ordering (orders the pattern of B + B^T).
   PermutationType orderingPerm;
@@ -1575,6 +1609,15 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeEquilibration(cons
   const StorageIndex n = m_size;
   m_rowScale.assign(n, RealScalar(1));
   m_colScale.assign(n, RealScalar(1));
+
+  // MC64's duals already scale the matrix so every matched diagonal entry has
+  // magnitude 1 and nothing exceeds 1. Seed with them; Ruiz below then iterates
+  // on |value| * rowScale * colScale, so the two scalings compose rather than
+  // one discarding the other. This is where most of MC64's benefit lives.
+  if (!m_mc64RowScale.empty()) {
+    for (StorageIndex i = 0; i < n; ++i) m_rowScale[i] = m_mc64RowScale[i];
+    for (StorageIndex j = 0; j < n; ++j) m_colScale[j] = m_mc64ColScale[j];
+  }
   if (!m_equilibrate) return;
 
   // Ruiz equilibration: alternately scale rows and columns by 1/sqrt(inf-norm)
