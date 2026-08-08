@@ -241,6 +241,9 @@ add_dlu_test(test_regression SOURCE test/test_regression.cpp
 # SuiteSparse corpus sweep. The matrices are fetched on demand into a git-ignored
 # cache (test/matrices/fetch_suitesparse.py); with nothing downloaded the suite
 # reports how to get them and passes, so this is safe to register unconditionally.
+add_dlu_test(test_scalar_types SOURCE test/test_scalar_types.cpp LABELS "quick;correctness")
+add_dlu_test(test_edge_cases   SOURCE test/test_edge_cases.cpp   LABELS "quick;correctness")
+
 add_dlu_test(test_suitesparse SOURCE test/test_suitesparse.cpp
              LABELS "suitesparse;correctness")
 # `--tier large` deliberately omits pre2: Eigen::SparseLU alone runs for minutes

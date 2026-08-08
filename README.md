@@ -77,6 +77,8 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
+| `test/test_scalar_types.cpp` | `float` and `std::complex<double>` coverage, including the `adjoint()`/`transpose()` distinction that only exists for complex. |
+| `test/test_edge_cases.cpp` | Degenerate sizes (n = 0/1/2, diagonal-only, single dense supernode), the refactorize workflow, zero right-hand side, and a cross-solver differential. |
 | `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](#fill-regression-baselines). |
 | `test/test_suitesparse.cpp` | Correctness sweep over the curated SuiteSparse corpus, including matrices these solvers cannot handle. See [The SuiteSparse corpus](#the-suitesparse-corpus). |
 | `test/matrices/fetch_suitesparse.py` | Downloads the corpus named by `suitesparse.manifest` into a git-ignored `cache/`. No third-party dependency. |
@@ -157,8 +159,12 @@ class SupernodalLU;
 ```
 
 - **`MatrixType_`** — a column-major `Eigen::SparseMatrix<Scalar, ColMajor, StorageIndex>`. Any
-  scalar Eigen supports (`double`, `float`, `std::complex<double>`, ...) and any `StorageIndex`
-  (`int` is what this project's METIS/matching code is tested against).
+  scalar Eigen supports and any `StorageIndex` (`int` is what this project's METIS/matching code is
+  tested against). `double`, `float` and `std::complex<double>` are covered by
+  `test/test_scalar_types.cpp`; for complex scalars `adjoint()` is a genuine conjugate-transpose
+  solve, verified distinct from `transpose()`, and `determinant()` carries the right complex phase.
+  Note that `determinant()` overflows `double` on moderately sized systems (a diagonally dominant
+  n=150 matrix already gives |det| ~ 1e326) — use `LeftRightLU::logAbsDeterminant()` there.
 - **`OrderingType_`** — the fill-reducing ordering functor, applied to the (matched) pattern
   during `analyzePattern()`. Default `Eigen::AMDOrdering<StorageIndex>`. Alternatives:
   - `Eigen::MetisOrdering<StorageIndex>` (needs `<Eigen/MetisSupport>` + METIS/GKlib) — or use
