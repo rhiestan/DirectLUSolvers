@@ -248,6 +248,11 @@ add_dlu_test(compare_testdata SOURCE test/compare_testdata.cpp
 add_dlu_test(bench_parallel SOURCE test/bench_parallel.cpp
              ARGS --quick --reps 1 --threads 1,4 LABELS "benchmark;parallel")
 
+# Machine ceiling: what the hardware can deliver before any of our scheduling.
+# The --quick form uses only the synthetic matrix so CTest stays fast.
+add_dlu_test(bench_ceiling SOURCE test/bench_ceiling.cpp
+             ARGS --quick LABELS "benchmark;parallel")
+
 # The regression suite also has a synthetic-only mode that needs no testdata and
 # runs in well under a second -- worth having in the "quick" set so the fill
 # guard is exercised even on a checkout without the benchmark matrices.

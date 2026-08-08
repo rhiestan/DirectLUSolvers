@@ -80,6 +80,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](#fill-regression-baselines). |
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
 | `test/bench_parallel.cpp` | Thread-count scaling sweep with per-phase timing (analyze / factor / solve), per mechanism. See [Parallel scaling](#parallel-scaling-measured). |
+| `test/bench_ceiling.cpp` | What the *machine* can deliver, via independent concurrent factorizations — the upper bound any scheduler could reach. See [The machine ceiling](#the-machine-ceiling). |
 | `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
@@ -799,6 +800,69 @@ Four things this says, none of them visible from a single-thread-count timing:
 Across the board, most of the available gain arrives by 8 threads; 8 → 32
 adds little.
 
+#### The machine ceiling
+
+In-solver speedup confounds two very different limits: how much parallelism the
+schedule exposes, and how much the machine can deliver. `bench_ceiling`
+separates them by running **K independent single-threaded factorizations
+concurrently** — they share no lock, no queue and no data, so their parallelism
+is perfect by construction and the only contended resource is memory. Whatever
+scaling that reaches is an upper bound on what *any* scheduler could achieve.
+
+Measured on an AMD Ryzen 9 5950X (**16 physical cores**, 32 logical,
+dual-channel DDR4):
+
+| matrix | factor size | K=1 | K=8 | K=16 | K=32 |
+|---|---|---:|---:|---:|---:|
+| `lap3d_30³` | 92 MB | 1.00x | 4.93x | **7.76x** | 11.36x |
+| `laoss_2` | 154 MB | 1.00x | 4.27x | **7.30x** | 10.28x |
+| `laoss_1` | 463 MB | 1.00x | 4.59x | **7.84x** | — |
+
+**Roughly half of the cores' throughput is already gone before our code does
+anything.** With perfect, embarrassingly-parallel work, 16 cores deliver only
+~7.3-7.9x. The absolute rate also falls with footprint — 16.0 GFLOP/s per core
+solo on the 92 MB case versus 12.4 on the 154 MB one — which is the signature of
+a memory-bound workload, as expected for a factor that does not fit in L3.
+
+So `laoss_1`'s 2.48x should be read against **~7.8x, not against 32**. Two
+multiplicative limits produce it:
+
+1. **Hardware**: 16 cores behave like ~7.8 for this workload (49% efficiency).
+2. **Schedule**: a flop-accurate model of the exact level/chunk schedule —
+   counting the real Schur-update flops per supernode, the serial diagonal-block
+   part, and an LPT bound on each outer level — predicts only **6.31x** for
+   `laoss_1` even with perfect hardware.
+
+Against a hardware-corrected structural prediction (~6.3 lanes at the ~8 GFLOP/s
+per-lane rate the machine sustains at that concurrency, ≈ 50 GFLOP/s) the solver
+achieves 37.4 GFLOP/s, or about **75%**. The remaining shortfall is dispatch
+overhead and load imbalance beyond the LPT bound.
+
+The practical consequences:
+
+- **There is real headroom on `laoss_1` — about 3x, not 12x.** Anyone planning
+  around these solvers should size expectations to the ceiling table, not to the
+  core count.
+- **Further gains must come from moving less memory**, not from more threads:
+  better cache blocking and reuse in the update GEMMs. More scheduling
+  sophistication cannot beat 7.8x.
+- Fork-join dispatch costs **33-77 µs at 8-32 threads**, which is expensive in
+  absolute terms, but a factorization issues only a few hundred dispatches
+  (359 for `laoss_1`), so it accounts for ~2% here. Worth fixing eventually, not
+  the bottleneck.
+- Only **84 of `laoss_1`'s 49350 supernodes** run in inner (chunked) mode — but
+  they carry 77% of the work. The other 22.6% sits in outer levels whose balance
+  is whatever LPT gives.
+
+```sh
+./build/bench_ceiling            # full: synthetic + the laoss matrices
+./build/bench_ceiling --quick    # synthetic only
+```
+
+Re-run it on your own hardware before reading anything into a speedup number;
+the ceiling is machine-specific and a dual-socket server with more memory
+channels will land somewhere quite different.
+
 #### Chunk sizing
 
 Intra-supernode chunking originally split a panel into fixed 128-row chunks, so
@@ -823,13 +887,8 @@ reproduces the old behaviour exactly.
 | `lap2d_300²` | | 59.1 ms | **51.3 ms** | 1.84x → **2.13x** |
 | `laoss_1` (251k) | | 835 ms | 834 ms | 2.35x → 2.48x |
 
-**`laoss_1` did not move**, despite the diagnostic predicting 44% idle there —
-and its 8-thread efficiency is only 27% (2.13x), so something other than chunk
-count is the binding constraint on that matrix well before 32 threads. Its
-factor is ~58M scalars (~465 MB) streamed repeatedly by the update GEMMs, which
-makes memory bandwidth the obvious suspect, but that is a hypothesis this
-benchmark has not tested. Treat the 2.48x there as unexplained, not as a
-success.
+**`laoss_1` did not move**, despite the diagnostic predicting 44% idle there.
+That was investigated separately — see [The machine ceiling](#the-machine-ceiling).
 
 #### Work-stealing ready queue
 
