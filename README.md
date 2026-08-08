@@ -318,14 +318,6 @@ operation they describe has run at least once.
   of the rows the supernode already carries. Matters mainly for dense-ish factorizations (a wide
   panel with hundreds of off-diagonal rows can absorb a few more essentially for free); barely
   affects sparse matrices, where the absolute rule already governs. `0` disables this rule.
-- **`setAmalgamationCostModel(bool enable, double tolerance = 0.0)`** (default **off**) — an
-  alternative to the two heuristics above: a machine-calibrated BLAS time model (ported from
-  PaStiX's `cblk_time_fact`) predicts whether merging is actually *faster* to factor, not just
-  "cheap in fill", and merges iff it is (or would be at most `tolerance` relatively slower, for
-  coarser panels / better load balance at a small serial cost). Measured to *not* beat the
-  tuned default heuristics on this project's matrices (the model doesn't know about our
-  per-supernode bookkeeping overhead) — provided as a principled alternative, not a better
-  default.
 - **`setMaxBlockSize(Index maxBlockSize)`** (default `128`; `0` = unlimited) — caps supernode
   width by forcing extra boundaries. Adds **no fill** (entries beyond the cap just relocate into
   off-diagonal panels) and keeps dense panels cache-friendly; also measurably improves parallel
@@ -1301,3 +1293,11 @@ reporting, and parallel(dynamic-scheduler)-vs-serial agreement plus a deadlock-s
 
 Mozilla Public License 2.0 (`LICENSE`), matching the surrounding Eigen code this solver
 integrates with.
+
+`THIRD-PARTY-NOTICES.md` records the external work these solvers build on, and
+distinguishes **algorithmic lineage** (published algorithms reimplemented from
+their descriptions — PaStiX's supernodal design, PARDISO's scheduler, Duff &
+Koster's MC64) from **code derivation**. No third-party source is incorporated:
+everything under `src/` is original code. Note in particular that PaStiX is
+CeCILL v2, a copyleft license incompatible with MPL-2.0 redistribution, which is
+why its design is reimplemented rather than translated.
