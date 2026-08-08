@@ -216,11 +216,28 @@ void testComplexDeterminant() {
   check(dLrlu < 1e-8, "LeftRightLU [complex]: determinant matches SparseLU", dLrlu);
 
   // logAbsDeterminant() exists precisely because determinant() overflows; check
-  // it agrees here, where both are representable.
-  const double logDiff =
-      std::abs(t.logAbsDeterminant() - std::log(std::abs(expected))) /
-      std::max(1.0, std::abs(std::log(std::abs(expected))));
-  check(logDiff < 1e-8, "LeftRightLU [complex]: logAbsDeterminant agrees", logDiff);
+  // it agrees here, where both are representable. Both solvers now provide it.
+  const double refLog = std::log(std::abs(expected));
+  const double scale = std::max(1.0, std::abs(refLog));
+  check(std::abs(t.logAbsDeterminant() - refLog) / scale < 1e-8,
+        "LeftRightLU [complex]: logAbsDeterminant agrees",
+        std::abs(t.logAbsDeterminant() - refLog) / scale);
+  check(std::abs(s.logAbsDeterminant() - refLog) / scale < 1e-8,
+        "SupernodalLU [complex]: logAbsDeterminant agrees",
+        std::abs(s.logAbsDeterminant() - refLog) / scale);
+
+  // determinantSign() must carry the complex PHASE, not just +/-1: sign * exp(log|det|)
+  // has to reconstruct the determinant.
+  for (int which = 0; which < 2; ++which) {
+    const C sign = which == 0 ? s.determinantSign() : t.determinantSign();
+    const double logAbs = which == 0 ? s.logAbsDeterminant() : t.logAbsDeterminant();
+    const C rebuilt = sign * std::exp(logAbs);
+    const double rel = std::abs(rebuilt - expected) / std::abs(expected);
+    check(rel < 1e-8,
+          std::string(which == 0 ? "SupernodalLU" : "LeftRightLU") +
+              " [complex]: sign * exp(logAbs) reconstructs det",
+          rel);
+  }
 }
 
 // determinant() overflowing on a moderately sized system is not hypothetical --
@@ -232,16 +249,50 @@ void testDeterminantOverflow() {
   Eigen::SparseMatrix<double> A(n, n);
   for (int i = 0; i < n; ++i) A.insert(i, i) = 150.0;
   A.makeCompressed();
-
-  Eigen::LeftRightLU<Eigen::SparseMatrix<double>> t;
-  t.compute(A);
-  const double det = t.determinant();
-  const double logDet = t.logAbsDeterminant();
-  checkTrue(!std::isfinite(det), "determinant() overflows on 150^150, as expected");
-  checkTrue(std::isfinite(logDet), "logAbsDeterminant() stays finite where determinant() overflows");
   const double expectedLog = n * std::log(150.0);
-  check(std::abs(logDet - expectedLog) / expectedLog < 1e-10,
-        "logAbsDeterminant() value is correct", std::abs(logDet - expectedLog) / expectedLog);
+
+  // Both solvers must behave the same way here. SupernodalLU gained
+  // logAbsDeterminant() only after this test showed LeftRightLU had the only
+  // escape hatch from the overflow.
+  {
+    Eigen::SupernodalLU<Eigen::SparseMatrix<double>> s;
+    s.compute(A);
+    checkTrue(!std::isfinite(s.determinant()),
+              "SupernodalLU: determinant() overflows on 150^150, as expected");
+    const double logDet = s.logAbsDeterminant();
+    checkTrue(std::isfinite(logDet),
+              "SupernodalLU: logAbsDeterminant() stays finite where determinant() overflows");
+    check(std::abs(logDet - expectedLog) / expectedLog < 1e-10,
+          "SupernodalLU: logAbsDeterminant() value is correct",
+          std::abs(logDet - expectedLog) / expectedLog);
+    checkTrue(s.determinantSign() == 1.0, "SupernodalLU: determinantSign() is +1 here");
+  }
+  {
+    Eigen::LeftRightLU<Eigen::SparseMatrix<double>> t;
+    t.compute(A);
+    checkTrue(!std::isfinite(t.determinant()),
+              "LeftRightLU: determinant() overflows on 150^150, as expected");
+    const double logDet = t.logAbsDeterminant();
+    checkTrue(std::isfinite(logDet),
+              "LeftRightLU: logAbsDeterminant() stays finite where determinant() overflows");
+    check(std::abs(logDet - expectedLog) / expectedLog < 1e-10,
+          "LeftRightLU: logAbsDeterminant() value is correct",
+          std::abs(logDet - expectedLog) / expectedLog);
+  }
+
+  // A negative-determinant case, so the sign is not trivially +1: an odd number
+  // of negative pivots must give -1 while log|det| stays unchanged.
+  {
+    Eigen::SparseMatrix<double> B(n, n);
+    for (int i = 0; i < n; ++i) B.insert(i, i) = (i == 0) ? -150.0 : 150.0;
+    B.makeCompressed();
+    Eigen::SupernodalLU<Eigen::SparseMatrix<double>> s;
+    s.compute(B);
+    checkTrue(s.determinantSign() == -1.0, "SupernodalLU: determinantSign() detects a sign flip");
+    check(std::abs(s.logAbsDeterminant() - expectedLog) / expectedLog < 1e-10,
+          "SupernodalLU: log|det| unchanged by the sign flip",
+          std::abs(s.logAbsDeterminant() - expectedLog) / expectedLog);
+  }
 }
 
 // Equilibration and matching both reason about magnitudes; for complex scalars

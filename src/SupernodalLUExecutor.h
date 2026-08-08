@@ -12,8 +12,11 @@
 //     int concurrency() const;   // number of worker lanes (>= 1)
 //
 // SerialExecutor (the default) keeps the solver dependency-free. StdThreadExecutor
-// is a ready-to-use std::thread pool. Backends such as oneTBB or OpenMP are a few
-// lines: forward parallelFor to tbb::parallel_for / a `#pragma omp parallel for`.
+// is a ready-to-use std::thread pool; PooledExecutor wraps one in a shared_ptr so
+// that a solver's thread count can still be changed after construction, which
+// StdThreadExecutor itself cannot support. Backends such as oneTBB or OpenMP are
+// a few lines: forward parallelFor to tbb::parallel_for / a
+// `#pragma omp parallel for`.
 //
 // This Source Code Form is licensed under the Mozilla Public License v.2.0,
 // matching the surrounding Eigen code it integrates with.
@@ -27,8 +30,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace Eigen {
@@ -152,6 +157,45 @@ class StdThreadExecutor {
   mutable unsigned m_activeWorkers = 0;
   mutable std::uint64_t m_generation = 0;
   bool m_stop = false;
+};
+
+// A RECONFIGURABLE wrapper around a shared StdThreadExecutor pool.
+//
+// The solvers hold their Executor by value, and the only hook for changing it
+// after construction is assigning through the executor() accessor. That does not
+// work for StdThreadExecutor: it owns its pool, deletes its copy operations and
+// declares a destructor, so it has no move operations either -- its thread count
+// is fixed at construction and it cannot be assigned into a live solver. Anyone
+// wanting a runtime-chosen thread count (a sweep, a setting read from a config
+// file, a pool sized to a job) hits that wall.
+//
+// Holding the pool through a shared_ptr keeps the pool itself unique and
+// un-copied while making the wrapper default-constructible, copyable and
+// assignable:
+//
+//     SupernodalLU<Mat, AMDOrdering<int>, supernodal_lu::PooledExecutor> solver;
+//     solver.executor() = supernodal_lu::PooledExecutor(8);   // now works
+//
+// Copies share one pool, which is the point: assigning a PooledExecutor into a
+// solver does not spawn a second set of threads. The default constructor makes a
+// one-thread pool, which spawns nothing and runs parallelFor inline, so a
+// default-constructed solver costs nothing until a real pool is assigned in.
+class PooledExecutor {
+ public:
+  // numThreads == 0 selects std::thread::hardware_concurrency().
+  explicit PooledExecutor(int numThreads = 1)
+      : m_pool(std::make_shared<StdThreadExecutor>(
+            static_cast<unsigned>(numThreads < 0 ? 0 : numThreads))) {}
+
+  int concurrency() const { return m_pool->concurrency(); }
+
+  template <typename F>
+  void parallelFor(Index begin, Index end, F&& f) const {
+    m_pool->parallelFor(begin, end, std::forward<F>(f));
+  }
+
+ private:
+  std::shared_ptr<StdThreadExecutor> m_pool;
 };
 
 }  // namespace supernodal_lu

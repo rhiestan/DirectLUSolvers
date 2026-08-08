@@ -91,7 +91,6 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
 | `test/testing/TestData.h` | The benchmark-matrix registry: one list of `testdata/` matrices, with size tiers, shared by every suite. |
-| `test/testing/PooledExecutor.h` | A copy-assignable `Executor` wrapping a shared `StdThreadExecutor` pool, so a solver's thread count can be changed after construction (which `StdThreadExecutor` itself cannot do). |
 
 ## Requirements
 
@@ -362,6 +361,13 @@ operation they describe has run at least once.
   concurrency of plain level-parallelism (see [Parallelism](#parallelism)).
 - **`determinant() -> Scalar`** — `det(A)`, correctly divides out the equilibration scaling and
   folds in the sign of the matching permutation and every in-block pivot swap.
+- **`logAbsDeterminant() -> RealScalar`** / **`determinantSign() -> Scalar`** — `log|det(A)|`
+  accumulated as a sum of logs, plus the sign (±1 for real scalars, a unit-modulus phase for
+  complex, `0` on a zero pivot). **Prefer these over `determinant()` above a few hundred rows:**
+  `det` scales like the product of the pivots, so a diagonally dominant 150×150 system already
+  gives `|det| ~ 1e326` — `inf` in `double`, and any comparison against it is vacuous.
+  `determinantSign() * exp(logAbsDeterminant())` reconstructs the value where it is
+  representable. (`LeftRightLU` exposes the same pair.)
 
 ### Factor access & transposed solves (`Eigen::SparseLU`-compatible)
 
@@ -405,7 +411,8 @@ Four backends are provided:
 | Executor | Header | Dependency | Notes |
 |---|---|---|---|
 | `supernodal_lu::SerialExecutor` | `SupernodalLU.h` (bundled) | none | Default. No threading. |
-| `supernodal_lu::StdThreadExecutor` | `SupernodalLUExecutor.h` (bundled) | `<thread>` | Persistent `std::thread` pool, fork-join, dynamic work-stealing. Thread count fixed at construction (default `hardware_concurrency()`); the instance is non-copyable, so it **cannot** be reconfigured via `solver.executor() = ...` after construction — build a custom executor wrapping a shared pool of the size you want if you need that. |
+| `supernodal_lu::StdThreadExecutor` | `SupernodalLUExecutor.h` (bundled) | `<thread>` | Persistent `std::thread` pool, fork-join, dynamic work-stealing. Thread count fixed at construction (default `hardware_concurrency()`); the instance is non-copyable **and** non-movable, so it cannot be reconfigured via `solver.executor() = ...` — use `PooledExecutor` when you need that. |
+| `supernodal_lu::PooledExecutor` | `SupernodalLUExecutor.h` (bundled) | `<thread>` | The same pool held through a `shared_ptr`, which makes it copyable and assignable: `solver.executor() = PooledExecutor(8)` works, and copies share one pool rather than spawning a second. Default-constructs to a single thread (spawns nothing). Use this for a runtime-chosen thread count. |
 | `supernodal_lu::OpenMPExecutor` | `SupernodalLUExecutorOpenMP.h` | OpenMP runtime | See [below](#openmpexecutor). |
 | `supernodal_lu::TBBExecutor` | `SupernodalLUExecutorTBB.h` | oneAPI TBB | See [below](#tbbexecutor). |
 
@@ -1228,7 +1235,9 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
   alias mapping to `Complete` / `None`.
 - **`setRefineOnlyIfPerturbed(bool)`** (default **true**) — PARDISO-style refinement gating.
 - **`logAbsDeterminant() -> RealScalar`** and **`determinantSign() -> Scalar`** — the
-  log-determinant pair.
+  log-determinant pair. No longer a delta: `SupernodalLU` gained the same pair, since
+  `determinant()` overflows on both solvers for the same reason. See its
+  [Diagnostics & queries](#diagnostics--queries).
 - **`predictedFactorNonzeros()`** and **`setMaxFactorNonzeros(Index)`** — the shared fail-fast
   fill guard (see the SupernodalLU [Diagnostics & queries](#diagnostics--queries) section). Both
   solvers factor a symmetric pattern, so both can predict an infeasible factor on matrices without

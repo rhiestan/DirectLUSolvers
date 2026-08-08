@@ -39,7 +39,6 @@
 #include "LeftRightLU.h"
 #include "SupernodalLU.h"
 #include "testing/Check.h"
-#include "testing/PooledExecutor.h"
 #include "testing/TestMatrices.h"
 
 #ifdef DLU_HAVE_OPENMP
@@ -201,9 +200,9 @@ int main() {
   std::printf("StdThreadExecutor:\n");
   exerciseBackend<slu::StdThreadExecutor>("StdThread(default)", ref, [](auto&) {});
   for (int t : {2, 8})
-    exerciseBackend<lu_testing::PooledExecutor>(
+    exerciseBackend<Eigen::supernodal_lu::PooledExecutor>(
         "Pooled/StdThread(" + std::to_string(t) + ")", ref,
-        [t](auto& s) { s.executor() = lu_testing::PooledExecutor(t); });
+        [t](auto& s) { s.executor() = Eigen::supernodal_lu::PooledExecutor(t); });
 
 #ifdef DLU_HAVE_OPENMP
   std::printf("OpenMPExecutor:\n");

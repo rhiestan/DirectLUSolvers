@@ -411,6 +411,47 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     return m_factorizationSign * det / m_scalingDeterminant;
   }
 
+  /** \returns log|det(A)|, accumulated as a sum of logs so it stays finite where
+   *  determinant() would overflow or underflow.
+   *
+   *  This is not an exotic case: det scales like the product of the pivots, so a
+   *  diagonally dominant system of only a few hundred rows is already past the
+   *  top of `double` (a 150x150 one with a diagonal of 150 gives |det| ~ 1e326,
+   *  i.e. inf). Anything comparing determinants at that size is comparing
+   *  infinities. Pair with determinantSign() for the full value.
+   *
+   *  Note this recomputes the equilibration correction as a sum of logs rather
+   *  than dividing by m_scalingDeterminant, because that product overflows for
+   *  exactly the same reason the determinant does. */
+  RealScalar logAbsDeterminant() const {
+    RealScalar acc(0);
+    for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+      const ConstStridedPanel diag = diagBlock(s);
+      for (Index k = 0; k < diag.rows(); ++k) acc += numext::log(numext::abs(diag(k, k)));
+    }
+    // divide out the (positive) equilibration scaling: log|det A| = log|det A~|
+    //   - sum log(Dr) - sum log(Dc).
+    for (StorageIndex i = 0; i < m_size; ++i)
+      acc -= numext::log(m_rowScale[i]) + numext::log(m_colScale[i]);
+    return acc;
+  }
+
+  /** \returns the sign of det(A) -- +/-1 for real scalars, a unit-modulus phase
+   *  for complex ones, or 0 if any pivot came out exactly zero. Pairs with
+   *  logAbsDeterminant(). */
+  Scalar determinantSign() const {
+    Scalar sign = m_factorizationSign;
+    for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+      const ConstStridedPanel diag = diagBlock(s);
+      for (Index k = 0; k < diag.rows(); ++k) {
+        const Scalar d = diag(k, k);
+        if (d == Scalar(0)) return Scalar(0);
+        sign *= d / numext::abs(d);
+      }
+    }
+    return sign;
+  }
+
   // --- factor accessors (Eigen::SparseLU-compatible) ------------------------
 
   /** Expression of the unit-lower factor L. The supported operation is the

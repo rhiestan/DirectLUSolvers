@@ -51,20 +51,19 @@
 #include "SupernodalLU.h"
 #include "testing/Check.h"
 #include "testing/MatrixMarket.h"
-#include "testing/PooledExecutor.h"
 #include "testing/TestData.h"
 #include "testing/TestMatrices.h"
 
 using Eigen::MatrixXd;
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
+using Eigen::supernodal_lu::PooledExecutor;
 using lu_testing::ms;
-using lu_testing::PooledExecutor;
 using Clock = lu_testing::Clock;
 
-// Both solvers instantiated on the reconfigurable pooled executor, so one
-// solver type covers the whole sweep (see testing/PooledExecutor.h for why
-// StdThreadExecutor cannot be reconfigured in place).
+// Both solvers instantiated on the reconfigurable pooled executor, so one solver
+// type covers the whole sweep (StdThreadExecutor cannot be reconfigured in place;
+// see PooledExecutor in SupernodalLUExecutor.h).
 using Snlu = Eigen::SupernodalLU<SparseMatrix<double>, Eigen::AMDOrdering<int>, PooledExecutor>;
 using Lrlu = Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>, PooledExecutor>;
 
