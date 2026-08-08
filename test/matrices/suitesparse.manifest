@@ -1,0 +1,71 @@
+# Curated SuiteSparse Matrix Collection corpus for DirectLUSolvers.
+#
+# Download with:  python fetch_suitesparse.py
+# Consumed by:    test/test_suitesparse.cpp  (via testing/TestData.h)
+#
+# The files themselves live in cache/ and are NOT committed. This manifest is,
+# so the corpus is reproducible: SuiteSparse matrices are immutable, so a given
+# line always denotes the same matrix.
+#
+# WHY THESE MATRICES
+#
+# The selection is stratified on PATTERN SYMMETRY (psym), because that is the
+# axis these solvers are actually sensitive to. Both factor a symmetric pattern,
+# so a matrix whose pattern is far from symmetric gets explicit structural zeros
+# added and can fill catastrophically -- a corpus of psym==1.00 matrices would
+# look great and test nothing about the failure mode that matters. The bands:
+#
+#   psym == 1.00   native symmetric pattern -- the intended use case
+#   0.50 - 0.99    partial -- symmetrization adds moderate structure
+#   < 0.50         strongly unsymmetric -- stress case; several of these are
+#                  EXPECTED to be declined by the fill guard, and that is a
+#                  tested behaviour, not a failure
+#
+# Within each band the pick spreads over problem kind (structural, CFD, circuit,
+# chemical process, thermal, graph, ...) and size, taking a mid-sized
+# representative of each family rather than the extremes.
+#
+# TIERS
+#   quick     small, runs in CI
+#   standard  larger; run on demand
+#   large     big enough to need real time/memory
+#
+# Add candidates with:  python fetch_suitesparse.py --propose 20
+# Check the metadata is still accurate:  python fetch_suitesparse.py --verify
+#
+# group name tier n nnz psym spd kind
+
+# --- band: native symmetric pattern (psym == 1.00) -------------------------
+Boeing nasa1824 quick 1824 39208 1.00 n duplicate structural problem
+Bai bwm2000 quick 2000 7996 1.00 n chemical process simulation problem
+Wang swang2 quick 3169 20841 1.00 n subsequent semiconductor device problem
+Simon raefsky2 quick 3242 293551 1.00 n subsequent computational fluid dynamics problem
+Lucifora cell2 quick 7055 30082 1.00 n directed weighted graph
+Nemeth nemeth01 quick 9506 725054 1.00 n theoretical/quantum chemistry problem sequence
+Bai cryg10000 quick 10000 49699 1.00 n materials problem
+GHS_indef sit100 quick 10262 61046 1.00 n 2D/3D problem
+Bindel ted_B_unscaled quick 10605 144579 1.00 y thermal problem
+JGD_Trefethen Trefethen_20000b standard 19999 554435 1.00 y combinatorial problem
+GHS_indef spmsrtls standard 29995 229947 1.00 n statistical/mathematical problem
+SNAP as-caida standard 31379 106762 1.00 n directed weighted graph sequence
+
+# --- band: partial pattern symmetry (0.50 <= psym < 1.00) ------------------
+HB nnc1374 quick 1374 8588 0.82 n 2D/3D problem
+Sandia adder_dcop_11 quick 1813 11243 0.65 n subsequent circuit simulation problem
+DRIVCAV cavity10 quick 2597 76171 0.94 n computational fluid dynamics problem sequence
+Muite Chebyshev3 quick 4101 36879 0.50 n structural problem
+DRIVCAV cavity17 quick 4562 131735 0.95 n subsequent computational fluid dynamics problem
+Shyy shyy41 quick 4720 20042 0.72 n computational fluid dynamics problem
+
+# --- band: strongly unsymmetric pattern (psym < 0.50) ----------------------
+# Several of these are expected to be DECLINED by the fill guard. That is the
+# documented behaviour for patterns without good separators, and pinning it is
+# the point of including them.
+Bai tols1090 quick 1090 3546 0.32 n computational fluid dynamics problem
+JGD_CAG CAG_mat1916 quick 1916 195985 0.30 n combinatorial problem
+Grund meg1 quick 2904 58142 0.00 n circuit simulation problem
+HB gemat12 quick 4929 33044 0.00 n subsequent power network problem
+Bai rw5151 quick 5151 20199 0.49 n statistical/mathematical problem
+Simon raefsky5 quick 6316 167178 0.00 n structural problem
+Mallya lhr10c quick 10672 232633 0.01 n chemical process simulation problem
+Pajek foldoc quick 13356 120238 0.48 n directed weighted graph

@@ -78,6 +78,9 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](#fill-regression-baselines). |
+| `test/test_suitesparse.cpp` | Correctness sweep over the curated SuiteSparse corpus, including matrices these solvers cannot handle. See [The SuiteSparse corpus](#the-suitesparse-corpus). |
+| `test/matrices/fetch_suitesparse.py` | Downloads the corpus named by `suitesparse.manifest` into a git-ignored `cache/`. No third-party dependency. |
+| `test/matrices/suitesparse.manifest` | The checked-in, human-curated corpus definition. |
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
 | `test/bench_parallel.cpp` | Thread-count scaling sweep with per-phase timing (analyze / factor / solve), per mechanism. See [Parallel scaling](#parallel-scaling-measured). |
 | `test/bench_ceiling.cpp` | What the *machine* can deliver, via independent concurrent factorizations — the upper bound any scheduler could reach. See [The machine ceiling](#the-machine-ceiling). |
@@ -748,6 +751,55 @@ ctest --test-dir build -R test_regression --output-on-failure
 Re-baseline only once you understand why the fill moved: `--update` rewrites
 every entry, so read the diff before committing it. A fill change is a real
 change.
+
+### The SuiteSparse corpus
+
+`testdata/` holds a handful of matrices this project happened to encounter, all
+of which these solvers handle. `test/matrices/` adds a curated corpus from the
+[SuiteSparse Matrix Collection](https://sparse.tamu.edu), **stratified on
+pattern symmetry** and deliberately including matrices the solvers should *not*
+handle well — because the interesting question is not "does it solve" but "does
+it behave correctly when it cannot".
+
+```sh
+python test/matrices/fetch_suitesparse.py     # download (~59 MB, once)
+ctest --test-dir build -R test_suitesparse --output-on-failure
+```
+
+The fetch script needs **no third-party package** — the SuiteSparse URL scheme
+is stable, so plain `urllib` suffices and reproducing the corpus never depends
+on a `pip install`. (`ssgetpy` is consulted only by `--propose`, and only if
+installed.) `suitesparse.manifest` is checked in and human-curated; the matrices
+themselves land in a git-ignored `cache/`. Because SuiteSparse matrices are
+immutable, a manifest line always denotes the same matrix.
+
+```sh
+python test/matrices/fetch_suitesparse.py --list        # what's in the corpus
+python test/matrices/fetch_suitesparse.py --verify      # manifest vs live index
+python test/matrices/fetch_suitesparse.py --propose 20  # candidates to adopt
+```
+
+**The contract being tested.** A solver may solve accurately, may refuse to
+factor, or may return a bad answer *it has itself flagged* — but must never
+quietly return a wrong one. `test_suitesparse` judges exactly that, reading
+`info()` **after** `solve()`, and additionally confirms that a flagged solve
+really was bad (flagging a good one would be its own defect).
+
+Results on the 23-matrix quick tier: **15 solved** to machine precision, **8
+returned a bad answer the solver flagged itself**, 0 tripped the fill guard.
+No unflagged wrong answers — the honesty machinery
+(`solveFailureThreshold`, the post-solve residual check) is now tested against
+matrices that genuinely defeat the solvers, which nothing previously did.
+
+**A finding worth knowing: pattern symmetry does not predict success.** The
+intuition that `psym == 1.00` is safe and `psym < 0.5` is doomed is wrong in
+both directions. Three matrices with a *completely* unsymmetric pattern
+(`HB/gemat12`, `Grund/meg1`, `Simon/raefsky5`, all psym 0.00) solved to ~1e-16,
+while four in the *partial* band failed, including `DRIVCAV/cavity10` at
+psym 0.94. Fill ratio tracks symmetry as expected (`Pajek/foldoc` 282x,
+`HB/gemat12` 160x), but whether the answer is usable is governed by
+conditioning, not by pattern. Do not use `psym` to decide whether these solvers
+suit your matrix — run it and check `info()`.
 
 ### Parallel scaling (measured)
 

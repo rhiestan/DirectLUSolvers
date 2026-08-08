@@ -131,6 +131,7 @@ target_link_libraries(dlu_test_common INTERFACE DirectLUSolvers Threads::Threads
 target_include_directories(dlu_test_common INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/test")
 target_compile_definitions(dlu_test_common INTERFACE
                            "DLU_TESTDATA_DIR=\"${DLU_TESTDATA_DIR}\""
+                           "DLU_MATRIX_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/test/matrices\""
                            "DLU_BASELINE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/test/baselines/testdata.baseline\"")
 
 if(MSVC)
@@ -236,6 +237,12 @@ endif()
 
 add_dlu_test(test_regression SOURCE test/test_regression.cpp
              LABELS "testdata;regression" LINK ${DLU_REGRESSION_LINK})
+
+# SuiteSparse corpus sweep. The matrices are fetched on demand into a git-ignored
+# cache (test/matrices/fetch_suitesparse.py); with nothing downloaded the suite
+# reports how to get them and passes, so this is safe to register unconditionally.
+add_dlu_test(test_suitesparse SOURCE test/test_suitesparse.cpp
+             LABELS "suitesparse;correctness")
 # `--tier large` deliberately omits pre2: Eigen::SparseLU alone runs for minutes
 # at 3+ GB there, which no default `ctest` invocation should trigger. Run the
 # binary by hand (no arguments) for the full corpus.

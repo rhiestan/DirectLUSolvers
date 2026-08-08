@@ -13,6 +13,8 @@
 #define DIRECTLUSOLVERS_TEST_TESTING_TESTDATA_H
 
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -20,6 +22,11 @@
 // Fallback for a hand-compiled build without CMake: assume the repository root
 // is the working directory.
 #define DLU_TESTDATA_DIR "testdata"
+#endif
+
+#ifndef DLU_MATRIX_DIR
+// Where fetch_suitesparse.py keeps the manifest and its cache/ directory.
+#define DLU_MATRIX_DIR "DirectLUSolvers/test/matrices"
 #endif
 
 namespace lu_testing {
@@ -83,6 +90,77 @@ inline std::vector<std::string> benchmarkPaths(Tier maxTier) {
     if (static_cast<int>(m.tier) <= static_cast<int>(maxTier))
       paths.push_back(testdataPath(m.relative));
   return paths;
+}
+
+// ---------------------------------------------------------------------------
+//  SuiteSparse corpus (optional, downloaded on demand)
+// ---------------------------------------------------------------------------
+//
+// test/matrices/suitesparse.manifest is a checked-in, human-curated list; the
+// .mtx files it names are fetched by fetch_suitesparse.py into a git-ignored
+// cache/. The manifest is read at RUN time, not baked in at configure time, so
+// adopting a matrix is a one-line edit with no rebuild.
+//
+// Entries whose file has not been downloaded are still returned, with
+// `available == false`, so a suite can report "3 of 26 present, run the fetch
+// script" rather than silently testing less than the reader assumes.
+
+struct SuiteSparseMatrix {
+  std::string group;
+  std::string name;
+  Tier tier = Tier::Small;
+  long long n = 0;
+  long long nnz = 0;
+  double patternSymmetry = 0.0;  // 1.00 == already symmetric, < 0.5 == stress case
+  bool positiveDefinite = false;
+  std::string kind;
+  std::string path;        // absolute path to the .mtx
+  bool available = false;  // has it actually been downloaded?
+
+  std::string label() const { return group + "/" + name; }
+};
+
+inline std::string matrixDir() {
+  if (const char* env = std::getenv("DLU_MATRIX_DIR")) {
+    if (env[0] != '\0') return std::string(env);
+  }
+  return std::string(DLU_MATRIX_DIR);
+}
+
+inline std::string suitesparseManifestPath() {
+  return matrixDir() + "/suitesparse.manifest";
+}
+
+// Parse the manifest. Returns an empty vector when it cannot be read, which the
+// callers treat as "corpus not set up" rather than as an error.
+inline std::vector<SuiteSparseMatrix> suitesparseMatrices() {
+  std::vector<SuiteSparseMatrix> out;
+  std::ifstream in(suitesparseManifestPath());
+  if (!in) return out;
+
+  std::string line;
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const std::size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos || line[first] == '#') continue;
+
+    std::istringstream iss(line);
+    SuiteSparseMatrix m;
+    std::string tier, spd;
+    if (!(iss >> m.group >> m.name >> tier >> m.n >> m.nnz >> m.patternSymmetry >> spd))
+      continue;
+    std::getline(iss, m.kind);
+    if (!m.kind.empty() && m.kind[0] == ' ') m.kind.erase(0, 1);
+
+    m.tier = (tier == "large") ? Tier::Huge : (tier == "standard" ? Tier::Large : Tier::Small);
+    m.positiveDefinite = (spd == "y");
+    // The tarball expands to <Name>/<Name>.mtx under cache/<Group>/.
+    m.path = matrixDir() + "/cache/" + m.group + "/" + m.name + "/" + m.name + ".mtx";
+    std::ifstream probe(m.path);
+    m.available = static_cast<bool>(probe);
+    out.push_back(m);
+  }
+  return out;
 }
 
 // Short label for a matrix path: its parent directory name (so
