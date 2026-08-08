@@ -599,25 +599,52 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // position a plain sub-block.) Only legal from a sequential caller.
   void applyAllUpdatesChunked(StorageIndex target);
 
-  // Minimum rows/columns of a chunk when splitting a panel op across the pool:
+  // Largest rows/columns of a chunk when splitting a panel op across the pool:
   // big enough that per-dispatch overhead is negligible against the chunk's
-  // BLAS-3 work, small enough to load-balance the tall root panels.
+  // BLAS-3 work, small enough to load-balance the tall root panels. This is a
+  // CEILING, not the chunk size -- see intraChunkRows().
   static constexpr Index kIntraChunkSize = 128;
 
-  // Split [0, total) into contiguous chunks of (at least) minChunk and dispatch
+  // Floor on chunk extent. Below roughly this many rows a panel GEMM becomes a
+  // strip too thin to amortize either the BLAS call or the per-chunk walk over
+  // the target's update sources, so splitting further costs more than it buys.
+  static constexpr Index kMinIntraChunkSize = 32;
+
+  // Chunk extent to use when splitting `total` rows/columns across the pool.
+  //
+  // This used to be the fixed kIntraChunkSize, which silently capped intra-
+  // supernode parallelism at ceil(total/128) chunks NO MATTER how many threads
+  // existed. Measured on this project's matrices at 32 lanes, the heaviest
+  // supernodes carry ~1400-1650 off-diagonal rows and so got only 11-13 chunks:
+  // 20 of 32 threads idle through the supernodes that dominate the
+  // factorization. Weighted by work, 52% (lap3d_30^3) and 44% (laoss_1) of all
+  // factorization work sat in supernodes that could not fill the machine.
+  //
+  // Aiming for one chunk per lane removes that cap. The result is never coarser
+  // than before (so this cannot reduce parallelism) and never finer than the
+  // floor above.
+  Index intraChunkRows(Index total) const {
+    const Index lanes = static_cast<Index>(m_executor.concurrency());
+    if (lanes <= 1 || total <= 0) return numext::maxi(Index(1), total);
+    const Index perLane = (total + lanes - 1) / lanes;
+    return numext::maxi(kMinIntraChunkSize, numext::mini(kIntraChunkSize, perLane));
+  }
+
+  // Split [0, total) into contiguous chunks of (at most) chunkRows and dispatch
   // body(start, length) for each through the executor. Chunks cover disjoint
-  // output regions and leave each element's arithmetic unchanged, so the result
-  // is bit-identical to body(0, total). Runs inline when only one chunk remains.
+  // output regions and leave each element's accumulation order unchanged, so the
+  // result matches body(0, total) up to Eigen choosing a different GEMM kernel
+  // for a differently-shaped block. Runs inline when only one chunk remains.
   template <typename F>
-  void parallelChunks(Index total, Index minChunk, const F& body) const {
-    const Index chunkCount = (total + minChunk - 1) / minChunk;
+  void parallelChunks(Index total, Index chunkRows, const F& body) const {
+    const Index chunkCount = (total + chunkRows - 1) / chunkRows;
     if (chunkCount <= 1) {
       if (total > 0) body(Index(0), total);
       return;
     }
     m_executor.parallelFor(Index(0), chunkCount, [&](Index c) {
-      const Index start = c * minChunk;
-      body(start, numext::mini(minChunk, total - start));
+      const Index start = c * chunkRows;
+      body(start, numext::mini(chunkRows, total - start));
     });
   }
 
@@ -1411,7 +1438,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(St
   // Each chunk walks the sources in order and applies the slice of every below-
   // facing GEMM that lands in its rows (element accumulation order = source
   // order, as in the serial sweep).
-  parallelChunks(offDiag, kIntraChunkSize, [&](Index chunkStart, Index chunkLen) {
+  parallelChunks(offDiag, intraChunkRows(offDiag), [&](Index chunkStart, Index chunkLen) {
     const Index chunkEnd = chunkStart + chunkLen;
     for (const UpdateSource& u : sources) {
       const Supernode& src = m_supernodes[u.sourceSupernode];
@@ -1442,7 +1469,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(St
 
   // Pass 3: U off-diagonal panel, chunked by disjoint target-panel column ranges
   // (same slicing, transposed roles).
-  parallelChunks(offDiag, kIntraChunkSize, [&](Index chunkStart, Index chunkLen) {
+  parallelChunks(offDiag, intraChunkRows(offDiag), [&](Index chunkStart, Index chunkLen) {
     const Index chunkEnd = chunkStart + chunkLen;
     for (const UpdateSource& u : sources) {
       const Supernode& src = m_supernodes[u.sourceSupernode];
@@ -1638,8 +1665,8 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storag
       diag.template triangularView<UnitLower>().solveInPlace(chunk);
     };
     if (intraParallel) {
-      parallelChunks(offDiag, kIntraChunkSize, lowerSolve);
-      parallelChunks(offDiag, kIntraChunkSize, upperSolve);
+      parallelChunks(offDiag, intraChunkRows(offDiag), lowerSolve);
+      parallelChunks(offDiag, intraChunkRows(offDiag), upperSolve);
     } else {
       lowerSolve(Index(0), offDiag);
       upperSolve(Index(0), offDiag);
@@ -1782,7 +1809,11 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
       StorageIndex maxOffDiag = 0;
       for (StorageIndex s : group)
         maxOffDiag = std::max(maxOffDiag, m_supernodes[s].offDiagonalRowCount);
-      innerMode = static_cast<Index>(maxOffDiag) >= 2 * kIntraChunkSize;
+      // Tall enough to split into at least two chunks at the finest granularity
+      // intraChunkRows() will use. This tracks the FLOOR, not the ceiling: with
+      // the chunk extent now scaled to the lane count, a 300-row panel splits
+      // usefully even though it never reaches the 128-row ceiling twice over.
+      innerMode = static_cast<Index>(maxOffDiag) >= 2 * kMinIntraChunkSize;
     }
     if (innerMode) {
       for (Index k = 0; k < groupSize; ++k) {

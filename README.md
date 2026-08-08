@@ -270,7 +270,11 @@ operation they describe has run at least once.
   fewer supernodes than worker threads (typically the few huge separator supernodes near the
   root, which otherwise serialize) run their supernodes one at a time but parallelize *inside*
   each one instead: the Schur-update GEMMs and off-diagonal TRSMs are split into disjoint chunks
-  dispatched across the executor. No effect with `SerialExecutor`. **Caveat:** where this
+  dispatched across the executor. Chunk extent scales with the executor's
+  `concurrency()` so a big supernode produces about one chunk per lane (see
+  [Chunk sizing](#chunk-sizing)); this is the single largest contributor to
+  parallel factorization speedup measured on this project's matrices. No effect
+  with `SerialExecutor`. **Caveat:** where this
   triggers, the parallel result is no longer *bit-identical* to the serial one (differs at
   ~1e-14 relative, from floating-point reassociation across chunk boundaries) — it is still
   fully deterministic for a given thread count, and the true residual is unaffected.
@@ -345,8 +349,8 @@ Numeric factorization parallelizes two ways, both driven by the same `Executor`:
    single big supernode's GEMM/TRSM work across the executor when a level is too narrow to keep
    the machine busy on its own — this is what breaks the "serial tail" of the few huge
    root-separator supernodes and is responsible for most of the speedup on well-separated
-   matrices (measured 3x+ on large 2D Laplacians with 32 threads, vs. ~1.5x from level
-   parallelism alone).
+   matrices (measured 3.20x on a 30³ 3D Laplacian at 32 threads, versus 1.13x
+   from level parallelism alone; see [Parallel scaling](#parallel-scaling-measured)).
 
 The `Executor` concept (`SupernodalLUExecutor.h`) is two methods:
 
@@ -681,8 +685,11 @@ solver.compute(A);
   3D matrices. If you write a custom `OrderingType`, return the same convention as Eigen's
   built-in orderings.
 - Parallel scaling benefits the most from `setIntraSupernodeParallelism` (on by default) on
-  matrices with a wide, well-separated elimination tree (e.g. 2D/3D discretizations) — 3x+
-  speedup measured at 32 threads, versus ~1.5x from level-parallelism alone.
+  matrices with a wide, well-separated elimination tree (e.g. 2D/3D discretizations) — 3.20x
+  measured at 32 threads on a 30³ 3D Laplacian, versus 1.13x from level-parallelism alone.
+  Note that on the *whole* pipeline the serial `analyzePattern()` then dominates (~41% of
+  factor+solve on `laoss_1` at 32 threads), so total speedup is well below the factorization
+  figure. See [Parallel scaling](#parallel-scaling-measured) for the per-phase breakdown.
 - All of the above is measured on `DirectLUSolvers/test/compare_testdata.cpp`'s matrix set —
   benchmark your own matrices before drawing conclusions for your workload.
 
@@ -758,14 +765,14 @@ from 1 to 32 threads.
 
 | matrix | phase | 1t | 8t | 32t | speedup |
 |---|---|---:|---:|---:|---:|
-| `laoss_1` (251k) | analyze (symbolic) | 664 | 640 | 628 | **1.06x** |
-| | factor, levels only | 2111 | 1402 | 1330 | 1.59x |
-| | factor, levels+intra | 2097 | 987 | 829 | **2.53x** |
-| | factor, LRLU DAG | 2162 | 1325 | 1227 | 1.76x |
-| | solve, 1 rhs | 71.1 | 71.1 | 71.3 | **1.00x** |
-| | solve, 8 rhs | 215 | 211 | 209 | **1.03x** |
-| `lap3d_30³` | factor, levels only | 612 | 530 | 534 | 1.15x |
-| | factor, levels+intra | 616 | 279 | 265 | **2.33x** |
+| `laoss_1` (251k) | analyze (symbolic) | 650 | 637 | 626 | **1.04x** |
+| | factor, levels only | 2069 | 1394 | 1336 | 1.55x |
+| | factor, levels+intra | 2071 | 972 | 834 | **2.48x** |
+| | factor, LRLU DAG | 2150 | 1303 | 1223 | 1.76x |
+| | solve, 1 rhs | 71.3 | 71.4 | 71.5 | **1.00x** |
+| | solve, 8 rhs | 207 | 209 | 208 | **1.00x** |
+| `lap3d_30³` | factor, levels only | 600 | 544 | 533 | 1.13x |
+| | factor, levels+intra | 604 | 263 | 189 | **3.20x** |
 | | factor, LRLU DAG | 645 | 539 | 543 | 1.19x |
 
 Four things this says, none of them visible from a single-thread-count timing:
@@ -780,9 +787,10 @@ Four things this says, none of them visible from a single-thread-count timing:
    `laoss_2`, and 57% on `lap2d_300²` — more than the factorization it feeds.
    Improving factorization scaling further buys little until this moves.
 3. **Intra-supernode chunking is the mechanism that pays, not level
-   parallelism.** On the 3D Laplacian, levels alone give 1.15x while adding
-   intra-supernode chunking gives 2.33x. Level parallelism on its own never
-   exceeded 1.65x on any matrix here.
+   parallelism.** On the 3D Laplacian, levels alone give 1.13x while adding
+   intra-supernode chunking gives 3.20x. Level parallelism on its own never
+   exceeded 1.65x on any matrix here. See [Chunk sizing](#chunk-sizing) for the
+   cap that used to hold this back.
 4. **`LeftRightLU`'s barrier-free scheduler still trails `SupernodalLU`'s
    levels + chunking on 3D** (1.19x vs 2.33x on `lap3d_30³`; 1.76x vs 2.53x on
    `laoss_1`) — see [Work-stealing ready queue](#work-stealing-ready-queue)
@@ -790,6 +798,38 @@ Four things this says, none of them visible from a single-thread-count timing:
 
 Across the board, most of the available gain arrives by 8 threads; 8 → 32
 adds little.
+
+#### Chunk sizing
+
+Intra-supernode chunking originally split a panel into fixed 128-row chunks, so
+a supernode yielded `ceil(offDiagonalRows / 128)` chunks **regardless of how
+many threads existed**. On this project's matrices at 32 lanes the heaviest
+supernodes carry ~1400-1650 off-diagonal rows and therefore got only 11-13
+chunks: 20 of 32 threads idled through precisely the supernodes that dominate
+the factorization. Weighted by work, 52% (`lap3d_30³`) and 44% (`laoss_1`) of
+all factorization work sat in supernodes that could not fill the machine.
+
+The chunk extent is now `clamp(ceil(total / lanes), 32, 128)` — one chunk per
+lane, floored so a chunk stays thick enough to amortize the BLAS call and the
+per-chunk walk over the target's update sources, and ceilinged at the old 128 so
+tall panels still produce many chunks for load balance. It is **never coarser
+than before**, so it cannot reduce parallelism, and at low lane counts it
+reproduces the old behaviour exactly.
+
+| matrix | factor (levels+intra) at 32t | before | after | speedup 1→32 |
+|---|---|---:|---:|---|
+| `lap3d_30³` | | 265 ms | **189 ms** | 2.33x → **3.20x** |
+| `laoss_2` (100k) | | 261 ms | **214 ms** | 2.01x → **2.47x** |
+| `lap2d_300²` | | 59.1 ms | **51.3 ms** | 1.84x → **2.13x** |
+| `laoss_1` (251k) | | 835 ms | 834 ms | 2.35x → 2.48x |
+
+**`laoss_1` did not move**, despite the diagnostic predicting 44% idle there —
+and its 8-thread efficiency is only 27% (2.13x), so something other than chunk
+count is the binding constraint on that matrix well before 32 threads. Its
+factor is ~58M scalars (~465 MB) streamed repeatedly by the update GEMMs, which
+makes memory bandwidth the obvious suspect, but that is a hypothesis this
+benchmark has not tested. Treat the 2.48x there as unexplained, not as a
+success.
 
 #### Work-stealing ready queue
 
