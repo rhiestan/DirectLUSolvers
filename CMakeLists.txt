@@ -108,11 +108,8 @@ enable_testing()
 
 option(DLU_WITH_METIS   "Build the METIS / AutoOrdering comparisons" OFF)
 option(DLU_WITH_PARDISO "Build the MKL PARDISO comparison"           OFF)
-
-# No DLU_WITH_OPENMP / DLU_WITH_TBB switches yet: there is no suite that
-# exercises OpenMPExecutor or TBBExecutor, so an option here would only promise
-# a test that does not exist. test_parallel_lu covers StdThreadExecutor only.
-# Adding executor-parameterised variants of it is tracked as follow-up work.
+option(DLU_WITH_OPENMP  "Test the OpenMPExecutor backend"            OFF)
+option(DLU_WITH_TBB     "Test the TBBExecutor backend"               OFF)
 
 set(DLU_TESTDATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../testdata"
     CACHE PATH "Directory holding the MatrixMarket benchmark matrices")
@@ -186,6 +183,55 @@ if(DLU_WITH_PARDISO)
   message(STATUS "MKL PARDISO: ${DLU_MKL_RT_LIBRARY}")
 endif()
 
+# --- optional: OpenMP executor ---------------------------------------------
+if(DLU_WITH_OPENMP)
+  find_package(OpenMP REQUIRED COMPONENTS CXX)
+  add_library(dlu_openmp INTERFACE)
+  target_link_libraries(dlu_openmp INTERFACE OpenMP::OpenMP_CXX)
+  target_compile_definitions(dlu_openmp INTERFACE DLU_HAVE_OPENMP)
+  message(STATUS "OpenMP: ${OpenMP_CXX_FLAGS}")
+endif()
+
+# --- optional: oneTBB executor ---------------------------------------------
+if(DLU_WITH_TBB)
+  # oneAPI ships a TBBConfig.cmake, so find_package is the right entry point --
+  # but the layout has a trap: the `latest` symlink can point at a version that
+  # installed libraries WITHOUT headers (2022.3 here), while an older versioned
+  # directory beside it is complete (2022.0). Prefer a config whose include tree
+  # actually exists rather than whatever `latest` resolves to.
+  if(NOT DLU_TBB_DIR)
+    file(GLOB _dlu_tbb_candidates
+         "C:/Program Files (x86)/Intel/oneAPI/tbb/*/lib/cmake/tbb"
+         "C:/Program Files/Intel/oneAPI/tbb/*/lib/cmake/tbb"
+         "/opt/intel/oneapi/tbb/*/lib/cmake/tbb")
+    list(SORT _dlu_tbb_candidates)
+    list(REVERSE _dlu_tbb_candidates)  # newest first
+    foreach(_cand IN LISTS _dlu_tbb_candidates)
+      get_filename_component(_root "${_cand}/../../.." ABSOLUTE)
+      if(EXISTS "${_root}/include/oneapi/tbb.h")
+        set(DLU_TBB_DIR "${_cand}" CACHE PATH "Directory containing TBBConfig.cmake")
+        break()
+      endif()
+    endforeach()
+  endif()
+
+  if(DLU_TBB_DIR)
+    set(TBB_DIR "${DLU_TBB_DIR}" CACHE PATH "" FORCE)
+  endif()
+  find_package(TBB REQUIRED)
+  add_library(dlu_tbb INTERFACE)
+  target_link_libraries(dlu_tbb INTERFACE TBB::tbb)
+  target_compile_definitions(dlu_tbb INTERFACE DLU_HAVE_TBB)
+  message(STATUS "TBB: ${DLU_TBB_DIR}")
+
+  # tbb12.dll must be locatable at run time. Rather than make the developer
+  # remember that, hand CTest the directory in the test's PATH.
+  get_filename_component(_dlu_tbb_root "${DLU_TBB_DIR}/../../.." ABSOLUTE)
+  if(WIN32 AND EXISTS "${_dlu_tbb_root}/bin")
+    file(TO_NATIVE_PATH "${_dlu_tbb_root}/bin" DLU_TBB_BIN)
+  endif()
+endif()
+
 # add_dlu_test(<name> SOURCE <file> [ARGS ...] [LABELS ...] [LINK ...])
 #
 # Builds one test binary and registers it with CTest. Labels drive subsetting:
@@ -242,6 +288,23 @@ add_dlu_test(test_regression SOURCE test/test_regression.cpp
 # cache (test/matrices/fetch_suitesparse.py); with nothing downloaded the suite
 # reports how to get them and passes, so this is safe to register unconditionally.
 add_dlu_test(test_scalar_types SOURCE test/test_scalar_types.cpp LABELS "quick;correctness")
+
+# Executor backends. StdThreadExecutor is always covered; OpenMP and TBB join in
+# when their switches are on, in the same binary, so the three are held to one
+# shared contract instead of drifting apart in separate tests.
+set(DLU_EXECUTOR_LINK "")
+if(DLU_WITH_OPENMP)
+  list(APPEND DLU_EXECUTOR_LINK dlu_openmp)
+endif()
+if(DLU_WITH_TBB)
+  list(APPEND DLU_EXECUTOR_LINK dlu_tbb)
+endif()
+add_dlu_test(test_executors SOURCE test/test_executors.cpp
+             LABELS "quick;correctness;parallel" LINK ${DLU_EXECUTOR_LINK})
+if(DLU_TBB_BIN)
+  set_tests_properties(test_executors PROPERTIES
+                       ENVIRONMENT "PATH=${DLU_TBB_BIN};$ENV{PATH}")
+endif()
 add_dlu_test(test_edge_cases   SOURCE test/test_edge_cases.cpp   LABELS "quick;correctness")
 
 add_dlu_test(test_suitesparse SOURCE test/test_suitesparse.cpp

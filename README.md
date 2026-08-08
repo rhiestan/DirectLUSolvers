@@ -78,6 +78,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_scalar_types.cpp` | `float` and `std::complex<double>` coverage, including the `adjoint()`/`transpose()` distinction that only exists for complex. |
+| `test/test_executors.cpp` | One shared contract for every `Executor` backend — `StdThread`, `OpenMP`, `TBB` — checked against `SerialExecutor`. See [Testing the executor backends](#testing-the-executor-backends). |
 | `test/test_edge_cases.cpp` | Degenerate sizes (n = 0/1/2, diagonal-only, single dense supernode), the refactorize workflow, zero right-hand side, and a cross-solver differential. |
 | `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](#fill-regression-baselines). |
 | `test/test_suitesparse.cpp` | Correctness sweep over the curated SuiteSparse corpus, including matrices these solvers cannot handle. See [The SuiteSparse corpus](#the-suitesparse-corpus). |
@@ -418,7 +419,8 @@ solver.compute(A);
 
 All four executors give **numerically consistent** results for a fixed thread count (whether or
 not they're bit-identical to the serial factorization depends on `setIntraSupernodeParallelism`,
-see above) — pick whichever backend fits how the rest of your application is threaded.
+see above) — pick whichever backend fits how the rest of your application is threaded. This is
+checked rather than asserted; see [Testing the executor backends](#testing-the-executor-backends).
 
 ### `OpenMPExecutor`
 
@@ -767,6 +769,43 @@ guard placed *after* `project()` never fires and you silently get `-O0`. For
 this project that is a 50-100x timing error — enough to make every benchmark
 number meaningless. `cmake` prints the resolved type at configure time; check it
 before quoting a measurement.
+
+### Testing the executor backends
+
+`test_executors` holds all four backends to one shared contract, checked against
+`SerialExecutor`. `StdThreadExecutor` is always covered; the other two are
+opt-in, and when their switch is off that backend is reported as skipped rather
+than silently omitted:
+
+```sh
+cmake -S . -B build -G Ninja -DDLU_WITH_OPENMP=ON -DDLU_WITH_TBB=ON
+ctest --test-dir build -R test_executors --output-on-failure
+```
+
+All three multithreaded backends run in **one binary against the same checks**,
+deliberately — separate per-backend tests drift, and the property worth testing
+is agreement *between* them. Each must match `SerialExecutor` on fill, solution,
+residual and determinant; keep the parallel triangular solve bit-identical (a
+different dispatch path per backend, so the claim has to hold for all of them);
+drive `LeftRightLU`'s DAG scheduler, which asks something much stranger of an
+executor than a plain loop — one `parallelFor` whose body is an entire
+work-stealing scheduler; and survive repeated factorizations without deadlock or
+drift.
+
+**Discovery.** `DLU_WITH_TBB=ON` locates oneTBB automatically via its
+`TBBConfig.cmake`, but note a trap in the oneAPI layout: the `latest` symlink can
+point at a version that installed libraries **without headers** while a complete
+older version sits beside it. The search therefore prefers a config whose
+`include/oneapi/tbb.h` actually exists rather than trusting `latest`. Override
+with `-DDLU_TBB_DIR=<dir containing TBBConfig.cmake>`. CTest is also handed
+TBB's `bin` directory on `PATH`, so `tbb12.dll` resolves without any manual
+environment setup — running the binary directly still needs it on `PATH`.
+`DLU_WITH_OPENMP=ON` uses CMake's own `find_package(OpenMP)`.
+
+Verified on this project's setup: clang 22 with `-fopenmp=libomp`, and oneTBB
+2022.0. `TBBExecutor`'s documented reconfiguration (`solver.executor() =
+TBBExecutor(n)` re-capping concurrency across successive assignments) is checked
+explicitly, as is `OpenMPExecutor`'s thread-count override.
 
 ### Fill regression baselines
 
