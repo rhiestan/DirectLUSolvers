@@ -311,6 +311,14 @@ operation they describe has run at least once.
   ~1e-14 relative, from floating-point reassociation across chunk boundaries) — it is still
   fully deterministic for a given thread count, and the true residual is unaffected.
 
+- **`setParallelSolve(bool on)`** (default **on**) — dispatch `solve()`'s forward and
+  backward triangular sweeps across the `Executor`, over elimination-tree levels. Results are
+  **bit-identical** to the serial sweeps (the forward sweep switches to an equivalent gather
+  formulation that preserves each element's accumulation order — see
+  [Parallel triangular solve](#parallel-triangular-solve)). Systems below
+  `rows × nrhs = 200000` stay serial, because a per-level fork-join dispatch would cost more
+  than the substitution. No effect with `SerialExecutor`. Measured ~1.9x on `laoss_1`.
+
 ### Scaling
 
 - **`setEquilibration(bool on)`** (default **on**) — Ruiz row/column scaling
@@ -870,19 +878,20 @@ from 1 to 32 threads.
 | | factor, levels only | 2069 | 1394 | 1336 | 1.55x |
 | | factor, levels+intra | 2071 | 972 | 834 | **2.48x** |
 | | factor, LRLU DAG | 2150 | 1303 | 1223 | 1.76x |
-| | solve, 1 rhs | 71.3 | 71.4 | 71.5 | **1.00x** |
-| | solve, 8 rhs | 207 | 209 | 208 | **1.00x** |
+| | solve, 1 rhs | 72.7 | 41.5 | 38.3 | **1.90x** |
+| | solve, 8 rhs | 209 | 121 | 109 | **1.92x** |
 | `lap3d_30³` | factor, levels only | 600 | 544 | 533 | 1.13x |
 | | factor, levels+intra | 604 | 263 | 189 | **3.20x** |
 | | factor, LRLU DAG | 645 | 539 | 543 | 1.19x |
 
 Four things this says, none of them visible from a single-thread-count timing:
 
-1. **`solve()` does not parallelize at all** — 1.00x on every matrix, by
-   construction: `solveTriangular` walks the supernodes sequentially and never
-   touches the `Executor`. For the "many right-hand sides against one
-   factorization" use case this README advertises as the sweet spot, that is a
-   hard ceiling.
+1. **`solve()` now parallelizes** (~1.9x), but did not originally — it was
+   exactly 1.00x on every matrix because `solveTriangular` walked the supernodes
+   sequentially and never touched the `Executor`. See [Parallel triangular
+   solve](#parallel-triangular-solve). Even so it is only 3-7% of a
+   factor+solve here, so this matters most when you factor once and solve many
+   times.
 2. **`analyzePattern()` is serial and is often the *largest* remaining term.**
    At 32 threads it is 41% of a single factor+solve on `laoss_1`, 44% on
    `laoss_2`, and 57% on `lap2d_300²` — more than the factorization it feeds.
@@ -962,6 +971,47 @@ The practical consequences:
 Re-run it on your own hardware before reading anything into a speedup number;
 the ceiling is machine-specific and a dual-socket server with more memory
 channels will land somewhere quite different.
+
+#### Parallel triangular solve
+
+`solve()` originally ran entirely on the calling thread — measured at exactly
+1.00x from 1 to 32 threads, because the sweeps never touched the `Executor`.
+They now dispatch over elimination-tree levels (`setParallelSolve`, on by
+default).
+
+The two sweeps are not symmetric, which is the whole difficulty:
+
+- The **backward** sweep is already a *gather*: supernode `s` reads rows owned by
+  higher-numbered supernodes and writes only its own head. Levels visited from
+  the root down parallelize with no restructuring.
+- The **forward** sweep is a *scatter*: `s` pushes its solved head into its
+  ancestors' rows. Two supernodes in one level can own row blocks facing a
+  common ancestor, so running a level concurrently would race on the same rows
+  of `y`. The parallel path therefore uses the equivalent **gather** form —
+  each supernode pulls from its already-finished sources via the same
+  `m_updateSources` structure the factorization uses, and writes only its own
+  rows.
+
+Because sources are stored in ascending order, the gather applies them in the
+same order the scatter did, so **every element accumulates identically and the
+result is bit-identical to the serial sweep** — `test_parallel_lu` asserts
+exactly that (`maxDiff == 0.0`, not a tolerance), since a reformulation that
+quietly reassociated would still pass a tolerance check.
+
+| matrix | phase | 1t | 8t | 32t | speedup |
+|---|---|---:|---:|---:|---:|
+| `laoss_1` | solve, 1 rhs | 72.7 | 41.5 | 38.3 | **1.90x** |
+| | solve, 8 rhs | 209 | 121 | 109 | **1.92x** |
+
+Scaling stops near 16 threads: the elimination tree narrows towards the root, so
+the last levels hold one supernode and run inline. Below `rows × nrhs = 200000`
+the sweeps stay serial regardless — a fork-join dispatch costs tens of
+microseconds and a sweep issues one per level, so on a small system the
+dispatches would cost more than the substitution they parallelize.
+
+Note the honest scale: solve is only **3-7%** of a factor+solve on `laoss_1`, so
+this is worth ~2-4% end-to-end. It matters when you factor once and solve
+repeatedly, which is the case the solver is built for.
 
 #### Chunk sizing
 

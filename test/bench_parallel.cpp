@@ -126,8 +126,8 @@ MatrixResult sweep(const std::string& label, const SparseMatrix<double>& A, cons
   PhaseRow factorLevels{"SNLU factor, levels only", std::vector<double>(T, 0.0), true};
   PhaseRow factorIntra{"SNLU factor, levels+intra", std::vector<double>(T, 0.0), true};
   PhaseRow factorDag{"LRLU factor, DAG scheduler", std::vector<double>(T, 0.0), true};
-  PhaseRow solve1{"SNLU solve, 1 rhs", std::vector<double>(T, 0.0), false};
-  PhaseRow solveK{"SNLU solve, " + std::to_string(opt.rhs) + " rhs", std::vector<double>(T, 0.0), false};
+  PhaseRow solve1{"SNLU solve, 1 rhs", std::vector<double>(T, 0.0), true};
+  PhaseRow solveK{"SNLU solve, " + std::to_string(opt.rhs) + " rhs", std::vector<double>(T, 0.0), true};
 
   for (std::size_t ti = 0; ti < T; ++ti) {
     const int threads = opt.threads[ti];

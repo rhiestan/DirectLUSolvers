@@ -8,6 +8,7 @@
 // one (identical determinant, machine-precision residual), then times both on
 // the testdata matrices.
 
+#include <Eigen/Dense>
 #include <Eigen/SparseCore>
 
 #include <algorithm>
@@ -26,6 +27,7 @@
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
 using lu_testing::check;
+using lu_testing::checkTrue;
 using lu_testing::laplacian2d;
 using lu_testing::ms;
 using Clock = lu_testing::Clock;
@@ -38,6 +40,23 @@ namespace {
 
 SparseMatrix<double> loadSymmetrized(const std::string& path) {
   return lu_testing::ensureSymmetricPattern(lu_testing::loadMatrixMarket(path));
+}
+
+// NOTE the explicit MatrixXd: solver.solve(b) returns a lazy Eigen Solve<>
+// expression, so binding it to `auto` would time expression construction and
+// nothing else (it reported 0.0 ms). Assigning to a concrete matrix forces the
+// solve to actually run inside the timed region.
+template <typename Solver, typename Rhs>
+double bestSolveMs(Solver& solver, const Rhs& b, int reps) {
+  double best = 1e30;
+  for (int r = 0; r < reps; ++r) {
+    const auto t0 = Clock::now();
+    const Eigen::MatrixXd x = solver.solve(b);
+    const auto t1 = Clock::now();
+    if (!x.allFinite()) return -1.0;
+    best = std::min(best, ms(t0, t1));
+  }
+  return best;
 }
 
 template <typename Solver>
@@ -116,6 +135,57 @@ void runLaplacian(int g) {
               tSerial, tParallel, tParallel > 0 ? tSerial / tParallel : 0.0);
 }
 
+// The PARALLEL TRIANGULAR SOLVE (setParallelSolve, on by default).
+//
+// The forward sweep is a scatter in its serial form -- supernode s pushes into
+// its ancestors' rows -- which cannot run level-parallel, so the parallel path
+// uses an equivalent gather instead. The claim is that this leaves each element's
+// accumulation order untouched and is therefore BIT-IDENTICAL, not merely close;
+// this asserts exactly that, since a reformulation that quietly reassociated
+// would still pass a tolerance-based check.
+//
+// Note the work threshold: the sweeps stay serial below rows x nrhs = 200000, so
+// this deliberately uses a matrix and RHS count large enough to cross it. Without
+// that, the parallel path would never run and the test would prove nothing.
+void testParallelSolve() {
+  std::printf("== parallel triangular solve\n");
+  SparseMatrix<double> A = laplacian2d(300, 300);  // 90000 rows
+  const int n = static_cast<int>(A.rows());
+  const int nrhs = 4;  // 90000 * 4 = 360000 > threshold
+  Eigen::MatrixXd B(n, nrhs);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < nrhs; ++j) B(i, j) = 1.0 + 0.1 * ((i + j) % 7);
+
+  Parallel solver;
+  solver.setMaxIterativeRefinements(0);  // compare the raw triangular sweeps
+  solver.compute(A);
+  checkTrue(solver.info() == Eigen::Success, "parallel solve: factorization succeeds");
+
+  solver.setParallelSolve(false);
+  const Eigen::MatrixXd serialX = solver.solve(B);
+  const double tSerial = bestSolveMs(solver, B, 3);
+
+  solver.setParallelSolve(true);
+  const Eigen::MatrixXd parallelX = solver.solve(B);
+  const double tParallel = bestSolveMs(solver, B, 3);
+
+  const double maxDiff = (serialX - parallelX).cwiseAbs().maxCoeff();
+  check(maxDiff == 0.0, "parallel solve is BIT-IDENTICAL to serial", maxDiff);
+
+  const double resid = (A * parallelX - B).norm() / B.norm();
+  check(resid < 1e-8, "parallel solve residual", resid);
+
+  std::printf("        n=%d nrhs=%d threads=%d  serial=%.1f ms  parallel=%.1f ms  speedup=%.2fx\n",
+              n, nrhs, solver.executor().concurrency(), tSerial, tParallel,
+              tParallel > 0 ? tSerial / tParallel : 0.0);
+
+  // Below the work threshold the sweeps must stay serial, and still be correct.
+  Eigen::MatrixXd smallB = Eigen::MatrixXd::Ones(n, 1);
+  solver.setParallelSolve(true);
+  const Eigen::MatrixXd tiny = solver.solve(smallB);
+  checkTrue(tiny.allFinite(), "sub-threshold solve stays correct");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -135,6 +205,8 @@ int main(int argc, char** argv) {
   runLaplacian(100);
   runLaplacian(200);
   runLaplacian(300);
+
+  testParallelSolve();
 
   return lu_testing::summarize("SupernodalLU parallel");
 }

@@ -302,6 +302,19 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   void setIntraSupernodeParallelism(bool on) { m_intraParallel = on; }
   bool intraSupernodeParallelism() const { return m_intraParallel; }
 
+  /** Dispatch the forward/backward triangular sweeps of solve() across the
+   *  Executor (default on; no effect with SerialExecutor). Supernodes within one
+   *  elimination-tree level write disjoint rows, so they run concurrently; the
+   *  forward sweep switches to an equivalent gather formulation to make that
+   *  true (see applyInverseL). Results are unchanged either way -- each element
+   *  accumulates its updates in the same order as the serial sweep.
+   *
+   *  Small systems stay serial regardless: a fork-join dispatch costs tens of
+   *  microseconds and a sweep issues one per level, so below a work threshold
+   *  the dispatches would cost more than the substitution. */
+  void setParallelSolve(bool on) { m_parallelSolve = on; }
+  bool parallelSolve() const { return m_parallelSolve; }
+
   /** Row/column equilibration (Ruiz). When on (default), factorize() scales the
    *  matrix to A~ = Dr*A*Dc so rows/columns have comparable magnitude, which
    *  improves conditioning, reduces bumped static pivots, and improves backward
@@ -528,6 +541,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_maxBlockSize = 128;  // split wide supernodes (cf. PaStiX MAX_BLOCKSIZE ~120)
     m_maxFactorNonzeros = 0;  // fail-fast fill guard off by default
     m_intraParallel = true;
+    m_parallelSolve = true;
     m_equilibrate = true;
     m_useMatching = true;
     m_diagonalPivoting = true;
@@ -717,6 +731,21 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   template <typename Dest>
   void applyInverseU(Dest& y) const;
 
+  // One supernode's share of the forward / backward sweep. Both write only
+  // inside the supernode's own rows, so supernodes within one elimination-tree
+  // level can run concurrently.
+  template <typename Dest>
+  void forwardSolveSupernode(StorageIndex t, Dest& y) const;
+  template <typename Dest>
+  void backwardSolveSupernode(StorageIndex s, Dest& y) const;
+
+  // Whether to dispatch the triangular sweeps across the executor.
+  bool solveInParallel(Index nrhs) const;
+
+  // Below this much solve work (rows x right-hand sides) the per-level fork-join
+  // dispatches cost more than the substitution they parallelize.
+  static constexpr Index kMinParallelSolveWork = 200000;
+
   // transposed in-place triangular solves (internal numbering): L^T/L^H y = y
   // and U^T/U^H y = y, for the transpose()/adjoint() solve.
   template <bool Conjugate, typename Dest>
@@ -822,6 +851,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   Index m_maxBlockSize;               // splitting: cap supernode width (0 = unlimited)
   Index m_maxFactorNonzeros;          // fail-fast fill guard (0 = off)
   bool m_intraParallel;               // parallelize inside supernodes on narrow levels
+  bool m_parallelSolve;               // dispatch the triangular sweeps over the executor
   bool m_equilibrate;                 // apply Ruiz row/column scaling
   bool m_useMatching;                 // apply MC64-style maximum-transversal matching
   bool m_diagonalPivoting;            // restricted (in-block) partial pivoting
@@ -1887,12 +1917,103 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixB
   x = solution;
 }
 
+// One supernode's share of the forward sweep, in GATHER form: pull every
+// already-finished source's contribution into this supernode's own rows, then
+// permute and solve its diagonal block. Writes only inside [firstColumn, +w).
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename Dest>
+void SupernodalLU<MatrixType, OrderingType, Executor>::forwardSolveSupernode(StorageIndex t,
+                                                                             Dest& y) const {
+  const Supernode& tn = m_supernodes[t];
+  const StorageIndex w = tn.width();
+
+  // Gather: for each source that has row blocks facing t, subtract its panel
+  // times its (already solved) head. Sources are stored in ascending id order,
+  // which is the order the scatter form applied them, so each element's
+  // accumulation order -- and therefore the result -- is unchanged.
+  for (const UpdateSource& u : m_updateSources[t]) {
+    const Supernode& src = m_supernodes[u.sourceSupernode];
+    const ConstStridedPanel lower = lowerPanel(u.sourceSupernode);
+    const auto srcHead = y.middleRows(src.firstColumn, src.width());
+    const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
+    for (StorageIndex b = u.facingRowBlock; b < lastBlock; ++b) {
+      const RowBlock& block = m_rowBlocks[b];
+      if (block.facingSupernode != t) break;  // blocks facing t are consecutive
+      const StorageIndex hb = block.height();
+      y.middleRows(block.firstRow, hb).noalias() -=
+          lower.middleRows(block.panelOffset, hb) * srcHead;
+    }
+  }
+
+  auto head = y.middleRows(tn.firstColumn, w);
+  // apply the in-block pivot permutation: head := P_s head (newhead[k]=head[piv[k]]).
+  const std::vector<StorageIndex>& piv = m_diagPivot[t];
+  if (!piv.empty()) {
+    DenseMatrix tmp = head;
+    for (StorageIndex k = 0; k < w; ++k) head.row(k) = tmp.row(piv[k]);
+  }
+  diagBlock(t).template triangularView<UnitLower>().solveInPlace(head);
+}
+
+// One supernode's share of the backward sweep. Already a gather in the original
+// formulation: reads rows owned by higher-numbered supernodes, writes only its
+// own head.
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename Dest>
+void SupernodalLU<MatrixType, OrderingType, Executor>::backwardSolveSupernode(StorageIndex s,
+                                                                              Dest& y) const {
+  const Supernode& sn = m_supernodes[s];
+  auto head = y.middleRows(sn.firstColumn, sn.width());
+  const ConstContiguousPanel upper = upperPanel(s);
+  for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
+    const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
+    const StorageIndex hb = block.height();
+    head.noalias() -= upper.middleCols(block.panelOffset, hb) * y.middleRows(block.firstRow, hb);
+  }
+  diagBlock(s).template triangularView<Upper>().solveInPlace(head);
+}
+
+// Should the triangular sweeps be dispatched across the executor at all? A
+// fork-join dispatch costs tens of microseconds at high thread counts (see
+// bench_ceiling), and a sweep issues one per level, so on a small system the
+// dispatches alone can outweigh the substitution. Require enough total work --
+// rows times right-hand sides -- before paying for them.
+template <typename MatrixType, typename OrderingType, typename Executor>
+bool SupernodalLU<MatrixType, OrderingType, Executor>::solveInParallel(Index nrhs) const {
+  if (!m_parallelSolve || m_levelGroups.empty()) return false;
+  if (m_executor.concurrency() <= 1) return false;
+  return Index(m_size) * nrhs >= kMinParallelSolveWork;
+}
+
 // Forward substitution L y = y (unit-lower), in place, on an internal-numbered
 // right-hand side. Shared by the full solve and matrixL().solveInPlace().
+//
+// The serial path SCATTERS: supernode s pushes its solved head into the rows of
+// its ancestors. That cannot be run level-parallel, because two supernodes in
+// one level may both own row blocks facing a common ancestor and would race on
+// the same rows of y. The parallel path therefore uses the equivalent GATHER
+// form (see forwardSolveSupernode), where each supernode pulls from its already
+// finished sources and writes only its own rows -- conflict-free within a level,
+// and applying sources in the same order, so the result is unchanged.
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
+
+  if (solveInParallel(y.cols())) {
+    for (const std::vector<StorageIndex>& group : m_levelGroups) {
+      const Index groupSize = static_cast<Index>(group.size());
+      if (groupSize == 1) {
+        forwardSolveSupernode(group[0], y);  // no dispatch for a single node
+        continue;
+      }
+      m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
+        forwardSolveSupernode(group[static_cast<std::size_t>(k)], y);
+      });
+    }
+    return;
+  }
+
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
@@ -1915,21 +2036,31 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) co
 
 // Backward substitution U y = y (upper), in place, on an internal-numbered
 // right-hand side. Shared by the full solve and matrixU().solveInPlace().
+//
+// This sweep is already a gather, so levels parallelize with no restructuring;
+// they are simply visited from the root downwards.
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::applyInverseU(Dest& y) const {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-  for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
-    const Supernode& sn = m_supernodes[s];
-    const StorageIndex w = sn.width();
-    auto head = y.middleRows(sn.firstColumn, w);
-    const ConstContiguousPanel upper = upperPanel(s);
-    for (StorageIndex b2 = 0; b2 < sn.rowBlockCount; ++b2) {
-      const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b2];
-      const StorageIndex hb = block.height();
-      head.noalias() -= upper.middleCols(block.panelOffset, hb) * y.middleRows(block.firstRow, hb);
+
+  if (solveInParallel(y.cols())) {
+    for (std::size_t lv = m_levelGroups.size(); lv-- > 0;) {
+      const std::vector<StorageIndex>& group = m_levelGroups[lv];
+      const Index groupSize = static_cast<Index>(group.size());
+      if (groupSize == 1) {
+        backwardSolveSupernode(group[0], y);
+        continue;
+      }
+      m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
+        backwardSolveSupernode(group[static_cast<std::size_t>(k)], y);
+      });
     }
-    diagBlock(s).template triangularView<Upper>().solveInPlace(head);
+    return;
+  }
+
+  for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
+    backwardSolveSupernode(s, y);
     if (s == 0) break;  // guard against unsigned underflow
   }
 }
