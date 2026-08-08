@@ -238,6 +238,28 @@ operation they describe has run at least once.
   internally, as this solver requires.
   `matchingIsPerfect() -> bool` reports whether the last matching found a fully zero-free
   diagonal (`false` indicates the matrix is structurally singular).
+
+  > **Matching is not always an improvement — try turning it off if a solve fails.**
+  > Measured over the [SuiteSparse corpus](#the-suitesparse-corpus): of 8 matrices whose
+  > solve failed, **4 are fixed outright by `setMatching(false)`** (`Chebyshev3`
+  > 6e+94 → 7e-17, `CAG_mat1916` 4e+23 → 5e-16, `cavity10` 4.6e-04 → 3.6e-16,
+  > `nnc1374` 5.4e-01 → 4.2e-10) — and `Eigen::SparseLU` solves all four, so the
+  > matrices are not at fault. Matching remains *essential* on others
+  > (`meg1` 5.9e-16 with, 1e+300 without; `gemat12` 1.6e-16 with, 7e+76 without),
+  > which is why it stays on by default.
+  >
+  > The cause is that this is a maximum *transversal* that prefers large entries,
+  > not a true maximum-weight (MC64) assignment — the header says so. The
+  > augmenting-path phase optimizes only for completing the transversal, so it can
+  > displace good diagonal entries, and nothing checks the result against the
+  > un-permuted diagonal. On `Chebyshev3` it takes a diagonal where 4096 of 4101
+  > entries are within 1e-3 of their column maximum down to 181.
+  >
+  > There is no cheap a-priori test for which case you are in: diagonal-quality
+  > scores predict only `Chebyshev3`, and fill does not correlate either
+  > (`cavity10` gets *less* fill with matching and a worse answer). The reliable
+  > move is empirical — if `info()` reports a bad solve, refactor with
+  > `setMatching(false)` and compare.
 - **`setDiagonalPivoting(bool on)`** (default **on**) — factors each supernode's dense diagonal
   block with partial pivoting *confined to that block* (row swaps never leave the
   already-allocated dense panel, so the global symbolic structure — and therefore BLAS-3 shape
@@ -796,6 +818,26 @@ returned a bad answer the solver flagged itself**, 0 tripped the fill guard.
 No unflagged wrong answers — the honesty machinery
 (`solveFailureThreshold`, the post-solve residual check) is now tested against
 matrices that genuinely defeat the solvers, which nothing previously did.
+
+**Why the 8 failures fail.** Diagnosed by comparing against `Eigen::SparseLU`
+(real partial pivoting) on the same systems, then sweeping the solver options:
+
+| matrix | psym | SparseLU | diagnosis |
+|---|---:|---|---|
+| `Chebyshev3` | 0.50 | solves 4e-20 | **matching**; `setMatching(false)` → 7e-17 |
+| `CAG_mat1916` | 0.30 | solves 1e-15 | **matching**; → 5e-16 |
+| `cavity10` | 0.94 | solves 2e-15 | **matching**; → 3.6e-16 |
+| `nnc1374` | 0.82 | solves 7e-16 | **matching**; → 4.2e-10 |
+| `lhr10c` | 0.01 | solves 5e-16 | **block size**; `setMaxBlockSize(0)` → 2.4e-16 |
+| `shyy41` | 0.72 | **fails** 1e-06 | the matrix |
+| `rw5151` | 0.49 | **fails** 7e-02 | the matrix |
+| `foldoc` | 0.48 | **fails** inf | structurally singular |
+
+So **5 of 8 are ours, not the matrix**, and a single setting recovers each. See
+the [`setMatching`](#matching--diagonal-pivoting-robustness) note for the
+mechanism and for why there is no cheap way to pick the right setting up front.
+`lhr10c` is the one case where the 128-column `setMaxBlockSize` cap is the
+binding constraint: widening it gives in-block pivoting enough candidate rows.
 
 **A finding worth knowing: pattern symmetry does not predict success.** The
 intuition that `psym == 1.00` is safe and `psym < 0.5` is doomed is wrong in
