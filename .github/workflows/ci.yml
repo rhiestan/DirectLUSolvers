@@ -13,6 +13,16 @@
 # fetches it and runs the real-matrix correctness sweep. That gives coverage on
 # genuine matrices without needing the developer's private testdata/.
 #
+# VERIFICATION STATUS. The Windows leg was reproduced locally before this file
+# was committed -- MSVC 19.44 via both Ninja and the Visual Studio generator,
+# with DLU_EIGEN_DIR set and testdata/ absent, i.e. the exact configure/build/
+# test sequence below. All 8 quick tests pass, and the full 15-test suite also
+# passes under MSVC where testdata is available. Notably the fill baselines hold
+# byte-for-byte across clang 22 and MSVC 19.44, so they are compiler-portable at
+# least across those two. The LINUX legs remain unverified: this project has
+# never been built with gcc, though nothing in src/ or test/ uses a
+# Windows-specific header or API.
+#
 # EIGEN IS PINNED TO AN EXACT COMMIT, deliberately. The fill baselines in
 # test/baselines/ record nnzL+nnzU per matrix, and fill depends on the
 # fill-reducing ordering, which comes from Eigen's AMD implementation. A
