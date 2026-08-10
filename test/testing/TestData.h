@@ -71,6 +71,15 @@ inline const std::vector<BenchmarkMatrix>& benchmarkMatrices() {
       // that chain into 9 dense blocks (43x fill), while METIS keeps it sparse
       // (2.7x). See the amalgamation note in README.md.
       {"setfos", "setfos/spmatrix.mtx", Tier::Small, "near-tridiagonal; chain elimination tree"},
+      // setfos's opposite, and the corpus's stress case for a symmetric-pattern
+      // solver: 7.8% dense, and only 44% of entries have their transpose, so
+      // symmetrizing adds 56% more nonzeros before factorization even starts.
+      // Dense columns (median 258 nnz) over sparse rows (median 9). Solves
+      // accurately either way, but the ORDERING decides whether the symmetric
+      // pattern costs anything: AMD gives 3.93M fill (2x Eigen::SparseLU's
+      // 1.94M), METIS 1.63M (below it). The one matrix here that shows that gap
+      // is an ordering choice, not an inherent cost of forcing symmetry.
+      {"setfos_2", "setfos_2/spmatrix.mtx", Tier::Small, "dense-ish, strongly pattern-unsymmetric"},
       {"sherman1", "sherman1/sherman1.mtx", Tier::Small, "oil reservoir simulation"},
       {"tomography", "tomography/tomography.mtx", Tier::Small, "well-conditioned"},
       {"YaleB_10NN", "YaleB_10NN/YaleB_10NN.mtx", Tier::Small, "10-nearest-neighbour graph"},
