@@ -829,8 +829,13 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::computeSupernodePartition(
       bool start;
       if (parent[j - 1] != j) {
         start = true;  // mandatory structural boundary
-      } else if (children[j].size() == 1) {
-        start = false;  // fundamental supernode: no extra fill
+      } else if (children[j].size() == 1 && rowsBeyond(structJ, j) == rowsBeyond(structPrev, j)) {
+        // Fundamental continuation: one child AND the same off-diagonal row set,
+        // so the merge is free. The structure half matters on chain elimination
+        // trees (banded matrices), where the etree conditions alone hold at every
+        // column and would collapse the whole matrix into one dense supernode.
+        // See the fuller note in SupernodalLU.h's computeSupernodePartition.
+        start = false;
       } else {
         const StorageIndex childWidth = j - currentStart;
         const StorageIndex existingRows = rowsBeyond(structPrev, j);

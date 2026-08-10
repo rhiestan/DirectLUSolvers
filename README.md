@@ -313,6 +313,18 @@ operation they describe has run at least once.
   accepted when the supernode being closed is narrower than `relaxedSize` columns, **or** the
   merge adds at most `maxZeroRows` extra zero rows per column. `(1, 0)` recovers the pure
   fundamental-supernode partition (no amalgamation).
+
+  > **Banded matrices are the case to watch.** Neither rule carries a *cumulative* budget:
+  > each merge is judged on its own, so on a **chain elimination tree** — what AMD produces
+  > for a banded matrix, tridiagonal being the extreme — every step adds exactly one zero
+  > row, always passes `maxZeroRows`, and the chain amalgamates until `setMaxBlockSize`
+  > stops it. On `testdata/setfos` (1015 rows, bandwidth 2) the defaults give 9 supernodes
+  > and a 131422-scalar factor, against 4060 for `Eigen::SparseLU`. Two things fix it, both
+  > measured on that matrix: `setAmalgamation(1, 0)` → 4074 scalars (and 1.8x faster), or
+  > `setAmalgamation(4, 0)` → 7108 and faster still; alternatively `MetisOrdering`, whose
+  > nested dissection does not produce a chain tree in the first place, → 8130 with the
+  > defaults untouched. If your matrix is banded or otherwise chain-structured, set
+  > `maxZeroRows` to `0` or order it with METIS.
 - **`setAmalgamationFillFraction(double fraction)`** (default `0.3`) — an additional *relative*
   merge rule: also accept a merge when the extra zero rows it introduces are at most `fraction`
   of the rows the supernode already carries. Matters mainly for dense-ish factorizations (a wide
@@ -745,7 +757,7 @@ solver.compute(A);
   at the cost of extra `analyzePattern()` time on small matrices.
   For **large, well-separated 3D FEM systems, use `MetisOrdering`** (nested dissection) — on this
   project's `laoss_1` benchmark (251k rows, 3.5M nnz, 3D FEM), METIS ordering gives **~11.9x
-  fill** (41.8M scalars, ~330 MB), matching MKL PARDISO's ~12x/~0.5GB and beating
+  fill** (41.7M scalars, ~330 MB), matching MKL PARDISO's ~12x/~0.5GB and beating
   `Eigen::SparseLU`'s ~24.2x/85.1M-scalar/~680MB factor by roughly 2x. Even the *default* AMD
   ordering alone already beats SparseLU on fill here (~16.5x, 57.8M scalars) and is **faster in
   absolute wall-clock time**: factor+solve 3.0s vs SparseLU's 10.1s (3.4x faster) vs PARDISO's

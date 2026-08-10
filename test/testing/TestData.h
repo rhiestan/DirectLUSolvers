@@ -65,10 +65,12 @@ inline const std::vector<BenchmarkMatrix>& benchmarkMatrices() {
       {"dendrimer", "dendrimer/dendrimer.mtx", Tier::Small, "symmetric, well behaved"},
       {"gemat11", "gemat11/gemat11.mtx", Tier::Small, "unsymmetric power-network matrix"},
       {"rdb2048_noL", "rdb2048_noL/rdb2048_noL.mtx", Tier::Small, "unsymmetric, reaction-diffusion"},
-      // NOTE: this file is only 2x2 with 4 nonzeros -- it has been in the
-      // benchmark list since the start but exercises essentially nothing.
-      // Probably a truncated or placeholder export; worth replacing.
-      {"setfos", "setfos/spmatrix.mtx", Tier::Small, "2x2 (!) -- degenerate, see comment"},
+      // Near-tridiagonal: bandwidth 2, ~3 nonzeros per row, full diagonal, and
+      // only 10 of 3049 entries lack their transpose. The one matrix here with a
+      // CHAIN elimination tree, which is why it is worth keeping: AMD amalgamates
+      // that chain into 9 dense blocks (43x fill), while METIS keeps it sparse
+      // (2.7x). See the amalgamation note in README.md.
+      {"setfos", "setfos/spmatrix.mtx", Tier::Small, "near-tridiagonal; chain elimination tree"},
       {"sherman1", "sherman1/sherman1.mtx", Tier::Small, "oil reservoir simulation"},
       {"tomography", "tomography/tomography.mtx", Tier::Small, "well-conditioned"},
       {"YaleB_10NN", "YaleB_10NN/YaleB_10NN.mtx", Tier::Small, "10-nearest-neighbour graph"},

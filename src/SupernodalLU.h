@@ -1060,19 +1060,28 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodePartition
     columnStructure[j].push_back(j);  // diagonal, smaller than everything above (all > j)
     columnStructure[j].insert(columnStructure[j].end(), scratch.begin(), scratch.end());
 
-    // --- supernode-boundary decision (same rules as before). A boundary at
-    //     column j is MANDATORY when parent[j-1]!=j (j does not continue the
-    //     elimination-tree path of j-1); merging across it would violate the
-    //     "last column has the largest structure" invariant. When the path
-    //     does continue, a fundamental boundary (childCount[j]!=1, a branch
-    //     point) may be AMALGAMATED into the running supernode. ---
+    // --- supernode-boundary decision. A boundary at column j is MANDATORY when
+    //     parent[j-1]!=j (j does not continue the elimination-tree path of j-1);
+    //     merging across it would violate the "last column has the largest
+    //     structure" invariant. When the path does continue, j joins the running
+    //     supernode for FREE only if it is a genuine fundamental continuation:
+    //     one child AND the same off-diagonal row set as j-1 (deltaRows == 0).
+    //     Otherwise the merge costs explicit zeros and has to be AMALGAMATED,
+    //     i.e. justified by the cost rules below.
+    //
+    //     The structure half of that test is load-bearing, not a formality: on a
+    //     CHAIN elimination tree (banded matrices -- tridiagonal is the extreme)
+    //     every column has exactly one child and continues its parent's path, so
+    //     the etree conditions alone hold everywhere and would merge the entire
+    //     matrix into one dense supernode. Each column there adds one new row, so
+    //     deltaRows == 1 and the merge correctly falls through to the cost rules.
     if (j > 0) {
       const std::vector<StorageIndex>& structPrev = columnStructure[j - 1];
       const std::vector<StorageIndex>& structJ = columnStructure[j];
       bool start;
       if (parent[j - 1] != j) {
         start = true;  // mandatory structural boundary
-      } else if (children[j].size() == 1) {
+      } else if (children[j].size() == 1 && rowsBeyond(structJ, j) == rowsBeyond(structPrev, j)) {
         start = false;  // fundamental supernode: no extra fill
       } else {
         // path-continuation branch point: amalgamate if cheap enough.
