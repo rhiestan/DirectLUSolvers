@@ -6,13 +6,13 @@
 //
 // WHY THIS EXISTS
 //
-// The existing suites gate on the residual, and compare_testdata gates on
+// The other suites gate on the residual, and compare_testdata gates on
 // resid < 1e-6. That catches a solver returning a wrong answer -- but it does
-// NOT catch the failure mode this project has actually suffered: a change that
-// leaves every residual at machine precision while inflating FILL by orders of
-// magnitude. The ordering-direction bug (fixed 2026-07) applied the fill-reducing
-// permutation backwards; residuals stayed perfect and the only symptom was a
-// 250-350x larger factor on 3D matrices. Nothing in the test suite noticed.
+// NOT catch the failure mode that matters most here: a change that leaves every
+// residual at machine precision while inflating FILL by orders of magnitude.
+// Applying the fill-reducing permutation in the wrong direction, for instance,
+// keeps residuals perfect and shows up only as a 250-350x larger factor on 3D
+// matrices; no residual-based check can see it.
 //
 // So this suite pins nnzL + nnzU per (matrix, solver) against a checked-in
 // baseline. Fill is a deterministic function of the pattern and the ordering, so
@@ -230,8 +230,8 @@ void writeBaseline(const std::string& path, const std::vector<Record>& records) 
       << "# Fill (nnzL+nnzU) is the load-bearing column: it is a deterministic function of\n"
       << "# the sparsity pattern and the fill-reducing ordering, so a change here is a real\n"
       << "# structural change in the solver, not numerical noise. A large jump is exactly\n"
-      << "# the signature of the 2026-07 ordering-direction bug, which left every residual\n"
-      << "# at machine precision while inflating 3D factors 250-350x.\n"
+      << "# the signature of an ordering-direction mistake, which leaves every residual at\n"
+      << "# machine precision while inflating 3D factors 250-350x.\n"
       << "#\n"
       << "# nnzL = nnzU = -1 means the solver declined the matrix (info() != Success);\n"
       << "# that is a pinned behaviour too -- a solver that suddenly accepts it has changed.\n"

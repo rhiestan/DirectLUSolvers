@@ -120,7 +120,7 @@ inline MatrixMarketHeader parseBanner(const std::string& bannerLine, const std::
   }
   if (tok.size() > 4) {
     // Exact token comparison, NOT substring: "skew-symmetric" must not be read
-    // as "symmetric" (that was the old bug -- it mirrored with the wrong sign).
+    // as "symmetric", which would mirror it with the wrong sign.
     if (tok[4] == "general") h.symmetry = MMSymmetry::General;
     else if (tok[4] == "symmetric") h.symmetry = MMSymmetry::Symmetric;
     else if (tok[4] == "skew-symmetric" || tok[4] == "skew") h.symmetry = MMSymmetry::SkewSymmetric;

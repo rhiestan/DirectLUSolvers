@@ -6,8 +6,8 @@
 # Fill (nnzL+nnzU) is the load-bearing column: it is a deterministic function of
 # the sparsity pattern and the fill-reducing ordering, so a change here is a real
 # structural change in the solver, not numerical noise. A large jump is exactly
-# the signature of the 2026-07 ordering-direction bug, which left every residual
-# at machine precision while inflating 3D factors 250-350x.
+# the signature of an ordering-direction mistake, which leaves every residual at
+# machine precision while inflating 3D factors 250-350x.
 #
 # nnzL = nnzU = -1 means the solver declined the matrix (info() != Success);
 # that is a pinned behaviour too -- a solver that suddenly accepts it has changed.

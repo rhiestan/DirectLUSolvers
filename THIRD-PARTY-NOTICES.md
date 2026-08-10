@@ -12,8 +12,7 @@ draws throughout is between:
   licensing matter.
 
 **No third-party source code is incorporated in this project.** Everything under
-`src/` is original code written for it. The single case of code derivation that
-previously existed is documented under [Removed](#removed) below.
+`src/` is original code written for it.
 
 ---
 
@@ -31,8 +30,7 @@ previously existed is documented under [Removed](#removed) below.
 ## Algorithmic lineage
 
 These are designs and published algorithms that shaped the implementation. Each
-was reimplemented from its description; no source was consulted line-by-line
-except where noted under [Removed](#removed).
+was reimplemented from its description; no source was consulted line-by-line.
 
 **PaStiX** — <https://gitlab.inria.fr/solverstack/pastix>, license **CeCILL v2**.
 The overall design of `SupernodalLU` follows PaStiX's approach, as documented in
@@ -40,16 +38,12 @@ The overall design of `SupernodalLU` follows PaStiX's approach, as documented in
 symbolic block structure, static pivoting with iterative refinement in place of
 partial pivoting, BLAS-3 supernodal kernels, elimination-tree level scheduling,
 contiguous per-supernode factor storage (PaStiX calls these `coeftab`/`ucoeftab`),
-and capping supernode width (`MAX_BLOCKSIZE`). One further item — the traversal
-that walks maximal runs of contiguous off-diagonal rows in
-`SupernodalLU::cblkFactorTime` — was structurally derived from PaStiX's
-`cblk_time_fact`; that function has since been removed entirely (see below).
+and capping supernode width (`MAX_BLOCKSIZE`).
 
 > **CeCILL v2 is a copyleft license and is not compatible with redistributing
 > derived work under MPL-2.0.** This is why the project holds itself to
 > reimplementation from published descriptions rather than translation of PaStiX
-> source, and why the one function that crossed that line was removed rather than
-> kept.
+> source.
 
 **PARDISO** — the design of `LeftRightLU`, as documented in
 `pardiso_algorithms.md`: left-right-looking numeric factorization driven by a
@@ -72,33 +66,3 @@ row/column equilibration; Liu's elimination-tree and symbolic-factorization
 algorithms; supernode amalgamation; Chase–Lev-style work-stealing deques;
 BiCGStab; and the shortest-augmenting-path / Hungarian family of linear
 assignment methods.
-
-## Removed
-
-`SupernodalLU::cblkFactorTime` and its `setAmalgamationCostModel()` option were
-removed on 2026-08-08.
-
-The function was a structural translation of PaStiX's `cblk_time_fact`
-(`kass/amalgamate.c`) — same algorithm, same variable names (`L`, `G`, `H`), same
-loop shape — and its coefficients were copied verbatim from PaStiX's
-`perf/perf.h`. Every floating-point constant in this project's `src/` came from
-that file; there were no others. Since PaStiX is CeCILL v2 and this project is
-MPL-2.0, that was a genuine license incompatibility rather than merely an
-attribution gap.
-
-It was first re-derived honestly: `test/calibrate_cost_model.cpp` measured the
-kernels this solver actually issues (LU of the diagonal block, panel TRSM, Schur
-GEMM) on the host machine and least-squares fitted the same functional forms,
-replacing the borrowed numbers with measured ones. The borrowed constants were
-in any case wrong here — `perf.h` is labelled `PERF_MODEL "AMD 6180 MKL"`, an
-Opteron with a decade-old MKL, and was fitted to a Cholesky factorization while
-these solvers do LU.
-
-With correct constants the model was then measured across roughly 30 matrices
-(`testdata/` plus the SuiteSparse corpus) and **still did not help**: factor time
-moved within noise on the matrices that matter (`laoss_1` −2% to −1%), while
-being repeatably slower on others (`tomography` +9–10%, `gemat11` +4%). No matrix
-showed a reproducible win. Rather than keep a feature that earns nothing and
-carries a licensing question, both it and its calibration tool were deleted. The
-absolute/fractional fill heuristics it could substitute for remain the default
-and are unchanged.

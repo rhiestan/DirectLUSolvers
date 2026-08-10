@@ -241,7 +241,7 @@ void testComplexDeterminant() {
 }
 
 // determinant() overflowing on a moderately sized system is not hypothetical --
-// it is what broke the first version of the test above. Pin the documented
+// it is easy to trip over in a test like the one above. Pin the documented
 // remedy: logAbsDeterminant() must stay finite exactly where determinant() does
 // not.
 void testDeterminantOverflow() {

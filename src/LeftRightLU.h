@@ -20,10 +20,11 @@
 //      readiness to its consumers (right-looking): it decrements each consumer's
 //      counter and enqueues any that reach zero. No worker ever blocks on a
 //      dependency -- it always takes the next ready node -- so the big root
-//      separators no longer serialize a whole tree level. A LIFO ready-stack
-//      gives depth-first subtree affinity (PARDISO's cooperative subtree
-//      ownership, minus the NUMA placement, which is out of scope). This is the
-//      "two-level dynamic scheduler" idea reduced to what shared memory needs.
+//      separators never serialize a whole tree level. Per-worker LIFO deques
+//      with work stealing give depth-first subtree affinity (PARDISO's
+//      cooperative subtree ownership, minus the NUMA placement, which is out of
+//      scope). This is the "two-level dynamic scheduler" idea reduced to what
+//      shared memory needs.
 //   2. IN-BLOCK COMPLETE PIVOTING (PARDISO DGETC2, unsymmetric MTYPE=11/13):
 //      the dense diagonal block of each supernode is factored with BOTH row and
 //      column interchanges confined to that block, giving per-supernode row (P_s)
@@ -997,7 +998,8 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
     // directly. Getting this backwards eliminates the top separators FIRST and
     // inflates fill enormously on strongly directional matrices (e.g. 3D FEM:
     // 250-300x more fill), while being nearly invisible on near-symmetric
-    // orderings -- which is exactly why the bug hid until the laoss matrices.
+    // orderings and leaving the residual at machine precision either way --
+    // so it is a mistake that hides from every check except fill.
     for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
   }
 
@@ -1393,25 +1395,25 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     // Parallel dynamic DAG scheduler with PER-WORKER DEQUES AND WORK STEALING.
     // remaining[s] = number of unfinished update sources of s.
     //
-    // The previous implementation kept one global mutex-guarded ready stack and
-    // called notify_all() after every completed supernode. That serialized every
-    // task acquisition and every push behind a single lock, and woke all P
-    // workers per supernode when at most a couple could make progress. Measured
-    // on 32 threads it stopped scaling around 8 and then went BACKWARDS
-    // (lap2d_300^2 56.3ms at 16 threads -> 72.6ms at 32; lap3d_30^3 542 -> 634),
-    // which is the classic shape of ready-queue contention rather than of a
-    // parallelism shortage. It also defeated the depth-first subtree affinity
-    // the LIFO was there to provide: a worker pushed its freshly-readied
-    // children onto the shared stack where any other worker took them
-    // immediately, so a subtree's data never stayed on one core.
+    // Each worker owns a deque and pushes the consumers IT readied onto its own
+    // back, popping from its own back as well: depth-first, and the node it just
+    // produced (whose data is hot in this core's cache) is the node it takes
+    // next. Only when its own deque runs dry does it steal, and it steals from
+    // the FRONT of a victim -- the oldest entry, furthest from the victim's hot
+    // end, so stealing rarely collides with the owner and tends to move a whole
+    // coarse subtree rather than one leaf.
     //
-    // Each worker now owns a deque and pushes the consumers IT readied onto its
-    // own back, popping from its own back as well: depth-first, and the node it
-    // just produced (whose data is hot in this core's cache) is the node it
-    // takes next. Only when its own deque runs dry does it steal, and it steals
-    // from the FRONT of a victim -- the oldest entry, furthest from the victim's
-    // hot end, so stealing rarely collides with the owner and tends to move a
-    // whole coarse subtree rather than one leaf.
+    // The simpler alternative -- one global mutex-guarded ready stack with a
+    // notify_all() after every completed supernode -- serializes every task
+    // acquisition and every push behind a single lock, and wakes all P workers
+    // per supernode when at most a couple can make progress. Measured, it stops
+    // scaling around 8 threads and then goes BACKWARDS (lap2d_300^2 56.3ms at 16
+    // threads -> 72.6ms at 32; lap3d_30^3 542 -> 634): the classic shape of
+    // ready-queue contention rather than of a parallelism shortage. It also
+    // defeats the depth-first subtree affinity the LIFO is there to provide, as
+    // a worker's freshly-readied children land on the shared stack where any
+    // other worker takes them immediately, so a subtree's data never stays on
+    // one core.
     std::vector<std::atomic<int>> remaining(static_cast<std::size_t>(supernodeNbr));
     for (StorageIndex s = 0; s < supernodeNbr; ++s)
       remaining[s].store(static_cast<int>(m_updateSources[s].size()), std::memory_order_relaxed);

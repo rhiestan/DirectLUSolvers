@@ -1,9 +1,8 @@
 // Shared PASS/FAIL reporting for the DirectLUSolvers test suites.
 //
-// Every test binary used to carry its own copy of `int g_failures` plus a
-// `check()` that printed a differently-padded line. This centralizes both so a
-// new test costs an include instead of a copy-paste, and so all suites produce
-// the same, greppable output format.
+// One `int g_failures` and one `check()` for every suite, so a new test costs an
+// include instead of a copy-paste and all suites produce the same, greppable
+// output format.
 //
 // Usage:
 //   #include "testing/Check.h"

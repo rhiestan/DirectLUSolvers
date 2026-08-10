@@ -610,13 +610,13 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // (firstColumn/lastColumn only) and m_supernodeOfColumn directly, plus one
   // compact off-diagonal-row list per finalized supernode (extracted at
   // supernode-close time, before that supernode's own explicit column lists
-  // are freed) -- much smaller than the old per-column storage, since it holds
+  // are freed) -- much smaller than a per-column representation, since it holds
   // each supernode's shared off-diagonal rows ONCE rather than once per member
   // column.
   void computeSupernodePartition(const std::vector<std::vector<StorageIndex>>& adjacency,
                                  const std::vector<StorageIndex>& parent,
                                  std::vector<std::vector<StorageIndex>>& supernodeOffDiagRows);
-  // Second half of the old detectSupernodesAndBlocks: turns each supernode's
+  // Second half of supernode/block detection: turns each supernode's
   // compact off-diagonal-row list into contiguous per-facing-supernode
   // RowBlocks (needs m_supernodeOfColumn for arbitrary later columns, so it can
   // only run after computeSupernodePartition has finished ALL supernodes), then
@@ -651,16 +651,16 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
 
   // Chunk extent to use when splitting `total` rows/columns across the pool.
   //
-  // This used to be the fixed kIntraChunkSize, which silently capped intra-
-  // supernode parallelism at ceil(total/128) chunks NO MATTER how many threads
-  // existed. Measured on this project's matrices at 32 lanes, the heaviest
-  // supernodes carry ~1400-1650 off-diagonal rows and so got only 11-13 chunks:
-  // 20 of 32 threads idle through the supernodes that dominate the
-  // factorization. Weighted by work, 52% (lap3d_30^3) and 44% (laoss_1) of all
-  // factorization work sat in supernodes that could not fill the machine.
+  // Aiming for one chunk per lane is what keeps intra-supernode parallelism
+  // from being capped by the ceiling: a fixed kIntraChunkSize extent would give
+  // ceil(total/128) chunks NO MATTER how many threads exist. Measured on this
+  // project's matrices at 32 lanes, the heaviest supernodes carry ~1400-1650
+  // off-diagonal rows and so would get only 11-13 chunks: 20 of 32 threads idle
+  // through the supernodes that dominate the factorization. Weighted by work,
+  // 52% (lap3d_30^3) and 44% (laoss_1) of all factorization work sits in
+  // supernodes that could not fill the machine that way.
   //
-  // Aiming for one chunk per lane removes that cap. The result is never coarser
-  // than before (so this cannot reduce parallelism) and never finer than the
+  // The result is never coarser than kIntraChunkSize and never finer than the
   // floor above.
   Index intraChunkRows(Index total) const {
     const Index lanes = static_cast<Index>(m_executor.concurrency());
@@ -1011,12 +1011,12 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodePartition
   // sorted union of sorted inputs is exactly what std::set_union computes, in
   // time linear in the input/output sizes -- so folding the children in one at
   // a time via set_union (ping-ponging between scratch/scratch2) produces the
-  // same deduped, sorted result as the old mark-and-sweep-then-std::sort
-  // approach, but without ever paying an O(m log m) sort of a list that's
-  // almost entirely inherited, unchanged, from one child. This was the actual
-  // hot path on large fill-heavy matrices (large near-root supernodes' columns
-  // have the biggest m, and the OLD code re-sorted their near-identical
-  // structure from scratch at every one of their member columns).
+  // same deduped, sorted result as a mark-and-sweep-then-std::sort approach,
+  // but without ever paying an O(m log m) sort of a list that's almost entirely
+  // inherited, unchanged, from one child. This is the hot path on large
+  // fill-heavy matrices (large near-root supernodes' columns have the biggest
+  // m, and a per-column sort would rebuild their near-identical structure from
+  // scratch at every one of their member columns).
   std::vector<StorageIndex> scratch, scratch2;
 
   auto rowsBeyond = [](const std::vector<StorageIndex>& structure, StorageIndex col) -> StorageIndex {
@@ -1165,7 +1165,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::buildRowBlocksAndUpdateSo
   }
 
   // Build, for each supernode, the list of contributing sources for the
-  // left-looking sweep. (The off-diagonal row -> panel position map is no longer
+  // left-looking sweep. (The off-diagonal row -> panel position map is not
   // materialized; rowPanelPosition() derives it from the sorted row blocks.)
   m_updateSources.assign(supernodeNbr, std::vector<UpdateSource>());
 
@@ -1271,7 +1271,8 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
     // directly. Getting this backwards eliminates the top separators FIRST and
     // inflates fill enormously on strongly directional matrices (e.g. 3D FEM:
     // 250-300x more fill), while being nearly invisible on near-symmetric
-    // orderings -- which is exactly why the bug hid until the laoss matrices.
+    // orderings and leaving the residual at machine precision either way --
+    // so it is a mistake that hides from every check except fill.
     for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
   }
 

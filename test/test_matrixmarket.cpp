@@ -138,8 +138,8 @@ void testHermitian(const ScratchDir& dir) {
   const double diff = (dense(A) - expect).norm();
   check(diff == 0.0, "hermitian: mirrored as conj(v)", diff);
 
-  // A hermitian file used to match no symmetry keyword at all, so only the
-  // lower triangle was read -- assert the upper triangle really is populated.
+  // A reader that matches no symmetry keyword for "hermitian" reads only the
+  // lower triangle -- assert the upper triangle really is populated.
   checkTrue(A.nonZeros() == 3, "hermitian: upper triangle present");
 }
 
@@ -178,7 +178,7 @@ void testPatternField(const ScratchDir& dir) {
 
 void testArrayFormat(const ScratchDir& dir) {
   // Array format is column-major. This is what testdata/*/spmatrix_b.mtx uses;
-  // the old coordinate-only readers would have misread such a file.
+  // a coordinate-only reader would misread such a file.
   const std::string path = dir.write("arr.mtx",
                                      "%%MatrixMarket matrix array real general\n"
                                      "3 2\n"

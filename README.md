@@ -297,7 +297,7 @@ operation they describe has run at least once.
   solver.setMatchingMethod(Eigen::supernodal_lu::MatchingMethod::MC64);
   ```
 
-  `setMatching(true|false)` remains, as an alias for `Transversal`/`None`.
+  `setMatching(true|false)` is an alias for `Transversal`/`None`.
 - **`setDiagonalPivoting(bool on)`** (default **on**) — factors each supernode's dense diagonal
   block with partial pivoting *confined to that block* (row swaps never leave the
   already-allocated dense panel, so the global symbolic structure — and therefore BLAS-3 shape
@@ -337,7 +337,7 @@ operation they describe has run at least once.
   [Chunk sizing](#chunk-sizing)); this is the single largest contributor to
   parallel factorization speedup measured on this project's matrices. No effect
   with `SerialExecutor`. **Caveat:** where this
-  triggers, the parallel result is no longer *bit-identical* to the serial one (differs at
+  triggers, the parallel result is not *bit-identical* to the serial one (differs at
   ~1e-14 relative, from floating-point reassociation across chunk boundaries) — it is still
   fully deterministic for a given thread count, and the true residual is unaffected.
 
@@ -741,9 +741,8 @@ solver.compute(A);
   in testing and can win, though the size of the win is ordering-seed- and matrix-dependent — e.g.
   on `bayer05` (a near-singular pathological matrix; resid stays ~1e-16..1e-18 regardless of
   ordering, so *err* is the meaningful metric there) plain AMD gives solve error ~2.2, METIS/Auto
-  bring it to ~1.5 — a real but modest improvement (re-measure before quoting a specific factor;
-  this number moves as the solver evolves and has shifted in this project's history — see the
-  ordering-direction note below), at the cost of extra `analyzePattern()` time on small matrices.
+  bring it to ~1.5 — a real but modest improvement (re-measure before quoting a specific factor),
+  at the cost of extra `analyzePattern()` time on small matrices.
   For **large, well-separated 3D FEM systems, use `MetisOrdering`** (nested dissection) — on this
   project's `laoss_1` benchmark (251k rows, 3.5M nnz, 3D FEM), METIS ordering gives **~11.9x
   fill** (41.8M scalars, ~330 MB), matching MKL PARDISO's ~12x/~0.5GB and beating
@@ -759,10 +758,9 @@ solver.compute(A);
   *speed*, not fill.)
 - **Get the ordering direction right.** These solvers consume the fill-reducing permutation as the
   *inverse* of what `Eigen`'s `AMDOrdering`/`MetisOrdering` put in `indices()` (see the note in
-  `analyzePattern`). This was a bug until 2026-07: the ordering was applied backwards, which is
-  nearly invisible on near-symmetric orderings but inflates fill 250-350x on strongly directional
-  3D matrices. If you write a custom `OrderingType`, return the same convention as Eigen's
-  built-in orderings.
+  `analyzePattern`). Applying it backwards is nearly invisible on near-symmetric orderings but
+  inflates fill 250-350x on strongly directional 3D matrices, at unchanged residuals. If you write
+  a custom `OrderingType`, return the same convention as Eigen's built-in orderings.
 - Parallel scaling benefits the most from `setIntraSupernodeParallelism` (on by default) on
   matrices with a wide, well-separated elimination tree (e.g. 2D/3D discretizations) — 3.20x
   measured at 32 threads on a 30³ 3D Laplacian, versus 1.13x from level-parallelism alone.
@@ -856,9 +854,9 @@ explicitly, as is `OpenMPExecutor`'s thread-count override.
 ### Fill regression baselines
 
 `test_regression` is the suite that guards the failure mode the others cannot
-see. Every other check gates on the residual — but the ordering-direction bug
-fixed in 2026-07 left every residual at machine precision while inflating 3D
-factors 250-350x. Fill is a deterministic function of the pattern and the
+see. Every other check gates on the residual — but an ordering-direction mistake
+leaves every residual at machine precision while inflating 3D factors 250-350x.
+Fill is a deterministic function of the pattern and the
 ordering, so `test_regression` pins `nnzL + nnzU` per (matrix, solver) against
 `test/baselines/testdata.baseline` and fails on drift beyond 5%.
 
@@ -909,8 +907,8 @@ really was bad (flagging a good one would be its own defect).
 Results on the 23-matrix quick tier: **15 solved** to machine precision, **8
 returned a bad answer the solver flagged itself**, 0 tripped the fill guard.
 No unflagged wrong answers — the honesty machinery
-(`solveFailureThreshold`, the post-solve residual check) is now tested against
-matrices that genuinely defeat the solvers, which nothing previously did.
+(`solveFailureThreshold`, the post-solve residual check) is exercised against
+matrices that genuinely defeat the solvers.
 
 **Why the 8 failures fail.** Diagnosed by comparing against `Eigen::SparseLU`
 (real partial pivoting) on the same systems, then sweeping the solver options:
@@ -927,7 +925,7 @@ matrices that genuinely defeat the solvers, which nothing previously did.
 | `foldoc` | 0.48 | **fails** inf | structurally singular |
 
 So **5 of 8 are ours, not the matrix** — and **`setMatchingMethod(MatchingMethod::MC64)`
-now fixes all five at once**, including `lhr10c`. See
+fixes all five at once**, including `lhr10c`. See
 [Matching & diagonal pivoting](#matching--diagonal-pivoting-robustness) for the
 mechanism and the cost trade-off.
 
@@ -956,6 +954,12 @@ Measured 2026-08-07, 32 hardware threads, `StdThreadExecutor` via
 `PooledExecutor`, best of 3, AMD ordering. Times in ms; "32t" is the speedup
 from 1 to 32 threads.
 
+The `lap*` names are the synthetic Laplacians from `test/testing/TestMatrices.h`,
+and the superscript is the grid exponent, not a footnote marker: `lap3d_30³` is
+the 30×30×30 3D Laplacian (27000 rows, `lap3d_30x30x30` in the benchmark output)
+and `lap2d_300²` the 300×300 2D one (90000 rows, `lap2d_300x300`). `laoss_1` and
+`laoss_2` are real 3D FEM systems from `testdata/`.
+
 | matrix | phase | 1t | 8t | 32t | speedup |
 |---|---|---:|---:|---:|---:|
 | `laoss_1` (251k) | analyze (symbolic) | 650 | 637 | 626 | **1.04x** |
@@ -970,9 +974,7 @@ from 1 to 32 threads.
 
 Four things this says, none of them visible from a single-thread-count timing:
 
-1. **`solve()` now parallelizes** (~1.9x), but did not originally — it was
-   exactly 1.00x on every matrix because `solveTriangular` walked the supernodes
-   sequentially and never touched the `Executor`. See [Parallel triangular
+1. **`solve()` parallelizes too** (~1.9x) — see [Parallel triangular
    solve](#parallel-triangular-solve). Even so it is only 3-7% of a
    factor+solve here, so this matters most when you factor once and solve many
    times.
@@ -983,8 +985,8 @@ Four things this says, none of them visible from a single-thread-count timing:
 3. **Intra-supernode chunking is the mechanism that pays, not level
    parallelism.** On the 3D Laplacian, levels alone give 1.13x while adding
    intra-supernode chunking gives 3.20x. Level parallelism on its own never
-   exceeded 1.65x on any matrix here. See [Chunk sizing](#chunk-sizing) for the
-   cap that used to hold this back.
+   exceeded 1.65x on any matrix here. See [Chunk sizing](#chunk-sizing) for how
+   the chunk extent is picked.
 4. **`LeftRightLU`'s barrier-free scheduler still trails `SupernodalLU`'s
    levels + chunking on 3D** (1.19x vs 2.33x on `lap3d_30³`; 1.76x vs 2.53x on
    `laoss_1`) — see [Work-stealing ready queue](#work-stealing-ready-queue)
@@ -1058,10 +1060,8 @@ channels will land somewhere quite different.
 
 #### Parallel triangular solve
 
-`solve()` originally ran entirely on the calling thread — measured at exactly
-1.00x from 1 to 32 threads, because the sweeps never touched the `Executor`.
-They now dispatch over elimination-tree levels (`setParallelSolve`, on by
-default).
+Both triangular sweeps dispatch over elimination-tree levels
+(`setParallelSolve`, on by default) rather than running on the calling thread.
 
 The two sweeps are not symmetric, which is the whole difficulty:
 
@@ -1099,65 +1099,64 @@ repeatedly, which is the case the solver is built for.
 
 #### Chunk sizing
 
-Intra-supernode chunking originally split a panel into fixed 128-row chunks, so
-a supernode yielded `ceil(offDiagonalRows / 128)` chunks **regardless of how
-many threads existed**. On this project's matrices at 32 lanes the heaviest
-supernodes carry ~1400-1650 off-diagonal rows and therefore got only 11-13
-chunks: 20 of 32 threads idled through precisely the supernodes that dominate
-the factorization. Weighted by work, 52% (`lap3d_30³`) and 44% (`laoss_1`) of
-all factorization work sat in supernodes that could not fill the machine.
+The chunk extent is `clamp(ceil(offDiagonalRows / lanes), 32, 128)` rows — about
+one chunk per lane, floored so a chunk stays thick enough to amortize the BLAS
+call and the per-chunk walk over the target's update sources, and capped at 128
+so tall panels still produce several chunks for load balance.
 
-The chunk extent is now `clamp(ceil(total / lanes), 32, 128)` — one chunk per
-lane, floored so a chunk stays thick enough to amortize the BLAS call and the
-per-chunk walk over the target's update sources, and ceilinged at the old 128 so
-tall panels still produce many chunks for load balance. It is **never coarser
-than before**, so it cannot reduce parallelism, and at low lane counts it
-reproduces the old behaviour exactly.
+Scaling the extent with the lane count is what makes the mechanism pay. A fixed
+128-row chunk would yield `ceil(offDiagonalRows / 128)` chunks **regardless of
+how many threads exist**: on this project's matrices the heaviest supernodes
+carry ~1400-1650 off-diagonal rows, so at 32 lanes they would split into only
+11-13 chunks and 20 of 32 threads would idle through precisely the supernodes
+that dominate the factorization — weighted by work, 52% (`lap3d_30³`) and 44%
+(`laoss_1`) of the whole factorization.
 
-| matrix | factor (levels+intra) at 32t | before | after | speedup 1→32 |
-|---|---|---:|---:|---|
-| `lap3d_30³` | | 265 ms | **189 ms** | 2.33x → **3.20x** |
-| `laoss_2` (100k) | | 261 ms | **214 ms** | 2.01x → **2.47x** |
-| `lap2d_300²` | | 59.1 ms | **51.3 ms** | 1.84x → **2.13x** |
-| `laoss_1` (251k) | | 835 ms | 834 ms | 2.35x → 2.48x |
+| matrix | factor (levels+intra) at 32t | speedup 1→32 |
+|---|---:|---|
+| `lap3d_30³` | 189 ms | **3.20x** |
+| `laoss_2` (100k) | 214 ms | **2.47x** |
+| `lap2d_300²` | 51.3 ms | **2.13x** |
+| `laoss_1` (251k) | 834 ms | 2.48x |
 
-**`laoss_1` did not move**, despite the diagnostic predicting 44% idle there.
-That was investigated separately — see [The machine ceiling](#the-machine-ceiling).
+`laoss_1` is the exception: its 44% idle-work diagnostic does not convert into a
+gain from finer chunks, because memory bandwidth binds first there — see
+[The machine ceiling](#the-machine-ceiling).
 
 #### Work-stealing ready queue
 
-The first version of the dynamic scheduler kept **one** global mutex-guarded
-ready stack and called `notify_all()` after every completed supernode. That
-serialized every task acquisition behind a single lock and woke all *P* workers
-per supernode when at most a couple could proceed. It also defeated the
-depth-first subtree affinity the LIFO existed to provide: a worker pushed its
-freshly-readied children onto the shared stack, where any other worker took them
-immediately.
+`LeftRightLU`'s dynamic scheduler holds its ready nodes in **per-worker deques
+with work stealing**: a worker pushes the consumers it readied onto its own back
+and pops from its own back, so the node whose data is hot in that core's cache
+is the node it takes next; only when its deque runs dry does it steal, from the
+*front* of a victim — the entry furthest from the victim's hot end, so steals
+rarely collide with the owner and tend to move a coarse subtree rather than a
+leaf. Idle workers park on a shared condition variable with a bounded wait, and
+producers skip the notify entirely unless someone is actually parked.
 
-It was replaced (2026-08-07) with **per-worker deques and work stealing**: a
-worker pushes the consumers it readied onto its own back and pops from its own
-back, so the node whose data is hot in that core's cache is the node it takes
-next; only when its deque runs dry does it steal, from the *front* of a victim —
-the entry furthest from the victim's hot end, so steals rarely collide with the
-owner and tend to move a coarse subtree rather than a leaf. Idle workers park on
-a shared condition variable with a bounded wait, and producers skip the notify
-entirely unless someone is actually parked.
+The obvious alternative — **one** global mutex-guarded ready stack with a
+`notify_all()` per completed supernode — serializes every task acquisition
+behind a single lock, wakes all *P* workers when at most a couple can proceed,
+and defeats the depth-first subtree affinity the LIFO exists to provide (a
+worker's freshly readied children land on the shared stack, where any other
+worker takes them immediately). Measured, it is slow enough at high thread
+counts to make `lap2d_300²` and `lap3d_30³` run *worse* at 32 threads than at
+16.
 
-Measured effect (same setup as the table above), LRLU factorization:
+Measured (same setup as the table above), LRLU factorization:
 
-| matrix | before, 16t → 32t | after, 16t → 32t | speedup 1→32 |
-|---|---|---|---|
-| `lap2d_300²` | 56.3 → **72.6** ms *(regressed)* | 58.1 → **53.9** ms | 1.69x → **2.30x** |
-| `lap3d_30³` | 542 → **634** ms *(regressed)* | 536 → 543 ms | 1.02x → **1.19x** |
-| `laoss_2` (100k) | 311 → 312 ms | 298 → 301 ms | 1.82x → 1.85x |
-| `laoss_1` (251k) | 1262 → 1251 ms | 1259 → 1227 ms | 1.75x → 1.76x |
+| matrix | 16t | 32t | speedup 1→32 |
+|---|---:|---:|---|
+| `lap2d_300²` | 58.1 ms | **53.9 ms** | **2.30x** |
+| `lap3d_30³` | 536 ms | 543 ms | 1.19x |
+| `laoss_2` (100k) | 298 ms | 301 ms | 1.85x |
+| `laoss_1` (251k) | 1259 ms | 1227 ms | 1.76x |
 
-Read this honestly: **the change removes the high-thread-count regressions and
-is a large win on `lap2d_300²`, but is roughly neutral on the two real FEM
-matrices.** That split is consistent — `lap2d_300²` factors in ~120 ms across
-32919 supernodes, so per-task queue overhead is a large fraction of task cost
-and queue throughput dominates; `laoss_1` spends 2.1 s over 49350 supernodes, so
-its tasks are far coarser and the queue was never the limiter there.
+Read this honestly: **queue design decides the outcome only where tasks are fine
+grained.** `lap2d_300²` factors in ~120 ms across 32919 supernodes, so per-task
+queue overhead is a large fraction of task cost and queue throughput dominates;
+`laoss_1` spends 2.1 s over 49350 supernodes, so its tasks are far coarser and
+the queue is not the limiter there.
 
 The remaining `lap3d_30³` gap to `SupernodalLU` (1.19x vs 2.33x) is therefore
 **not** a queue problem. It is the absence of intra-supernode parallelism:
@@ -1202,7 +1201,7 @@ Eigen::VectorXd x = solver.solve(b);
    and steals from the front of a victim's** when it runs dry, which gives genuine
    depth-first subtree affinity (PARDISO's cooperative subtree ownership, minus the NUMA
    placement, which is out of scope) — see [Work-stealing ready
-   queue](#work-stealing-ready-queue) for the measurements that motivated it. This runs as a single `parallelFor(0, P, worker)` over
+   queue](#work-stealing-ready-queue) for the measurements behind it. This runs as a single `parallelFor(0, P, worker)` over
    the same pluggable `Executor` — each worker is itself a complete sequential scheduler, so
    even a serial or fork-join executor drives it correctly (verified with the serial,
    `StdThreadExecutor`, and `OpenMPExecutor` backends).
@@ -1227,8 +1226,8 @@ Eigen::VectorXd x = solver.solve(b);
    `determinantSign()`.
 
 **Excluded by design** (project scope): NUMA-aware data placement, out-of-core
-factorization, MPI, and the symmetric-indefinite Bunch-Kaufman `LDLᵀ` path (a documented
-follow-up — this first version is the unsymmetric LU path). Bit-reproducibility across thread
+factorization, MPI, and the symmetric-indefinite Bunch-Kaufman `LDLᵀ` path (this solver
+implements the unsymmetric LU path only). Bit-reproducibility across thread
 counts is **not** a goal: the dynamic scheduler reassociates floating-point updates, so the
 parallel result may differ from the serial one at the ~1e-14 level (the true residual is
 unaffected and refinement cleans up the rest).
@@ -1236,9 +1235,9 @@ unaffected and refinement cleans up the rest).
 ### Performance notes (honest summary)
 
 Measured 2026-07-14 with `DirectLUSolvers/test/compare_testdata.cpp`, single-threaded
-(`SerialExecutor`) — the numbers below do **not** yet exercise the barrier-free dynamic
-scheduler's headline advantage (that requires a parallel executor and hasn't been separately
-benchmarked in this doc; see [Parallelism](#parallelism) for the mechanism).
+(`SerialExecutor`) — the numbers below do **not** exercise the barrier-free dynamic
+scheduler's headline advantage, which requires a parallel executor (see
+[Parallel scaling](#parallel-scaling-measured) for the threaded numbers).
 
 - On this project's real-world `testdata/` set, `LeftRightLU` tracks `SupernodalLU`'s
   factor+solve time closely (both reuse the same analysis pipeline and static-pivoting numeric
@@ -1269,11 +1268,11 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
 `info()`/`solveResidual()` failure check, …). The differences:
 
 - **`setPivoting(left_right_lu::Pivoting mode)`** — `None` / `Partial` (row-only) / `Complete`
-  (row + column, **default**). `setDiagonalPivoting(true|false)` remains as a convenience
-  alias mapping to `Complete` / `None`.
+  (row + column, **default**). `setDiagonalPivoting(true|false)` is a convenience alias
+  mapping to `Complete` / `None`.
 - **`setRefineOnlyIfPerturbed(bool)`** (default **true**) — PARDISO-style refinement gating.
 - **`logAbsDeterminant() -> RealScalar`** and **`determinantSign() -> Scalar`** — the
-  log-determinant pair. No longer a delta: `SupernodalLU` gained the same pair, since
+  log-determinant pair. Not actually a delta: `SupernodalLU` exposes the same pair, since
   `determinant()` overflows on both solvers for the same reason. See its
   [Diagnostics & queries](#diagnostics--queries).
 - **`predictedFactorNonzeros()`** and **`setMaxFactorNonzeros(Index)`** — the shared fail-fast
@@ -1284,7 +1283,7 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
   complete-pivoting search on a small dense block; the intra-supernode chunking `SupernodalLU`
   exposes is **not** present (the async scheduler can't nest a fork-join inside a worker, and
   the dynamic schedule already shrinks the serial tail to a single node).
-- `levelCount()`/`widestLevel()` remain as **diagnostics only** — the scheduler does not use
+- `levelCount()`/`widestLevel()` are **diagnostics only** — the scheduler does not use
   levels to schedule (there are no level barriers).
 
 ### Testing

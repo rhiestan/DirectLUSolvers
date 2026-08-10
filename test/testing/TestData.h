@@ -1,9 +1,8 @@
 // The benchmark-matrix registry shared by the DirectLUSolvers test suites.
 //
-// Three suites previously each hard-coded their own list of "testdata/<x>.mtx"
-// paths, relative to a working directory they silently assumed. This centralizes
-// both the location (baked in at configure time, env-overridable) and the list,
-// so a matrix added here reaches every suite at once.
+// One place for both the location of "testdata/<x>.mtx" (baked in at configure
+// time, env-overridable, so no suite has to assume a working directory) and the
+// list itself, so a matrix added here reaches every suite at once.
 //
 // The `Tier` classification is what lets CTest run a fast subset: Small matrices
 // factor in well under a second each; Large ones take seconds to minutes; Huge
