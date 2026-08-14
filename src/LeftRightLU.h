@@ -1,9 +1,16 @@
 // LeftRightLU - a sparse direct LU solver for Eigen using the algorithmic
 // design of PARDISO (see pardiso_algorithms.md), as a sibling of SupernodalLU.
 //
+// Accepts any square sparse matrix: general (unsymmetric) values AND a general
+// (unsymmetric) nonzero pattern. The symbolic phase factors the pattern of
+// B + B^T (B = the matched matrix), which is a valid superset of the structure
+// of L and U because the factorization never interchanges rows or columns
+// outside a diagonal block -- so an unsymmetric pattern needs no preprocessing
+// from the caller. See "Unsymmetric nonzero patterns" on the class below for
+// what it costs and how to keep that cost down.
+//
 // What LeftRightLU shares with SupernodalLU (and reuses verbatim from the
 // supernodal_lu:: support/matching/executor headers):
-//   * General (unsymmetric) values with a SYMMETRIC nonzero pattern.
 //   * The whole symbolic pipeline: MC64-style maximum-transversal matching,
 //     fill-reducing ordering, elimination tree + postorder, supernode detection
 //     with amalgamation/splitting, and block symbolic factorization.
@@ -88,6 +95,39 @@ enum class Refinement { None, IterativeRefinement, BiCGStab };
 //   Complete  - PARDISO DGETC2-style row AND column pivoting confined to the
 //               block: most robust, and still leaves the symbolic structure fixed.
 enum class Pivoting { None, Partial, Complete };
+
+// Direction convention of the permutation a fill-reducing ordering functor
+// returns. Eigen's own functors do NOT agree on it, and nothing in the type
+// says which one you got:
+//
+//   AMDOrdering, MetisOrdering  ->  perm.indices()(k) = the ORIGINAL column
+//                                   placed at new position k   (INVERSE map)
+//   COLAMDOrdering              ->  perm.indices()(j) = the NEW position of
+//                                   original column j          (DIRECT map)
+//
+// analyzePattern needs the direct map. Reading a permutation the wrong way
+// round still yields a valid permutation and a machine-precision residual --
+// it shows up only as fill, and then by orders of magnitude (measured: 4.6x on
+// a 900-column upwind grid with COLAMD, 250-300x on 3D FEM systems with AMD).
+// Nothing in the numbers themselves distinguishes the two directions, so this
+// is a compile-time trait rather than something the solver tries to detect.
+//
+// Specialize it for a custom ordering functor that returns the direct map:
+//
+//   namespace Eigen { namespace left_right_lu {
+//   template <> struct OrderingConvention<MyOrdering> {
+//     static constexpr bool returnsInverse = false;
+//   };
+//   }}  // namespace Eigen::left_right_lu
+template <typename OrderingType>
+struct OrderingConvention {
+  static constexpr bool returnsInverse = true;
+};
+
+template <typename StorageIndex>
+struct OrderingConvention<COLAMDOrdering<StorageIndex>> {
+  static constexpr bool returnsInverse = false;
+};
 }  // namespace left_right_lu
 
 /** \class LeftRightLUTransposeView
@@ -135,12 +175,16 @@ class LeftRightLUTransposeView
 
 /** \class LeftRightLU
  * \brief PARDISO-style supernodal sparse direct LU factorization for general
- *        matrices with a symmetric nonzero pattern: left-right-looking numeric
- *        factorization driven by a barrier-free dynamic (assembly-DAG) scheduler,
- *        with in-block complete pivoting.
+ *        square matrices: left-right-looking numeric factorization driven by a
+ *        barrier-free dynamic (assembly-DAG) scheduler, with in-block complete
+ *        pivoting.
  *
  * \tparam MatrixType_   A column-major Eigen::SparseMatrix<Scalar, ColMajor, StorageIndex>.
  * \tparam OrderingType_ A fill-reducing ordering functor (default AMDOrdering).
+ *                       A functor that returns the direct (rather than the
+ *                       inverse) permutation needs an OrderingConvention
+ *                       specialization; Eigen's own AMD/METIS/COLAMD/Natural
+ *                       functors are all handled already.
  * \tparam Executor_     A parallel-execution backend (default SerialExecutor);
  *                       see SupernodalLUExecutor.h. Supplies the worker count for
  *                       the dynamic scheduler (its concurrency()); the DAG
@@ -153,6 +197,54 @@ class LeftRightLUTransposeView
  *   solver.compute(A);
  *   x = solver.solve(b);
  * \endcode
+ *
+ * \section lrlu_unsym Unsymmetric nonzero patterns
+ *
+ * Both the values and the *pattern* of A may be unsymmetric; nothing has to be
+ * done to A first.
+ *
+ * In particular, do NOT pad the pattern with explicit structural zeros to
+ * symmetrize it. That is the documented workaround for SupernodalLU, and here it
+ * is not merely redundant but actively harmful, because *when* the pattern is
+ * symmetrized decides how much structure results. This solver symmetrizes AFTER
+ * the matching row permutation, on `P*A`; a caller who symmetrizes up front does
+ * it before, so the analysis then symmetrizes a second time and eliminates
+ * `P*(A u A^T) u (A u A^T)*P^T` instead of `P*A u A^T*P^T`. Measured on gemat11
+ * that is 102x the fill (51,728 -> 5,281,259 nnzL) and 546x the factorization
+ * time, for the same answer. A pattern that is *already* symmetric is unaffected
+ * either way -- padding only matters when there is something to pad.
+ *
+ * How it works: the symbolic phase runs on the pattern of `B + B^T`, where B is
+ * A with the matching row permutation applied. Because the numeric phase never
+ * moves a row or column outside its own diagonal block (that is the whole point
+ * of the static-structure design), the fill pattern of `chol(B + B^T)` is a
+ * valid superset of the structure of both L and U, and every entry of A lands
+ * in a slot that already exists. The result is exact for any pattern -- an
+ * unsymmetric pattern costs *fill*, never correctness. This is also what PARDISO
+ * does for its unsymmetric matrix types (MTYPE=11/13).
+ *
+ * What it costs, and what to do about it:
+ *
+ *  - patternSymmetry() reports how much symmetrizing added: 1 means the pattern
+ *    was already symmetric and nothing was added, 0 means no nonzero had a
+ *    mirror and the symbolic pattern has twice A's off-diagonal entries. Low
+ *    values are worth knowing about because the extra structure compounds
+ *    through fill, not linearly. It measures `B`, the graph actually eliminated,
+ *    so a symmetric-pattern A can still report below 1: matching permutes rows.
+ *  - The default AMDOrdering is still the right ordering here: it minimizes
+ *    degree in exactly the `A + A^T` graph this factorization eliminates.
+ *    COLAMDOrdering (which Eigen::SparseLU defaults to) targets the
+ *    partial-pivoting `A^T A` bound instead, a different objective, and measured
+ *    on unsymmetric-pattern matrices it gives *more* fill here, not less. Reach
+ *    for MetisOrdering, not COLAMD, when AMD's fill is too high.
+ *  - On a strongly unsymmetric pattern with no good vertex separators, the fill
+ *    can exceed what a partial-pivoting solver would need by orders of
+ *    magnitude. setMaxFactorNonzeros() turns that into a clean, immediate error
+ *    instead of an out-of-memory kill; predictedFactorNonzeros() prices it after
+ *    analyzePattern() and before any factor memory is touched.
+ *  - Unsymmetric patterns are also where structural singularity actually
+ *    happens (an empty column, or one whose rows are all claimed elsewhere).
+ *    matchingIsPerfect() reports it right after analyzePattern().
  */
 template <typename MatrixType_, typename OrderingType_ = AMDOrdering<typename MatrixType_::StorageIndex>,
           typename Executor_ = supernodal_lu::SerialExecutor>
@@ -321,8 +413,27 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
    *  opt-in because it costs O(n) shortest-path searches. */
   void setMatchingMethod(supernodal_lu::MatchingMethod method) { m_matchingMethod = method; }
   supernodal_lu::MatchingMethod matchingMethod() const { return m_matchingMethod; }
-  /** True if the last matching produced a full zero-free diagonal. */
+  /** True if the last matching produced a full zero-free diagonal. A false here
+   *  means the matrix is STRUCTURALLY SINGULAR: some column's nonzero rows are
+   *  all claimed by other columns, so no row permutation can fill the diagonal.
+   *  The factorization still runs (the unmatched columns get leftover rows and
+   *  static pivoting bumps the resulting zero pivots), but the solution is
+   *  meaningless; solve() then reports it through info()/solveResidual(). Valid
+   *  after analyzePattern(), and only meaningful when matching() is on. */
   bool matchingIsPerfect() const { return m_matchingIsPerfect; }
+
+  /** Structural symmetry of the pattern the symbolic analysis ran on, in [0,1]:
+   *  the fraction of off-diagonal nonzeros A(i,j) whose mirror A(j,i) is also
+   *  structurally present. 1 = already symmetric, so symmetrizing added nothing;
+   *  0 = no nonzero has a mirror, so the symbolic pattern carries twice the
+   *  off-diagonal entries A does. Measured after the matching permutation, since
+   *  that is the pattern fill is actually computed from. Valid after
+   *  analyzePattern(). */
+  RealScalar patternSymmetry() const { return m_patternSymmetry; }
+
+  /** True when patternSymmetry() is exactly 1 -- symmetrizing was a no-op and
+   *  the fill is the same as an equivalent symmetric-pattern matrix's. */
+  bool structurallySymmetric() const { return m_structurallySymmetric; }
 
   /** In-block pivoting strategy (PARDISO restricted/complete pivoting). Default
    *  Complete (row + column interchanges confined to each diagonal block). */
@@ -533,6 +644,8 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_matchingMethod = supernodal_lu::MatchingMethod::Transversal;
     m_pivoting = left_right_lu::Pivoting::Complete;
     m_matchingIsPerfect = true;
+    m_patternSymmetry = RealScalar(1);
+    m_structurallySymmetric = true;
     m_matchSign = 1;
     m_factorizationSign = Scalar(1);
     m_scalingDeterminant = RealScalar(1);
@@ -540,8 +653,10 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_nnzU = 0;
   }
 
-  // analysis helpers (shared design with SupernodalLU)
-  void buildSymmetricAdjacency(const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency) const;
+  // analysis helpers (shared design with SupernodalLU). buildSymmetricAdjacency
+  // is what makes an unsymmetric input pattern work: it unions the pattern with
+  // its transpose, and records how much that union added (m_patternSymmetry).
+  void buildSymmetricAdjacency(const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency);
   void computeEliminationTree(const std::vector<std::vector<StorageIndex>>& adjacency,
                               std::vector<StorageIndex>& parent) const;
   void computePostorder(const std::vector<StorageIndex>& parent, std::vector<StorageIndex>& postorder) const;
@@ -631,6 +746,8 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   std::vector<StorageIndex> m_rowToInternal;  // original row -> internal index
   PermutationType m_rowPermutation;
   bool m_matchingIsPerfect;
+  RealScalar m_patternSymmetry;
+  bool m_structurallySymmetric;
   int m_matchSign;
 
   // Per-supernode in-block pivot permutations (internal local order). *Row*
@@ -696,22 +813,45 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetricAdjacency(
-    const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency) const {
+    const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency) {
   const StorageIndex n = m_size;
   adjacency.assign(n, std::vector<StorageIndex>());
+  Index offDiagonal = 0;  // off-diagonal nonzeros of `matrix`
   for (StorageIndex j = 0; j < n; ++j) {
     const StorageIndex jj = m_toInternal[j];
     for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
       const StorageIndex ii = m_toInternal[static_cast<StorageIndex>(it.index())];
       if (ii == jj) continue;
+      ++offDiagonal;
+      // Both directions go in: this union with the transpose is what lets an
+      // unsymmetric pattern through without the caller symmetrizing it.
       adjacency[jj].push_back(ii);
       adjacency[ii].push_back(jj);
     }
   }
+  Index distinct = 0;  // adjacency slots surviving the dedup
   for (StorageIndex j = 0; j < n; ++j) {
     auto& row = adjacency[j];
     std::sort(row.begin(), row.end());
     row.erase(std::unique(row.begin(), row.end()), row.end());
+    distinct += static_cast<Index>(row.size());
+  }
+
+  // Every off-diagonal entry pushed 2 slots, so `distinct` = 2u for u unordered
+  // pairs in the symmetrized pattern; a pair present in both directions was
+  // pushed twice and collapsed. With m off-diagonal entries and p mirrored
+  // pairs, m = u + p, so the mirrored fraction 2p/m is (2m - distinct)/m.
+  // distinct == m is exactly the already-symmetric case.
+  if (offDiagonal > 0) {
+    const RealScalar ratio =
+        RealScalar(2 * offDiagonal - distinct) / RealScalar(offDiagonal);
+    // Duplicate entries in an uncompressed input would inflate `offDiagonal`;
+    // clamp rather than report a nonsense ratio.
+    m_patternSymmetry = numext::mini(RealScalar(1), numext::maxi(RealScalar(0), ratio));
+    m_structurallySymmetric = (distinct == offDiagonal);
+  } else {
+    m_patternSymmetry = RealScalar(1);  // diagonal-only: trivially symmetric
+    m_structurallySymmetric = true;
   }
 }
 
@@ -988,27 +1128,35 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   const MatrixType& B =
       m_matchingMethod != supernodal_lu::MatchingMethod::None ? matched : matrix;
 
-  // 1) fill-reducing ordering of the pattern of B + B^T.
+  // 1) fill-reducing ordering. AMD/METIS order the pattern of B + B^T, which is
+  //    exactly the graph this factorization eliminates -- so they remain the
+  //    right choice on an unsymmetric pattern too (see the class docs).
   PermutationType orderingPerm;
   m_orderingFunctor(B, orderingPerm);
   m_toInternal.resize(n);
   if (orderingPerm.size() == 0) {
+    // NaturalOrdering: identity, reported as an empty permutation.
     for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = i;
-  } else {
+  } else if (left_right_lu::OrderingConvention<OrderingType>::returnsInverse) {
     // m_toInternal[i] must be the INTERNAL (elimination) index of original column
     // i -- i.e. the fill-reducing "new index of i" (separators eliminated last).
-    // Eigen's ordering functors (AMDOrdering/MetisOrdering) return that mapping
-    // as the INVERSE in indices(): orderingPerm.indices()(k) is the original
-    // column placed at new position k. So we must invert it here, not copy it
-    // directly. Getting this backwards eliminates the top separators FIRST and
-    // inflates fill enormously on strongly directional matrices (e.g. 3D FEM:
-    // 250-300x more fill), while being nearly invisible on near-symmetric
-    // orderings and leaving the residual at machine precision either way --
-    // so it is a mistake that hides from every check except fill.
+    // AMDOrdering and MetisOrdering return that mapping as the INVERSE in
+    // indices(): orderingPerm.indices()(k) is the original column placed at new
+    // position k. So it must be inverted here, not copied directly. Getting this
+    // backwards eliminates the top separators FIRST and inflates fill enormously
+    // on strongly directional matrices (e.g. 3D FEM: 250-300x more fill), while
+    // being nearly invisible on near-symmetric orderings and leaving the residual
+    // at machine precision either way -- so it is a mistake that hides from every
+    // check except fill.
     for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
+  } else {
+    // COLAMDOrdering (and anything else marked returnsInverse=false) already
+    // hands back the direct new-index-of-i mapping; inverting it here would be
+    // the exact same fill mistake in the other direction.
+    for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = orderingPerm.indices()(i);
   }
 
-  // 2) elimination tree of the ordered symmetric pattern.
+  // 2) elimination tree of the ordered, symmetrized (B + B^T) pattern.
   std::vector<std::vector<StorageIndex>> adjacency;
   buildSymmetricAdjacency(B, adjacency);
   std::vector<StorageIndex> parent;
@@ -1286,22 +1434,27 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
   // Fail-fast fill guard: abort BEFORE allocating the factor arenas if the
   // symbolic structure predicts a factor larger than the configured limit. This
   // turns an (unrecoverable) multi-hundred-GB bad_alloc / OOM kill into a clean
-  // NumericalIssue with a diagnostic -- the symmetric-pattern fill of some
+  // NumericalIssue with a diagnostic -- the symmetrized-pattern fill of some
   // matrices (e.g. FEM systems without good separators) is orders of magnitude
-  // larger than an unsymmetric solver would need. Off by default (limit 0).
+  // larger than a partial-pivoting solver would need. Off by default (limit 0).
   if (m_maxFactorNonzeros > 0) {
     const Index predicted = predictedFactorNonzeros();
     if (predicted > m_maxFactorNonzeros) {
-      char buf[512];
+      char buf[640];
       std::snprintf(buf, sizeof(buf),
                     "LeftRightLU: predicted factor size %lld scalars (~%.1f GB) exceeds the "
-                    "configured limit of %lld (setMaxFactorNonzeros). This symmetric-pattern "
-                    "fill is very large -- the matrix likely lacks good vertex separators; an "
-                    "iterative (e.g. BiCGSTAB+ILUT) or unsymmetric (SparseLU/PARDISO) solver is "
-                    "the right tool. Raise or clear the limit to force the factorization.",
+                    "configured limit of %lld (setMaxFactorNonzeros). The fill of the "
+                    "symmetrized (A + A^T) pattern is very large at pattern symmetry %.2f -- "
+                    "the matrix likely lacks good vertex separators%s. Try MetisOrdering, or "
+                    "an iterative (e.g. BiCGSTAB+ILUT) or partial-pivoting (SparseLU/PARDISO) "
+                    "solver. Raise or clear the limit to force the factorization.",
                     static_cast<long long>(predicted),
                     static_cast<double>(predicted) * static_cast<double>(sizeof(Scalar)) / 1e9,
-                    static_cast<long long>(m_maxFactorNonzeros));
+                    static_cast<long long>(m_maxFactorNonzeros),
+                    static_cast<double>(m_patternSymmetry),
+                    m_structurallySymmetric
+                        ? ""
+                        : ", and symmetrizing its unsymmetric pattern added structure on top");
       m_lastError = buf;
       m_info = NumericalIssue;
       return;  // nothing allocated; factors remain absent (isFactorized() stays false)

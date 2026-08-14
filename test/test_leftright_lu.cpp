@@ -13,9 +13,11 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "LeftRightLU.h"
@@ -26,8 +28,11 @@ using Eigen::SparseMatrix;
 using Eigen::VectorXd;
 using Eigen::MatrixXd;
 using lu_testing::check;
+using lu_testing::checkTrue;
 using lu_testing::laplacian2d;
 using lu_testing::randomSymmetricPattern;
+using lu_testing::randomUnsymmetricPattern;
+using lu_testing::upwind2d;
 using lu_testing::weakDiagonal;
 namespace lr = Eigen::left_right_lu;
 
@@ -327,6 +332,203 @@ void testParallelVsSerial() {
   check(true, "parallel scheduler stress (5 repetitions, no deadlock)", 0.0);
 }
 
+// ---------------------------------------------------------------------------
+//  Unsymmetric nonzero patterns
+// ---------------------------------------------------------------------------
+
+// The solver takes a matrix whose PATTERN is unsymmetric directly -- the caller
+// must not have to pad it with structural zeros first. Checks accuracy against
+// the true solution and cross-checks patternSymmetry() against a reference
+// computed from A and A^T.
+void testUnsymmetricPattern() {
+  struct Case {
+    const char* name;
+    SparseMatrix<double> A;
+  };
+  std::vector<Case> cases;
+  cases.push_back({"unsym pattern n=120 p=0.05", randomUnsymmetricPattern(120, 0.05, 3)});
+  cases.push_back({"unsym pattern n=300 p=0.02", randomUnsymmetricPattern(300, 0.02, 11)});
+  cases.push_back({"upwind grid 20x20", upwind2d(20, 20)});
+  cases.push_back({"upwind grid 40x30", upwind2d(40, 30)});
+
+  for (const Case& c : cases) {
+    const int n = static_cast<int>(c.A.rows());
+    // Guard the premise: these must actually have unsymmetric patterns, or the
+    // test silently degenerates into the symmetric case it already covers.
+    if (lu_testing::patternIsSymmetric(c.A)) {
+      lu_testing::fail(std::string(c.name) + ": generator produced a symmetric pattern");
+      continue;
+    }
+    VectorXd xTrue = VectorXd::Random(n);
+    VectorXd b = c.A * xTrue;
+
+    Eigen::LeftRightLU<SparseMatrix<double>> solver;
+    solver.compute(c.A);
+    if (solver.info() != Eigen::Success) {
+      lu_testing::fail(std::string(c.name) + ": " + solver.lastErrorMessage());
+      continue;
+    }
+    const VectorXd x = solver.solve(b);
+    const double worst = std::max((x - xTrue).norm() / xTrue.norm(), (c.A * x - b).norm() / b.norm());
+    check(worst < 1e-8, c.name, worst);
+
+    const double expected = lu_testing::patternSymmetry(c.A);
+    check(std::abs(solver.patternSymmetry() - expected) < 1e-12,
+          std::string(c.name) + ": patternSymmetry() matches reference",
+          std::abs(solver.patternSymmetry() - expected));
+    checkTrue(!solver.structurallySymmetric(),
+              std::string(c.name) + ": reported as not structurally symmetric");
+  }
+
+  // A symmetric-pattern matrix must report symmetry exactly 1.
+  Eigen::LeftRightLU<SparseMatrix<double>> sym;
+  sym.analyzePattern(laplacian2d(12, 12));
+  checkTrue(sym.structurallySymmetric() && sym.patternSymmetry() == 1.0,
+            "symmetric pattern reports patternSymmetry() == 1");
+}
+
+// Padding the pattern with explicit structural zeros must be unnecessary: the
+// solver's own symmetrization has to produce the same factor structure and the
+// same answer as feeding it a pre-symmetrized matrix, while doing strictly less
+// work per pass over the values.
+void testNoPreSymmetrizationNeeded() {
+  const SparseMatrix<double> A = upwind2d(25, 25);
+  const SparseMatrix<double> Apadded = lu_testing::symmetrizePattern(A);
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  Eigen::LeftRightLU<SparseMatrix<double>> raw, padded;
+  raw.compute(A);
+  padded.compute(Apadded);
+  const VectorXd xr = raw.solve(b), xp = padded.solve(b);
+
+  check(raw.info() == Eigen::Success && (A * xr - b).norm() / b.norm() < 1e-8,
+        "raw unsymmetric pattern solves", (A * xr - b).norm() / b.norm());
+  check(raw.nnzL() == padded.nnzL() && raw.nnzU() == padded.nnzU(),
+        "raw and pre-symmetrized inputs give identical fill",
+        double(raw.nnzL() - padded.nnzL()));
+  check((xr - xp).norm() / xp.norm() < 1e-10, "raw and pre-symmetrized answers agree",
+        (xr - xp).norm() / xp.norm());
+  std::printf("        A nnz=%lld padded nnz=%lld (padding is %.0f%% dead weight); nnzL=%lld\n",
+              (long long)A.nonZeros(), (long long)Apadded.nonZeros(),
+              100.0 * double(Apadded.nonZeros() - A.nonZeros()) / double(Apadded.nonZeros()),
+              (long long)raw.nnzL());
+}
+
+// Ordering functors disagree on whether they return the permutation or its
+// inverse (AMD/METIS: inverse; COLAMD: direct). Reading one the wrong way round
+// is invisible in the residual and shows up only as fill, so pin the fill.
+// AMD is expected to win here -- it minimizes degree in the A+A^T graph this
+// factorization actually eliminates -- but every functor must beat the natural
+// ordering by a wide margin, which a misread permutation cannot do.
+void testOrderingConventions() {
+  const SparseMatrix<double> A = upwind2d(30, 30);
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>> amd;
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::COLAMDOrdering<int>> colamd;
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::NaturalOrdering<int>> natural;
+  amd.compute(A);
+  colamd.compute(A);
+  natural.compute(A);
+
+  check((A * amd.solve(b) - b).norm() / b.norm() < 1e-8, "AMD ordering solves",
+        (A * amd.solve(b) - b).norm() / b.norm());
+  check((A * colamd.solve(b) - b).norm() / b.norm() < 1e-8, "COLAMD ordering solves",
+        (A * colamd.solve(b) - b).norm() / b.norm());
+
+  const double amdFill = double(amd.nnzL());
+  const double colamdFill = double(colamd.nnzL());
+  const double naturalFill = double(natural.nnzL());
+  // A permutation read backwards lands near (or above) the natural ordering.
+  // Correctly read, both fill-reducing orderings are several times below it.
+  check(amdFill < 0.5 * naturalFill, "AMD fill well below natural", amdFill / naturalFill);
+  check(colamdFill < 0.5 * naturalFill, "COLAMD fill well below natural (convention honoured)",
+        colamdFill / naturalFill);
+  std::printf("        nnzL: AMD=%.0f COLAMD=%.0f natural=%.0f\n", amdFill, colamdFill,
+              naturalFill);
+}
+
+// Structural singularity is the failure mode unsymmetric patterns introduce: a
+// column whose rows are all claimed elsewhere cannot get a diagonal entry. The
+// contract is that analyzePattern() reports it via matchingIsPerfect() and that
+// solve() refuses to call the resulting garbage a success.
+void testStructurallySingular() {
+  const int n = 40;
+  std::vector<Eigen::Triplet<double>> t;
+  for (int j = 0; j < n; ++j) {
+    if (j == 17) continue;  // an entirely empty column
+    t.emplace_back(j, j, 3.0);
+    if (j + 1 < n) t.emplace_back(j + 1, j, 1.0);
+  }
+  SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.analyzePattern(A);
+  checkTrue(!solver.matchingIsPerfect(),
+            "structurally singular matrix reported by matchingIsPerfect()");
+
+  solver.factorize(A);
+  const VectorXd b = VectorXd::Ones(n);
+  const VectorXd x = solver.solve(b);
+  checkTrue(solver.info() == Eigen::NumericalIssue,
+            "solve on a structurally singular matrix reports NumericalIssue");
+  std::printf("        residual=%.3e finite=%d\n", solver.solveResidual(), int(x.allFinite()));
+
+  // A matrix that is merely pattern-unsymmetric must NOT be flagged.
+  Eigen::LeftRightLU<SparseMatrix<double>> healthy;
+  healthy.analyzePattern(randomUnsymmetricPattern(80, 0.05, 21));
+  checkTrue(healthy.matchingIsPerfect(), "healthy unsymmetric pattern is not flagged singular");
+}
+
+// Unsymmetric pattern + everything else the solver offers at once: transpose and
+// adjoint solves, multiple right-hand sides, determinant, and the parallel
+// dynamic scheduler all have to keep working when the pattern is unsymmetric.
+void testUnsymmetricPatternFeatures() {
+  const SparseMatrix<double> A = randomUnsymmetricPattern(150, 0.04, 31);
+  const int n = static_cast<int>(A.rows());
+
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.compute(A);
+
+  MatrixXd X = MatrixXd::Random(n, 3);
+  MatrixXd B = A * X;
+  const MatrixXd Xs = solver.solve(B);
+  check((A * Xs - B).norm() / B.norm() < 1e-8, "unsym pattern: multiple RHS",
+        (A * Xs - B).norm() / B.norm());
+
+  const VectorXd b = VectorXd::Random(n);
+  const SparseMatrix<double> AT = A.transpose();
+  const VectorXd xt = solver.transpose().solve(b);
+  check((AT * xt - b).norm() / b.norm() < 1e-8, "unsym pattern: transpose solve",
+        (AT * xt - b).norm() / b.norm());
+
+  // Compared in log space: with a diagonal of ~n over 150 columns the raw
+  // determinant is ~1e320 and overflows double for both solvers.
+  Eigen::SparseLU<SparseMatrix<double>> ref;
+  ref.compute(A);
+  if (ref.info() == Eigen::Success) {
+    const double lref = ref.logAbsDeterminant();
+    const double rel = std::abs(solver.logAbsDeterminant() - lref) / std::abs(lref);
+    check(rel < 1e-10, "unsym pattern: log|det| matches SparseLU", rel);
+  }
+
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>,
+                     Eigen::supernodal_lu::StdThreadExecutor>
+      parallel;
+  parallel.compute(upwind2d(45, 45));
+  const SparseMatrix<double> P = upwind2d(45, 45);
+  const VectorXd pb = P * VectorXd::Random(P.rows());
+  const double presid = (P * parallel.solve(pb) - pb).norm() / pb.norm();
+  check(parallel.info() == Eigen::Success && presid < 1e-8,
+        "unsym pattern: parallel dynamic scheduler", presid);
+}
+
 }  // namespace
 
 int main() {
@@ -354,6 +556,13 @@ int main() {
   testHonestFailure();
   testFillGuard();
   testParallelVsSerial();
+
+  std::printf("Unsymmetric nonzero patterns:\n");
+  testUnsymmetricPattern();
+  testNoPreSymmetrizationNeeded();
+  testOrderingConventions();
+  testStructurallySingular();
+  testUnsymmetricPatternFeatures();
 
   return lu_testing::summarize("LeftRightLU correctness");
 }

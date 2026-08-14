@@ -178,9 +178,11 @@ std::vector<Case> buildCases() {
   for (const lu_testing::BenchmarkMatrix& m : lu_testing::benchmarkMatrices()) {
     if (m.tier == Tier::Huge) continue;
     const std::string path = lu_testing::testdataPath(m.relative);
-    cases.push_back({m.label, false, m.tier, [path] {
-                       return lu_testing::ensureSymmetricPattern(lu_testing::loadMatrixMarket(path));
-                     }});
+    // Loaded RAW -- the symmetric-pattern copy SupernodalLU needs is made per
+    // case below, so LeftRightLU can be pinned on the unsymmetric original it
+    // actually supports.
+    cases.push_back({m.label, false, m.tier,
+                     [path] { return lu_testing::loadMatrixMarket(path); }});
   }
   return cases;
 }
@@ -367,22 +369,28 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    std::printf("== %s (n=%lld nnz=%lld)\n", c.label.c_str(), (long long)A.rows(),
-                (long long)A.nonZeros());
+    // Each solver is pinned on the input it is designed for. SupernodalLU
+    // requires a symmetric pattern, so it gets the padded copy; LeftRightLU
+    // symmetrizes internally, AFTER matching, and padding its input first is the
+    // documented mistake (102x fill on gemat11) -- so pinning it on the padded
+    // copy would guard a path no caller should take.
+    const SparseMatrix<double> Asym = lu_testing::ensureSymmetricPattern(A);
+    std::printf("== %s (n=%lld nnz=%lld, symmetrized nnz=%lld)\n", c.label.c_str(),
+                (long long)A.rows(), (long long)A.nonZeros(), (long long)Asym.nonZeros());
 
     std::vector<Record> row;
-    row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>>>(c.label, "SupernodalLU", A));
+    row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>>>(c.label, "SupernodalLU", Asym));
     row.push_back(measure<Eigen::LeftRightLU<SparseMatrix<double>>>(c.label, "LeftRightLU", A));
     // MC64 is a separate symbolic path -- a different permutation, so different
     // fill -- and it is deterministic, so it is pinnable like the rest. Without
     // this it would be the one code path a fill regression could slip through.
     row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>>>(
-        c.label, "SupernodalLU+MC64", A, [](Eigen::SupernodalLU<SparseMatrix<double>>& s) {
+        c.label, "SupernodalLU+MC64", Asym, [](Eigen::SupernodalLU<SparseMatrix<double>>& s) {
           s.setMatchingMethod(Eigen::supernodal_lu::MatchingMethod::MC64);
         }));
 #ifdef HAVE_METIS
-    row.push_back(
-        measure<Eigen::SupernodalLUMetis<SparseMatrix<double>>>(c.label, "SupernodalLU+METIS", A));
+    row.push_back(measure<Eigen::SupernodalLUMetis<SparseMatrix<double>>>(
+        c.label, "SupernodalLU+METIS", Asym));
 #endif
 
     for (const Record& r : row) {

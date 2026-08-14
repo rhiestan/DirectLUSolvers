@@ -127,9 +127,90 @@ inline Eigen::SparseMatrix<double> weakDiagonal(int n, unsigned seed) {
   return weakDiagonalAs<double>(n, seed);
 }
 
+// A matrix whose PATTERN is unsymmetric: each off-diagonal entry is placed in
+// one direction only, so no nonzero has a mirror and patternSymmetry() is ~0.
+// Diagonally dominant, so the values themselves stay easy and any failure is
+// attributable to the pattern rather than to conditioning.
+template <typename Scalar>
+Eigen::SparseMatrix<Scalar> randomUnsymmetricPatternAs(int n, double offDiagProb, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  std::uniform_real_distribution<double> prob(0.0, 1.0);
+  std::uniform_int_distribution<int> coin(0, 1);
+
+  std::vector<Eigen::Triplet<Scalar>> t;
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j)
+      if (prob(rng) < offDiagProb) {
+        // exactly ONE of the two directions -- never both
+        if (coin(rng))
+          t.emplace_back(i, j, Scalar(uni(rng)));
+        else
+          t.emplace_back(j, i, Scalar(uni(rng)));
+      }
+  for (int i = 0; i < n; ++i) t.emplace_back(i, i, Scalar(n + uni(rng)));
+
+  Eigen::SparseMatrix<Scalar> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+inline Eigen::SparseMatrix<double> randomUnsymmetricPattern(int n, double offDiagProb,
+                                                            unsigned seed) {
+  return randomUnsymmetricPatternAs<double>(n, offDiagProb, seed);
+}
+
+// First-order upwind advection-diffusion on a gx-by-gy grid: each cell couples
+// only to its west and south neighbours. Same grid connectivity as laplacian2d
+// but the couplings go one way, so the pattern is strongly unsymmetric while the
+// matrix stays a realistic, well-conditioned PDE discretization -- the case that
+// distinguishes "unsymmetric pattern" from "hard numerics".
+template <typename Scalar>
+Eigen::SparseMatrix<Scalar> upwind2dAs(int gx, int gy) {
+  const int n = gx * gy;
+  std::vector<Eigen::Triplet<Scalar>> t;
+  t.reserve(static_cast<std::size_t>(3 * n));
+  for (int i = 0; i < gx; ++i)
+    for (int j = 0; j < gy; ++j) {
+      const int c = i * gy + j;
+      t.emplace_back(c, c, Scalar(4));
+      if (i > 0) t.emplace_back(c, (i - 1) * gy + j, Scalar(-1));  // west, no east
+      if (j > 0) t.emplace_back(c, i * gy + (j - 1), Scalar(-1));  // south, no north
+    }
+  Eigen::SparseMatrix<Scalar> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+inline Eigen::SparseMatrix<double> upwind2d(int gx, int gy) { return upwind2dAs<double>(gx, gy); }
+
 // ---------------------------------------------------------------------------
 //  Pattern helpers
 // ---------------------------------------------------------------------------
+
+// Fraction of off-diagonal nonzeros of A whose mirror is also present, in [0,1]
+// -- the reference implementation of LeftRightLU::patternSymmetry(), computed
+// the obvious (slow) way from A and A^T.
+template <typename Scalar>
+double patternSymmetry(const Eigen::SparseMatrix<Scalar>& A) {
+  Eigen::SparseMatrix<Scalar> AT = A.transpose();
+  AT.makeCompressed();
+  long long offDiagonal = 0, mirrored = 0;
+  for (Eigen::Index col = 0; col < A.outerSize(); ++col) {
+    for (typename Eigen::SparseMatrix<Scalar>::InnerIterator it(A, col); it; ++it) {
+      if (it.row() == it.col()) continue;
+      ++offDiagonal;
+      for (typename Eigen::SparseMatrix<Scalar>::InnerIterator jt(AT, col); jt; ++jt)
+        if (jt.index() == it.index()) {
+          ++mirrored;
+          break;
+        }
+    }
+  }
+  return offDiagonal ? double(mirrored) / double(offDiagonal) : 1.0;
+}
 
 // True when A(i,j) != 0 <=> A(j,i) != 0 structurally. Compares the column
 // index sets of A and A^T; a genuine structural zero counts as present.
@@ -149,7 +230,8 @@ bool patternIsSymmetric(const Eigen::SparseMatrix<Scalar>& A) {
 // A copy of A whose pattern is symmetric, by inserting an explicit structural
 // zero at (j,i) wherever (i,j) is present but (j,i) is not. This does not change
 // the linear system -- a genuine zero contributes nothing to the sum -- it only
-// gives the solvers the symmetric pattern they require.
+// gives SupernodalLU the symmetric pattern it requires. LeftRightLU symmetrizes
+// internally and takes an unsymmetric pattern directly, so do NOT pad its input.
 template <typename Scalar>
 Eigen::SparseMatrix<Scalar> symmetrizePattern(const Eigen::SparseMatrix<Scalar>& A) {
   std::vector<Eigen::Triplet<Scalar>> t;

@@ -312,10 +312,13 @@ int main(int argc, char** argv) {
     }
 
     // Adding explicit structural zeros (symmetrizePattern) does not change the
-    // operator, so b = A*xTrue works for every solver. SparseLU and PARDISO get
-    // the original (lighter, possibly unsymmetric) A; only SupernodalLU needs a
-    // symmetric pattern, and we build that Asym lazily -- not at all when SNLU
-    // is skipped, which avoids a large needless allocation on e.g. pre2.
+    // operator, so b = A*xTrue works for every solver. SparseLU, PARDISO and
+    // LeftRightLU get the original (lighter, possibly unsymmetric) A; only
+    // SupernodalLU needs a symmetric pattern, and we build that Asym lazily --
+    // not at all when SNLU is skipped, which avoids a large needless allocation
+    // on e.g. pre2. LeftRightLU symmetrizes internally, so handing it Asym would
+    // only make it walk padding entries on every pass over the values; the fill
+    // and the answer are identical either way.
     VectorXd xTrue = VectorXd::Random(A.rows());
     VectorXd b = A * xTrue;
 
@@ -347,7 +350,7 @@ int main(int argc, char** argv) {
 #endif
     Result lrlu;
     if (!runSnlu) lrlu.skipped = true;
-    else lrlu = runLeftRight(Asym, b, xTrue, /*amalgamate=*/true);
+    else lrlu = runLeftRight(A, b, xTrue, /*amalgamate=*/true);
     std::printf(" |");
     printCell(lrlu);
     Result ref = runSparseLU(A, b, xTrue);

@@ -33,6 +33,13 @@ first (`compare_testdata.cpp`'s `symmetrizePattern` shows how); this does not ch
 operator, since a genuine zero contributes nothing to the sum. Cholesky/LDLᵀ are **not**
 implemented (LU only, for now).
 
+> **This restriction applies to `SupernodalLU` only.** The sibling
+> [`LeftRightLU`](#leftrightlu--pardiso-style-sibling-solver) takes an **unsymmetric nonzero
+> pattern** directly and symmetrizes internally, at the one point in the pipeline where it is
+> cheapest — pre-symmetrizing its input instead costs 102x the fill on `gemat11`. If your
+> pattern is unsymmetric, reach for `LeftRightLU`; see [Unsymmetric nonzero
+> patterns](#unsymmetric-nonzero-patterns).
+
 The whole design rests on one decision: **no row interchanges**. Once `analyzePattern()` has
 built the supernode/block structure it never changes again. Tiny or zero pivots are instead
 *bumped* to a threshold (static pivoting) and the resulting error is cleaned up by refinement
@@ -1194,9 +1201,14 @@ replaces only the **numeric core** with PARDISO's two distinctive ideas.
 #include <LeftRightLU.h>
 
 Eigen::LeftRightLU<Eigen::SparseMatrix<double>> solver;
-solver.compute(A);                 // A: general values, SYMMETRIC nonzero pattern
-Eigen::VectorXd x = solver.solve(b);
+solver.compute(A);                 // A: any square matrix -- values AND pattern
+Eigen::VectorXd x = solver.solve(b);   //    may both be unsymmetric
 ```
+
+Unlike `SupernodalLU`, `LeftRightLU` takes an **unsymmetric nonzero pattern** directly, and
+you should *not* pre-symmetrize its input — see [Unsymmetric nonzero
+patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fill on
+`gemat11`.
 
 ### What's different from SupernodalLU
 
@@ -1244,6 +1256,60 @@ counts is **not** a goal: the dynamic scheduler reassociates floating-point upda
 parallel result may differ from the serial one at the ~1e-14 level (the true residual is
 unaffected and refinement cleans up the rest).
 
+### Unsymmetric nonzero patterns
+
+`LeftRightLU` accepts **any square sparse matrix**: unsymmetric values *and* an unsymmetric
+nonzero pattern. Nothing has to be done to `A` first.
+
+The symbolic phase runs on the pattern of `B + Bᵀ`, where `B` is `A` with the matching row
+permutation applied. Because the numeric phase never moves a row or column outside its own
+diagonal block, the fill pattern of `chol(B + Bᵀ)` is a valid superset of the structure of
+both `L` and `U`, so every entry of `A` lands in a slot that already exists. An unsymmetric
+pattern costs **fill, never correctness**. (This is also what PARDISO does for its
+unsymmetric matrix types, `MTYPE=11/13`.)
+
+**Do not pad the pattern with explicit structural zeros.** That was the documented workaround
+for `SupernodalLU`, and on `LeftRightLU` it is not merely redundant — it is actively harmful,
+because *when* you symmetrize decides how much structure you get:
+
+| gemat11 (n=4929) | input nnz | `patternSymmetry()` | `nnzL` | factor time |
+|---|---|---|---|---|
+| raw `A` | 33,185 | 0.81 | **51,728** | **2.6 ms** |
+| `symmetrizePattern(A)` | 66,313 | 0.38 | 5,281,259 | 1421 ms |
+
+Both give a machine-precision residual; the padded input just costs **102x the fill and 546x
+the factorization time**. The reason is ordering: the solver symmetrizes *after* the matching
+row permutation, on `P·A`, while a caller symmetrizing up front does it *before*, on `A` — and
+the pattern `P·(A ∪ Aᵀ)` then gets symmetrized a second time into
+`P·(A ∪ Aᵀ) ∪ (A ∪ Aᵀ)·Pᵀ`, which is far larger than `P·A ∪ Aᵀ·Pᵀ`. On `bayer05` the same
+effect is 8.3x fill / 24x time. Matrices whose pattern is *already* symmetric
+(`sherman1`, `rdb2048_noL`, `dendrimer`) are bit-identical either way — padding only matters
+when there is something to pad.
+
+Practical notes:
+
+- **`patternSymmetry()`** (in `[0,1]`) reports the fraction of off-diagonal nonzeros with a
+  structural mirror, measured on `B` — the graph actually eliminated, i.e. *after* matching.
+  A symmetric-pattern input can therefore still report below 1: matching permutes rows.
+  **`structurallySymmetric()`** is the exact `== 1` case.
+- **Stay on the default `AMDOrdering`.** It minimizes degree in exactly the `A + Aᵀ` graph
+  this factorization eliminates. `COLAMDOrdering` (what `Eigen::SparseLU` defaults to) targets
+  the partial-pivoting `AᵀA` bound, a different objective; measured on a 900-column upwind
+  grid it gives `nnzL` 15,181 against AMD's 13,679. Reach for `MetisOrdering`, not COLAMD,
+  when AMD's fill is too high.
+- A custom ordering functor that returns the **direct** permutation (rather than the inverse,
+  as AMD and METIS do) needs a one-line `left_right_lu::OrderingConvention` specialization;
+  Eigen's own AMD/METIS/COLAMD/Natural functors are all handled already. Getting this
+  direction wrong is invisible in the residual and shows up only as fill.
+- **Structural singularity** — a column whose nonzero rows are all claimed elsewhere — is the
+  failure mode unsymmetric patterns introduce. `matchingIsPerfect()` reports it right after
+  `analyzePattern()`; `solve()` then refuses to call the result a success via
+  `info()`/`solveResidual()`.
+- On a strongly unsymmetric pattern with no good vertex separators, fill can still exceed what
+  a partial-pivoting solver needs by orders of magnitude. `setMaxFactorNonzeros()` turns that
+  into a clean error before any factor memory is touched, and its message now names the
+  pattern symmetry as a contributing cause.
+
 ### Performance notes (honest summary)
 
 Measured 2026-07-14 with `DirectLUSolvers/test/compare_testdata.cpp`, single-threaded
@@ -1251,13 +1317,19 @@ Measured 2026-07-14 with `DirectLUSolvers/test/compare_testdata.cpp`, single-thr
 scheduler's headline advantage, which requires a parallel executor (see
 [Parallel scaling](#parallel-scaling-measured) for the threaded numbers).
 
-- On this project's real-world `testdata/` set, `LeftRightLU` tracks `SupernodalLU`'s
-  factor+solve time closely (both reuse the same analysis pipeline and static-pivoting numeric
-  design — only in-block pivoting and scheduling differ): e.g. gemat11 1573ms vs 1496ms,
-  bayer05 329ms vs 304ms, dendrimer 14.4ms vs 13.5ms. Same story on the large 3D FEM matrices —
-  laoss_1 (251k rows) 3.0s vs SupernodalLU's 3.0s, laoss_2 (100k rows) 0.88s vs 0.86s — both well
-  ahead of `Eigen::SparseLU` there (see the [SupernodalLU performance
+- On **symmetric-pattern** matrices from this project's real-world `testdata/` set,
+  `LeftRightLU` tracks `SupernodalLU`'s factor+solve time closely (both reuse the same analysis
+  pipeline and static-pivoting numeric design — only in-block pivoting and scheduling differ):
+  e.g. dendrimer 14.7ms vs 13.8ms, laoss_3 27.2ms vs 25.9ms. Same story on the large 3D FEM
+  matrices — laoss_1 (251k rows) 3.0s vs SupernodalLU's 3.0s, laoss_2 (100k rows) 0.88s vs
+  0.86s — both well ahead of `Eigen::SparseLU` there (see the [SupernodalLU performance
   notes](#performance-notes-honest-summary) above for the SparseLU/PARDISO comparison).
+- On **unsymmetric-pattern** matrices the two now diverge sharply, because `SupernodalLU` must
+  be handed a pre-symmetrized matrix and `LeftRightLU` symmetrizes internally *after* matching
+  (see [Unsymmetric nonzero patterns](#unsymmetric-nonzero-patterns)): gemat11 **11.5ms vs
+  1491ms**, bayer05 **24.3ms vs 305ms**, setfos_2 269ms vs 292ms. gemat11 and bayer05 are also
+  where `SupernodalLU` loses accuracy outright (bayer05 err 1.7e+00 vs `LeftRightLU`'s
+  1.5e-03), so this is not only a speed difference. Measured 2026-08-14.
 - One measured, mechanistic difference: on a couple of already well-conditioned matrices
   (tomography, YaleB_10NN) `LeftRightLU` lands on a visibly looser — but still safely
   small — residual than `SupernodalLU` (tomography resid 2.2e-12 vs 2.8e-16; YaleB 1.0e-13 vs
@@ -1308,6 +1380,13 @@ ctest --test-dir build -R test_leftright_lu --output-on-failure
 adjoint, all three pivoting modes, the forced column-swap path (matching off + weak diagonal)
 with its solve/transpose/determinant folding, log-determinant, equilibration, honest failure
 reporting, and parallel(dynamic-scheduler)-vs-serial agreement plus a deadlock-stress loop.
+
+An `Unsymmetric nonzero patterns` block covers that input class specifically: accuracy on
+random unsymmetric patterns and on upwind advection grids, `patternSymmetry()` against a
+reference computed from `A` and `Aᵀ`, equality of fill and answer between a raw and a
+pre-symmetrized input, the AMD/COLAMD/Natural ordering conventions pinned by fill (a misread
+permutation is invisible in the residual), structural-singularity reporting, and unsymmetric
+patterns combined with multi-RHS, transpose, determinant and the parallel scheduler.
 
 ## License
 
