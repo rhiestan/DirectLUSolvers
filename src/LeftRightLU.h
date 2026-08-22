@@ -457,6 +457,13 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   const std::vector<RealScalar>& rowScaling() const { return m_rowScale; }
   const std::vector<RealScalar>& colScaling() const { return m_colScale; }
 
+  /** Parallelize INSIDE a supernode once the assembly DAG has run out of
+   *  independent supernodes (the root-separator tail). On by default; it only
+   *  ever engages when the DAG cannot fill the lanes, so turning it off simply
+   *  leaves the tail serial. See the tail sweep in factorize(). */
+  void setIntraSupernodeParallelism(bool on) { m_intraParallel = on; }
+  bool intraSupernodeParallelism() const { return m_intraParallel; }
+
   /** Access the parallel-execution backend. Its concurrency() sets the number of
    *  dynamic-scheduler workers used by factorize(). */
   Executor& executor() { return m_executor; }
@@ -650,6 +657,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_equilibrate = true;
     m_matchingMethod = supernodal_lu::MatchingMethod::Transversal;
     m_pivoting = left_right_lu::Pivoting::Complete;
+    m_intraParallel = true;
     m_matchingIsPerfect = true;
     m_patternSymmetry = RealScalar(1);
     m_structurallySymmetric = true;
@@ -704,11 +712,85 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   // gather). Identical block math to SupernodalLU::applyUpdate.
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex facingBlock);
 
+  // Gather ALL of a target's updates with the panel work chunked across the pool
+  // (the intra-supernode counterpart of the applyUpdate loop). Every element
+  // still accumulates its updates in SOURCE order, but the result is not
+  // bit-identical to the serial gather: a chunk is a differently-shaped GEMM, so
+  // Eigen may pick a different kernel and sum each dot product in a different
+  // order. See the note on parallelChunks below.
+  void applyAllUpdatesChunked(StorageIndex target);
+
+  // Chunk-extent policy for splitting a panel op across the pool. Identical to
+  // SupernodalLU's: kIntraChunkSize is a CEILING, kMinIntraChunkSize a floor, and
+  // the extent actually used aims at one chunk per lane so that tall root panels
+  // can fill the machine rather than being capped at ceil(total/128) chunks.
+  static constexpr Index kIntraChunkSize = 128;
+  static constexpr Index kMinIntraChunkSize = 32;
+
+  // How far from "wide enough to fill the lanes" a level may be and still be
+  // carved into the tail: it is taken when size * kTailLevelSlack <= lanes.
+  //
+  // Carving is a TRADE. The level loses its inter-supernode parallelism, and --
+  // because this scheduler is barrier-free -- it also loses the overlap it had
+  // with neighbouring levels, since the tail sweep is a hard phase boundary. In
+  // exchange each of its supernodes gets the whole pool applied inside it.
+  //
+  // Measured on lap2d_300^2 and lap3d_30^3, factorize seconds, clang/AVX2:
+  //
+  //   slack   lap3d t2/t4/t8        lap2d t2/t4/t8
+  //     8     0.863 0.828 0.421     0.166 0.121 0.107
+  //     4     0.866 0.516 0.437     0.163 0.122 0.106
+  //     2     0.660 0.464 0.477     0.162 0.119 0.113
+  //     1     0.627 0.452 0.440     0.166 0.129 0.125
+  //
+  // 4 is the compromise: it matches 8 on the wide 2D tree at every thread count
+  // while recovering the 4-thread 3D case (0.83 -> 0.52), where 8 never fires at
+  // all because size*8 <= lanes needs 8 lanes before a single-supernode level
+  // qualifies. Going lower keeps helping the 3D tail but starts costing the 2D
+  // tree the overlap described above, which is what 1 shows.
+  static constexpr Index kTailLevelSlack = 4;
+
+  Index intraChunkRows(Index total) const {
+    const Index lanes = static_cast<Index>(m_executor.concurrency());
+    if (lanes <= 1 || total <= 0) return numext::maxi(Index(1), total);
+    const Index perLane = (total + lanes - 1) / lanes;
+    return numext::maxi(kMinIntraChunkSize, numext::mini(kIntraChunkSize, perLane));
+  }
+
+  // Split [0, total) into contiguous chunks and dispatch body(start, length) for
+  // each. Chunks cover disjoint output regions and leave each element's
+  // accumulation order unchanged, so the result matches body(0, total) UP TO
+  // Eigen choosing a different GEMM kernel for a differently-shaped block.
+  //
+  // That last clause is not a formality. Measured on this project's corpus, the
+  // tail sweep changes the computed solution on ill-conditioned members
+  // (Bai/cryg10000 by 0.88 relative, at an unchanged residual of 5e-15): the
+  // factorization is exactly as good, but it is a DIFFERENT one, and on a matrix
+  // that ill-conditioned any perturbation moves x a long way. Fill is unaffected.
+  // Callers needing run-to-run reproducibility should use
+  // setIntraSupernodeParallelism(false), which restores the previous behaviour.
+  // Runs inline when only one chunk remains.
+  template <typename F>
+  void parallelChunks(Index total, Index chunkRows, const F& body) const {
+    const Index chunkCount = (total + chunkRows - 1) / chunkRows;
+    if (chunkCount <= 1) {
+      if (total > 0) body(Index(0), total);
+      return;
+    }
+    m_executor.parallelFor(Index(0), chunkCount, [&](Index c) {
+      const Index start = c * chunkRows;
+      body(start, numext::mini(chunkRows, total - start));
+    });
+  }
+
   // factor one supernode: gather all its sources' updates (left-looking), do the
   // pivoted LU of its diagonal block, then solve its off-diagonal panels. Writes
-  // only this supernode's own panels.
+  // only this supernode's own panels. With intraParallel the gather GEMMs and the
+  // panel TRSMs are chunked across the pool instead -- used only by the TAIL
+  // sweep, where the DAG has run out of independent supernodes and the executor's
+  // fork-join pool is therefore free.
   void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, Index& replacedCount,
-                          bool& singular, int& sign);
+                          bool& singular, int& sign, bool intraParallel = false);
 
   // Unblocked LU of a dense diagonal block with the selected in-block pivoting
   // (none / row-only partial / row+col complete) and static-pivot fallback. On
@@ -781,7 +863,9 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   std::vector<StorageIndex> m_supernodeOfColumn;
   std::vector<std::vector<UpdateSource>> m_updateSources;  // per target: its sources
   std::vector<std::vector<StorageIndex>> m_consumers;      // per source: its targets
-  std::vector<std::vector<StorageIndex>> m_levelGroups;    // diagnostics only
+  std::vector<std::vector<StorageIndex>> m_levelGroups;    // also drives the tail sweep
+
+  bool m_intraParallel;  // parallelize inside supernodes once the DAG runs dry
 
   Executor m_executor;
 
@@ -1045,9 +1129,17 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::computeSupernodePartition(
       const std::vector<StorageIndex>& cs = columnStructure[c];
       auto childBeyond = std::upper_bound(cs.begin(), cs.end(), j);
       if (childBeyond == cs.end()) continue;
-      scratch2.clear();
-      scratch2.reserve(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
-      std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), std::back_inserter(scratch2));
+      // Write into a PRE-SIZED buffer rather than through back_inserter. The
+      // union can never exceed the sum of its inputs, so sizing scratch2 to
+      // that bound up front lets set_union store through a contiguous iterator
+      // -- a plain pointer write per element -- instead of a push_back whose
+      // capacity check on every element also defeats any bulk copy of the tail
+      // that remains when one input runs out. Same result, and this is the
+      // single hottest line in analyzePattern.
+      scratch2.resize(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
+      const auto unionEnd =
+          std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), scratch2.begin());
+      scratch2.resize(static_cast<std::size_t>(unionEnd - scratch2.begin()));
       scratch.swap(scratch2);
     }
     columnStructure[j].clear();
@@ -1321,34 +1413,138 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex s
   StorageIndex lastFacing = firstFacingBlock;
   while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
 
-  for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
-    const RowBlock& colBlock = m_rowBlocks[cb];
-    const StorageIndex columnCount = colBlock.height();
-    const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
-    const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);
-    const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);
-
-    for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);
-      if (rb < lastFacing) {
-        const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
+  // ROW BLOCK OUTER, COLUMN BLOCK INNER -- see the matching note in
+  // SupernodalLU::applyUpdate. Each (rb, cb) pair writes its own disjoint
+  // destination sub-block, so the nesting order does not affect the result;
+  // putting rb outside hoists rowPanelPosition()'s binary search out of the
+  // cb loop, where it was otherwise repeated once per facing column block.
+  for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);
+    const bool facingRows = (rb < lastFacing);
+    const StorageIndex destRow = facingRows ? StorageIndex(rowBlock.firstRow - targetFirstColumn)
+                                            : rowPanelPosition(target, rowBlock.firstRow);
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);
+      if (facingRows)
         targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      } else {
-        const StorageIndex destRow = rowPanelPosition(target, rowBlock.firstRow);
+      else
         targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      }
     }
+  }
 
-    for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
-      const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);
+  for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
+    const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);
       targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
     }
   }
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(StorageIndex target) {
+  const std::vector<UpdateSource>& sources = m_updateSources[target];
+  if (sources.empty()) return;
+  const StorageIndex targetFirstColumn = m_supernodes[target].firstColumn;
+  const Index offDiag = static_cast<Index>(m_supernodes[target].offDiagonalRowCount);
+  StridedPanel targetDiag = diagBlock(target);
+  StridedPanel targetLower = lowerPanel(target);
+  ContiguousPanel targetUpper = upperPanel(target);
+
+  // Pass 1 (serial): contributions to the target's diagonal block. These are
+  // small (<= width x width per source) and touch elements disjoint from the
+  // off-diagonal panels, so ordering between passes is free per element.
+  for (const UpdateSource& u : sources) {
+    const Supernode& src = m_supernodes[u.sourceSupernode];
+    const StorageIndex wSrc = src.width();
+    const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
+    const StridedPanel srcLower = lowerPanel(u.sourceSupernode);
+    const ContiguousPanel srcUpper = upperPanel(u.sourceSupernode);
+    StorageIndex lastFacing = u.facingRowBlock;
+    while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
+    for (StorageIndex rb = u.facingRowBlock; rb < lastFacing; ++rb) {
+      const RowBlock& rowBlock = m_rowBlocks[rb];
+      const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
+      for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
+        const RowBlock& colBlock = m_rowBlocks[cb];
+        targetDiag.block(destRow, colBlock.firstRow - targetFirstColumn, rowBlock.height(),
+                         colBlock.height())
+            .noalias() -= srcLower.block(rowBlock.panelOffset, 0, rowBlock.height(), wSrc) *
+                          srcUpper.block(0, colBlock.panelOffset, wSrc, colBlock.height());
+      }
+    }
+  }
+
+  // Pass 2: L off-diagonal panel, chunked by disjoint target-panel ROW ranges.
+  // Each chunk walks the sources in order and applies the slice of every
+  // below-facing GEMM that lands in its rows, so each element still accumulates
+  // its updates in source order exactly as the serial gather does.
+  parallelChunks(offDiag, intraChunkRows(offDiag), [&](Index chunkStart, Index chunkLen) {
+    const Index chunkEnd = chunkStart + chunkLen;
+    for (const UpdateSource& u : sources) {
+      const Supernode& src = m_supernodes[u.sourceSupernode];
+      const StorageIndex wSrc = src.width();
+      const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
+      const StridedPanel srcLower = lowerPanel(u.sourceSupernode);
+      const ContiguousPanel srcUpper = upperPanel(u.sourceSupernode);
+      StorageIndex lastFacing = u.facingRowBlock;
+      while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
+      for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+        const RowBlock& rowBlock = m_rowBlocks[rb];
+        const Index destRow = static_cast<Index>(rowPanelPosition(target, rowBlock.firstRow));
+        if (destRow >= chunkEnd) break;  // panel positions increase with rb
+        const Index a = numext::maxi(destRow, chunkStart);
+        const Index b = numext::mini(destRow + static_cast<Index>(rowBlock.height()), chunkEnd);
+        if (a >= b) continue;
+        for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
+          const RowBlock& colBlock = m_rowBlocks[cb];
+          targetLower.block(a, colBlock.firstRow - targetFirstColumn, b - a, colBlock.height())
+              .noalias() -= srcLower.block(rowBlock.panelOffset + (a - destRow), 0, b - a, wSrc) *
+                            srcUpper.block(0, colBlock.panelOffset, wSrc, colBlock.height());
+        }
+      }
+    }
+  });
+
+  // Pass 3: U off-diagonal panel, chunked by disjoint target-panel COLUMN ranges
+  // (same slicing, transposed roles).
+  parallelChunks(offDiag, intraChunkRows(offDiag), [&](Index chunkStart, Index chunkLen) {
+    const Index chunkEnd = chunkStart + chunkLen;
+    for (const UpdateSource& u : sources) {
+      const Supernode& src = m_supernodes[u.sourceSupernode];
+      const StorageIndex wSrc = src.width();
+      const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
+      const StridedPanel srcLower = lowerPanel(u.sourceSupernode);
+      const ContiguousPanel srcUpper = upperPanel(u.sourceSupernode);
+      StorageIndex lastFacing = u.facingRowBlock;
+      while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
+      for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+        const RowBlock& rowBlock = m_rowBlocks[rb];
+        const Index destCol = static_cast<Index>(rowPanelPosition(target, rowBlock.firstRow));
+        if (destCol >= chunkEnd) break;  // panel positions increase with rb
+        const Index a = numext::maxi(destCol, chunkStart);
+        const Index b = numext::mini(destCol + static_cast<Index>(rowBlock.height()), chunkEnd);
+        if (a >= b) continue;
+        for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
+          const RowBlock& colBlock = m_rowBlocks[cb];
+          targetUpper.block(colBlock.firstRow - targetFirstColumn, a, colBlock.height(), b - a)
+              .noalias() -= srcLower.block(colBlock.panelOffset, 0, colBlock.height(), wSrc) *
+                            srcUpper.block(0, rowBlock.panelOffset + (a - destCol), wSrc, b - a);
+        }
+      }
+    }
+  });
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
@@ -1425,15 +1621,36 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
     StorageIndex pr = k, pc = k;
     if (colPivot) {
       // complete pivoting: largest-magnitude entry of the whole trailing block.
+      //
+      // TWO PASSES, deliberately. maxCoeff(&index) has to track which lane holds
+      // the running maximum, costing a compare plus a select and a horizontal
+      // "any lane won?" test per packet on top of the max itself; plain
+      // maxCoeff() is a bare vectorized reduction. Only the WINNING column's row
+      // index is ever used, so the indexed form is needed once per elimination
+      // step rather than once per trailing column. Profiling put this search at
+      // roughly 44% of factorize() on the benchmark corpus -- it is what made
+      // LeftRightLU slower than SupernodalLU on pivot-heavy matrices.
+      //
+      // The pivot CHOICE is unchanged: `best` still starts at the diagonal and
+      // still only yields to a strictly larger magnitude, so ties keep going to
+      // the earliest column-major position exactly as before, and bestCol is the
+      // same column the one-pass loop would have settled on.
       RealScalar best = numext::abs(diag(k, k));
+      StorageIndex bestCol = 0;
+      bool found = false;
       for (StorageIndex jj = k; jj < w; ++jj) {
-        Index rel = 0;
-        const RealScalar m = diag.col(jj).segment(k, w - k).cwiseAbs().maxCoeff(&rel);
+        const RealScalar m = diag.col(jj).segment(k, w - k).cwiseAbs().maxCoeff();
         if (m > best) {
           best = m;
-          pr = k + static_cast<StorageIndex>(rel);
-          pc = jj;
+          bestCol = jj;
+          found = true;
         }
+      }
+      if (found) {
+        Index rel = 0;
+        diag.col(bestCol).segment(k, w - k).cwiseAbs().maxCoeff(&rel);
+        pr = k + static_cast<StorageIndex>(rel);
+        pc = bestCol;
       }
     } else if (rowPivot) {
       // partial pivoting: largest-magnitude entry of column k, rows [k,w).
@@ -1481,10 +1698,17 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 void LeftRightLU<MatrixType, OrderingType, Executor>::factorizeSupernode(StorageIndex s,
                                                                          const RealScalar& staticPivot,
                                                                          Index& replacedCount,
-                                                                         bool& singular, int& sign) {
+                                                                         bool& singular, int& sign,
+                                                                         bool intraParallel) {
   // LEFT-LOOKING gather: pull contributions from all (already-finished) sources.
-  for (const UpdateSource& source : m_updateSources[s])
-    applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
+  // Both paths accumulate each element's updates in source order; the chunked
+  // path spreads the panel GEMMs across the pool, which reshapes them and so is
+  // equal only up to floating-point reassociation (see parallelChunks).
+  if (intraParallel)
+    applyAllUpdatesChunked(s);
+  else
+    for (const UpdateSource& source : m_updateSources[s])
+      applyUpdate(source.sourceSupernode, s, source.facingRowBlock);
 
   StridedPanel diag = diagBlock(s);
 
@@ -1517,8 +1741,24 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storage
       for (StorageIndex k = 0; k < w; ++k) permuted.col(k) = lower.col(colPerm[k]);
       lower = permuted;
     }
-    diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(lower);
-    diag.template triangularView<UnitLower>().solveInPlace(upper);
+    // L21 := L21 U11^{-1}: every ROW of the panel is an independent right-solve.
+    // U12 := L11^{-1} U12: every COLUMN is independent. So both split cleanly.
+    const Index offDiag = static_cast<Index>(m_supernodes[s].offDiagonalRowCount);
+    auto lowerSolve = [&](Index start, Index len) {
+      auto chunk = lower.middleRows(start, len);
+      diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(chunk);
+    };
+    auto upperSolve = [&](Index start, Index len) {
+      auto chunk = upper.middleCols(start, len);
+      diag.template triangularView<UnitLower>().solveInPlace(chunk);
+    };
+    if (intraParallel) {
+      parallelChunks(offDiag, intraChunkRows(offDiag), lowerSolve);
+      parallelChunks(offDiag, intraChunkRows(offDiag), upperSolve);
+    } else {
+      lowerSolve(Index(0), offDiag);
+      upperSolve(Index(0), offDiag);
+    }
   }
 }
 
@@ -1671,6 +1911,45 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     // a worker's freshly-readied children land on the shared stack where any
     // other worker takes them immediately, so a subtree's data never stays on
     // one core.
+    // THE TAIL. Near the root the assembly DAG narrows to a chain of separator
+    // supernodes -- few nodes, each enormous -- and a scheduler that only
+    // parallelizes ACROSS supernodes has nothing left to hand out: measured on
+    // lap3d_30^3 at 8 threads, effective CPU utilization was 13.7% (1.1 of 8
+    // cores) with the idle time being starvation, not lock contention. Those
+    // levels are therefore carved out of the DAG phase and swept afterwards
+    // with the pool applied INSIDE each supernode instead.
+    //
+    // The split is necessary because the executor's parallelFor is fork-join and
+    // NOT nestable: while the DAG workers are running, all lanes are already
+    // inside one parallelFor, so no supernode can dispatch panel work of its
+    // own. Ending the parallel region first is what frees the pool.
+    //
+    // Level 0 is the leaves and the last group is the root, so the tail is the
+    // suffix of m_levelGroups that stays too narrow to fill the lanes. The
+    // `size * 8 <= lanes` test is SupernodalLU's, and for the same measured
+    // reason: wider levels keep the outer per-supernode parallelism, which beats
+    // chunking for moderate panels.
+    std::vector<char> isTail(static_cast<std::size_t>(supernodeNbr), 0);
+    StorageIndex tailCount = 0;
+    if (m_intraParallel && !m_levelGroups.empty()) {
+      for (std::size_t L = m_levelGroups.size(); L-- > 0;) {
+        const std::vector<StorageIndex>& g = m_levelGroups[L];
+        // A level of ONE supernode always qualifies, whatever the slack: the DAG
+        // phase would run it on one lane with the rest idle, so there is no
+        // inter-supernode parallelism to give up. Without this the slack test
+        // needs size <= lanes/4 and so never fires at 2 lanes at all -- the same
+        // gap SupernodalLU had below 8 lanes.
+        if (g.size() != 1 &&
+            static_cast<Index>(g.size()) * kTailLevelSlack > static_cast<Index>(lanes))
+          break;
+        for (StorageIndex s : g) {
+          isTail[static_cast<std::size_t>(s)] = 1;
+          ++tailCount;
+        }
+      }
+    }
+    const StorageIndex dagCount = supernodeNbr - tailCount;
+
     std::vector<std::atomic<int>> remaining(static_cast<std::size_t>(supernodeNbr));
     for (StorageIndex s = 0; s < supernodeNbr; ++s)
       remaining[s].store(static_cast<int>(m_updateSources[s].size()), std::memory_order_relaxed);
@@ -1688,7 +1967,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     {
       std::size_t lane = 0;
       for (StorageIndex s = 0; s < supernodeNbr; ++s)
-        if (remaining[s].load(std::memory_order_relaxed) == 0) {
+        if (!isTail[s] && remaining[s].load(std::memory_order_relaxed) == 0) {
           queues[lane].items.push_back(s);
           lane = (lane + 1) % static_cast<std::size_t>(lanes);
         }
@@ -1745,12 +2024,12 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
         if (s < 0) {
           // Nothing anywhere right now. The DAG may still produce more, so this
           // is not a termination condition -- only the completed count is.
-          if (completed.load(std::memory_order_acquire) == supernodeNbr) return;
+          if (completed.load(std::memory_order_acquire) == dagCount) return;
           sleepers.fetch_add(1, std::memory_order_release);
           {
             std::unique_lock<std::mutex> lk(idleMutex);
             idleCv.wait_for(lk, std::chrono::microseconds(200), [&] {
-              return completed.load(std::memory_order_acquire) == supernodeNbr ||
+              return completed.load(std::memory_order_acquire) == dagCount ||
                      failed.load(std::memory_order_acquire);
             });
           }
@@ -1774,13 +2053,42 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
           if (remaining[t].fetch_sub(1, std::memory_order_acq_rel) == 1) newReady.push_back(t);
         const StorageIndex done = completed.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-        for (StorageIndex t : newReady) pushLocal(lane, t);
-        if (done == supernodeNbr) idleCv.notify_all();  // wake everyone to exit
+        // Tail supernodes are deliberately NOT enqueued: the post-DAG sweep
+        // below takes them, with the pool free to work inside each one.
+        for (StorageIndex t : newReady)
+          if (!isTail[t]) pushLocal(lane, t);
+        if (done == dagCount) idleCv.notify_all();  // wake everyone to exit
       }
     };
     m_executor.parallelFor(Index(0), static_cast<Index>(lanes), worker);
 
     if (failed.load(std::memory_order_acquire)) singular = true;
+
+    // TAIL SWEEP. The parallel region has ended, so the pool is idle and
+    // available again. Supernode ids are in postorder, so ascending id order is
+    // a topological order: every source of a tail supernode -- whether it was
+    // factored in the DAG phase or is an earlier member of the tail -- is
+    // already done by the time we reach it.
+    if (!singular && tailCount > 0) {
+      for (StorageIndex s = 0; s < supernodeNbr; ++s) {
+        if (!isTail[s]) continue;
+        // Chunking is decided PER SUPERNODE, not per level: the very last
+        // supernode is the root and has NO off-diagonal rows at all, so there is
+        // nothing there to split, while the separator supernodes just below it
+        // carry the tall panels this whole path exists for. Testing per level
+        // (and giving up at the first level that fails) would let the root veto
+        // the entire tail.
+        const bool chunk =
+            static_cast<Index>(m_supernodes[s].offDiagonalRowCount) >= 2 * kMinIntraChunkSize;
+        bool localSingular = false;
+        factorizeSupernode(s, staticPivot, replacedPerSupernode[s], localSingular,
+                           signPerSupernode[s], chunk);
+        if (localSingular) {
+          singular = true;
+          break;
+        }
+      }
+    }
   }
 
   m_replacedPivots = 0;

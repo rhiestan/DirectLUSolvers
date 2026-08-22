@@ -649,6 +649,13 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // the target's update sources, so splitting further costs more than it buys.
   static constexpr Index kMinIntraChunkSize = 32;
 
+  // How far from "wide enough to fill the lanes" a MULTI-supernode level may be
+  // and still switch to intra-supernode parallelism: it does when
+  // size * kIntraLevelSlack <= lanes. A level of ONE supernode is handled
+  // separately and unconditionally -- see the level loop in factorize().
+  // The counterpart of LeftRightLU::kTailLevelSlack.
+  static constexpr Index kIntraLevelSlack = 8;
+
   // Chunk extent to use when splitting `total` rows/columns across the pool.
   //
   // Aiming for one chunk per lane is what keeps intra-supernode parallelism
@@ -1050,9 +1057,17 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodePartition
       const std::vector<StorageIndex>& cs = columnStructure[c];
       auto childBeyond = std::upper_bound(cs.begin(), cs.end(), j);
       if (childBeyond == cs.end()) continue;  // nothing from this child survives past j
-      scratch2.clear();
-      scratch2.reserve(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
-      std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), std::back_inserter(scratch2));
+      // Write into a PRE-SIZED buffer rather than through back_inserter. The
+      // union can never exceed the sum of its inputs, so sizing scratch2 to
+      // that bound up front lets set_union store through a contiguous iterator
+      // -- a plain pointer write per element -- instead of a push_back whose
+      // capacity check on every element also defeats any bulk copy of the tail
+      // that remains when one input runs out. Same result, and this is the
+      // single hottest line in analyzePattern.
+      scratch2.resize(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
+      const auto unionEnd =
+          std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), scratch2.begin());
+      scratch2.resize(static_cast<std::size_t>(unionEnd - scratch2.begin()));
       scratch.swap(scratch2);
     }
     columnStructure[j].clear();
@@ -1355,36 +1370,48 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
   StorageIndex lastFacing = firstFacingBlock;
   while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
 
-  // Each facing block contributes a contiguous set of the target's columns.
-  for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
-    const RowBlock& colBlock = m_rowBlocks[cb];
-    const StorageIndex columnCount = colBlock.height();
-    const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
-    const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);  // wSrc x cc
-    const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);   // cc x wSrc
+  // ROW BLOCK OUTER, COLUMN BLOCK INNER -- deliberately. The destination of a
+  // GEMM is (rb, cb)-disjoint: rb picks the target rows, cb the target columns,
+  // so every (rb, cb) pair writes its own sub-block and the two loops may be
+  // nested either way with bit-identical results. Nesting rb outside lets
+  // rowPanelPosition() -- a binary search over the source's row blocks, and
+  // dependent on rb alone -- be hoisted out of the cb loop, instead of being
+  // repeated once per facing column block. On the benchmark corpus that search
+  // was the largest non-BLAS cost in factorize().
 
-    // L-side: every source block from the first facing block onward contributes
-    // to these target columns (diagonal rows if facing, lower panel if below).
-    for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);  // rc x wSrc
-      if (rb < lastFacing) {  // facing rows -> target diagonal block
-        const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
+  // L-side: every source block from the first facing block onward contributes
+  // to the facing target columns (diagonal rows if facing, lower panel if below).
+  for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);  // rc x wSrc
+    const bool facingRows = (rb < lastFacing);
+    const StorageIndex destRow = facingRows ? StorageIndex(rowBlock.firstRow - targetFirstColumn)
+                                            : rowPanelPosition(target, rowBlock.firstRow);
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);  // wSrc x cc
+      if (facingRows)  // facing rows -> target diagonal block
         targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      } else {  // below rows -> target lower panel
-        const StorageIndex destRow = rowPanelPosition(target, rowBlock.firstRow);
+      else  // below rows -> target lower panel
         targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      }
     }
+  }
 
-    // U-side: only source blocks below the facing range contribute to the
-    // target's upper panel (its off-diagonal columns).
-    for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
-      const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);  // wSrc x rc
+  // U-side: only source blocks below the facing range contribute to the
+  // target's upper panel (its off-diagonal columns).
+  for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
+    const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);  // wSrc x rc
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);  // cc x wSrc
       targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
     }
   }
@@ -1803,7 +1830,35 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     // per-supernode parallelism (switching them REGRESSES — moderate panels
     // chunk poorly and dispatch overhead eats the gain), and levels whose panels
     // are all too short to chunk stay outer as well.
-    bool innerMode = m_intraParallel && lanes > 1 && groupSize * 8 <= lanes;
+    //
+    // A LEVEL OF ONE SUPERNODE ALWAYS QUALIFIES, regardless of the slack. Outer
+    // mode there runs one supernode on one lane and leaves every other lane
+    // idle, so there is no inter-supernode parallelism to lose and the only
+    // question left is whether the panels are tall enough to chunk -- which is
+    // exactly what the guard below already decides. The slack test alone never
+    // reached that case below 8 lanes (it needs size <= lanes/8), so 2- and
+    // 4-thread runs got NO intra-supernode parallelism at all, precisely where
+    // the single-supernode root-separator levels cost the most.
+    //
+    // factorize seconds, clang/AVX2, best of 3 (A/B INTERLEAVED -- see below):
+    //
+    //             lap3d_30^3  t2     t4     t8      lap2d_300^2  t2     t4     t8
+    //   slack only            0.817  0.756  0.392                0.150  0.121  0.109
+    //   + size==1             0.581  0.419  0.380                0.145  0.111  0.111
+    //                         1.41x  1.80x  1.03x                1.03x  1.09x  0.98x
+    //
+    // t8 is unchanged because size*8 <= 8 already admitted size==1 there; the
+    // gain is entirely the 2- and 4-lane cases the old test could not reach.
+    //
+    // MEASURE THIS INTERLEAVED IF YOU RETUNE IT. This is a 15W mobile part, and
+    // running one configuration to completion and then the other put thermal
+    // drift squarely on the parameter: identical builds of lap2d/t2 measured
+    // 0.143s and 0.377s in two sequential passes, and lap3d/t8 swung 0.382s to
+    // 0.852s. Alternating the two binaries run by run brought the within-arm
+    // spread down to 2-5%, which is where the table above comes from. The
+    // sequential numbers were worthless and nearly bought a wrong conclusion.
+    bool innerMode = m_intraParallel && lanes > 1 &&
+                     (groupSize == 1 || groupSize * kIntraLevelSlack <= lanes);
     if (innerMode) {
       StorageIndex maxOffDiag = 0;
       for (StorageIndex s : group)
