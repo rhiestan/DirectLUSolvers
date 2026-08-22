@@ -649,6 +649,13 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // the target's update sources, so splitting further costs more than it buys.
   static constexpr Index kMinIntraChunkSize = 32;
 
+  // How far from "wide enough to fill the lanes" a MULTI-supernode level may be
+  // and still switch to intra-supernode parallelism: it does when
+  // size * kIntraLevelSlack <= lanes. A level of ONE supernode is handled
+  // separately and unconditionally -- see the level loop in factorize().
+  // The counterpart of LeftRightLU::kTailLevelSlack.
+  static constexpr Index kIntraLevelSlack = 8;
+
   // Chunk extent to use when splitting `total` rows/columns across the pool.
   //
   // Aiming for one chunk per lane is what keeps intra-supernode parallelism
@@ -1823,7 +1830,35 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     // per-supernode parallelism (switching them REGRESSES — moderate panels
     // chunk poorly and dispatch overhead eats the gain), and levels whose panels
     // are all too short to chunk stay outer as well.
-    bool innerMode = m_intraParallel && lanes > 1 && groupSize * 8 <= lanes;
+    //
+    // A LEVEL OF ONE SUPERNODE ALWAYS QUALIFIES, regardless of the slack. Outer
+    // mode there runs one supernode on one lane and leaves every other lane
+    // idle, so there is no inter-supernode parallelism to lose and the only
+    // question left is whether the panels are tall enough to chunk -- which is
+    // exactly what the guard below already decides. The slack test alone never
+    // reached that case below 8 lanes (it needs size <= lanes/8), so 2- and
+    // 4-thread runs got NO intra-supernode parallelism at all, precisely where
+    // the single-supernode root-separator levels cost the most.
+    //
+    // factorize seconds, clang/AVX2, best of 3 (A/B INTERLEAVED -- see below):
+    //
+    //             lap3d_30^3  t2     t4     t8      lap2d_300^2  t2     t4     t8
+    //   slack only            0.817  0.756  0.392                0.150  0.121  0.109
+    //   + size==1             0.581  0.419  0.380                0.145  0.111  0.111
+    //                         1.41x  1.80x  1.03x                1.03x  1.09x  0.98x
+    //
+    // t8 is unchanged because size*8 <= 8 already admitted size==1 there; the
+    // gain is entirely the 2- and 4-lane cases the old test could not reach.
+    //
+    // MEASURE THIS INTERLEAVED IF YOU RETUNE IT. This is a 15W mobile part, and
+    // running one configuration to completion and then the other put thermal
+    // drift squarely on the parameter: identical builds of lap2d/t2 measured
+    // 0.143s and 0.377s in two sequential passes, and lap3d/t8 swung 0.382s to
+    // 0.852s. Alternating the two binaries run by run brought the within-arm
+    // spread down to 2-5%, which is where the table above comes from. The
+    // sequential numbers were worthless and nearly bought a wrong conclusion.
+    bool innerMode = m_intraParallel && lanes > 1 &&
+                     (groupSize == 1 || groupSize * kIntraLevelSlack <= lanes);
     if (innerMode) {
       StorageIndex maxOffDiag = 0;
       for (StorageIndex s : group)
