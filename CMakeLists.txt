@@ -308,6 +308,15 @@ if(DLU_TBB_BIN)
 endif()
 add_dlu_test(test_edge_cases   SOURCE test/test_edge_cases.cpp   LABELS "quick;correctness")
 
+# Serial-vs-parallel consistency for both solvers' intra-supernode parallelism.
+# Registered twice: --quick (synthetic matrices only, seconds) joins the "quick"
+# set so every build exercises the chunked panel paths, while the bare form adds
+# the SuiteSparse corpus and is left to the on-demand runs.
+add_dlu_test(test_parallel_consistency SOURCE test/test_parallel_consistency.cpp
+             ARGS --quick LABELS "quick;correctness;parallel")
+add_dlu_test_variant(test_parallel_consistency_corpus TARGET test_parallel_consistency
+                     LABELS "suitesparse;correctness;parallel")
+
 add_dlu_test(test_suitesparse SOURCE test/test_suitesparse.cpp
              LABELS "suitesparse;correctness")
 # `--tier large` deliberately omits pre2: Eigen::SparseLU alone runs for minutes
