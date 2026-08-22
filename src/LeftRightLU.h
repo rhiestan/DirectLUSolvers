@@ -1835,7 +1835,14 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     if (m_intraParallel && !m_levelGroups.empty()) {
       for (std::size_t L = m_levelGroups.size(); L-- > 0;) {
         const std::vector<StorageIndex>& g = m_levelGroups[L];
-        if (static_cast<Index>(g.size()) * kTailLevelSlack > static_cast<Index>(lanes)) break;
+        // A level of ONE supernode always qualifies, whatever the slack: the DAG
+        // phase would run it on one lane with the rest idle, so there is no
+        // inter-supernode parallelism to give up. Without this the slack test
+        // needs size <= lanes/4 and so never fires at 2 lanes at all -- the same
+        // gap SupernodalLU had below 8 lanes.
+        if (g.size() != 1 &&
+            static_cast<Index>(g.size()) * kTailLevelSlack > static_cast<Index>(lanes))
+          break;
         for (StorageIndex s : g) {
           isTail[static_cast<std::size_t>(s)] = 1;
           ++tailCount;
