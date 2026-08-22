@@ -96,6 +96,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
 | `test/bench_parallel.cpp` | Thread-count scaling sweep with per-phase timing (analyze / factor / solve), per mechanism. See [Parallel scaling](#parallel-scaling-measured). |
 | `test/bench_ceiling.cpp` | What the *machine* can deliver, via independent concurrent factorizations — the upper bound any scheduler could reach. See [The machine ceiling](#the-machine-ceiling). |
+| `test/bench_solvers.cpp` | Per-matrix solver/**ordering** shootout: warm-up, best-of-N, per-phase timing, against `Eigen::SparseLU` and optionally MKL PARDISO. See [Choosing a configuration for one matrix](#choosing-a-configuration-for-one-matrix). |
 | `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
@@ -819,7 +820,9 @@ cmake -S . -B build -G Ninja -DDLU_WITH_METIS=ON -DDLU_WITH_PARDISO=ON
 
 `DLU_EIGEN_DIR`, `DLU_TESTDATA_DIR`, `DLU_METIS_DIR` and `DLU_MKL_DIR` default
 to this project's layout (siblings of `DirectLUSolvers/`); override them if
-yours differs. **An in-tree Eigen is preferred over an installed one on
+yours differs. On Windows the METIS and MKL builds also need `tbb12.dll` /
+`mkl_rt.dll` at *run* time, which CTest gets handed automatically — you only
+need `<mkl root>/bin` on your own `PATH` when running those binaries by hand. **An in-tree Eigen is preferred over an installed one on
 purpose** — `find_package(Eigen3)` resolves against the user's CMake package
 registry, which is frequently an unrelated version, and the fill baselines below
 were recorded against the Eigen that ships beside these solvers.
@@ -957,6 +960,57 @@ psym 0.94. Fill ratio tracks symmetry as expected (`Pajek/foldoc` 282x,
 `HB/gemat12` 160x), but whether the answer is usable is governed by
 conditioning, not by pattern. Do not use `psym` to decide whether these solvers
 suit your matrix — run it and check `info()`.
+
+### Choosing a configuration for one matrix
+
+`compare_testdata` answers "does every solver get the right answer across the corpus, and
+roughly how fast". `bench_solvers` answers the question that follows it: **given this matrix,
+which configuration should I actually use?** It sweeps solvers × orderings × thread counts on
+one matrix at a time, warming each solver up before timing and reporting analyze / factor /
+solve separately.
+
+```sh
+./build/bench_solvers                                   # the Tier::Small corpus
+./build/bench_solvers --quick                           # synthetic only, no testdata needed
+./build/bench_solvers --threads 1,2,16 --reps 5 path/to/A.mtx
+./build/bench_solvers --no-matching path/to/A.mtx       # with setMatching(false)
+```
+
+Three things it shows that a single cold factor+solve number cannot:
+
+- **Cold-start cost is excluded.** MKL's first `pardiso()` call spins up its thread pool; on a
+  1015-row matrix that is ~500 ms against ~1 ms of real work, which makes an unwarmed PARDISO
+  measurement meaningless.
+- **Which phase costs.** `analyzePattern` is a third of wall clock for METIS on `setfos_2` —
+  and it is exactly the phase you skip when refactorizing an unchanged pattern.
+- **The ordering**, which on an unsymmetric pattern moves the result further than the choice of
+  solver does. Measured on `setfos_2` (n=3048, 238 nnz/row, symmetry 0.44), best of 5:
+
+  | configuration | thr | analyze | factor | solve | total | fill |
+  |---|--:|--:|--:|--:|--:|--:|
+  | `LeftRightLU` AMD | 1 | 36.8 | 198.9 | 2.8 | 238.4 | 3,933,570 |
+  | **`LeftRightLU` COLAMD** | 1 | 37.2 | 103.7 | 4.0 | **144.8** | 2,360,714 |
+  | `LeftRightLU` METIS | 1 | 87.4 | 127.6 | 1.3 | 216.3 | 1,609,832 |
+  | `LeftRightLU` METIS | 16 | 83.3 | 84.2 | 1.5 | 168.9 | 1,609,832 |
+  | `SupernodalLU` AMD (on `Asym`) | 1 | 100.3 | 205.5 | 5.9 | 311.7 | 3,927,774 |
+  | `SupernodalLU` AMD (on `Asym`) | 16 | 99.5 | 106.7 | 6.5 | 212.7 | 3,927,774 |
+  | `Eigen::SparseLU` | 1 | 9.2 | 114.6 | 1.1 | 124.9 | 1,935,897 |
+  | MKL PARDISO | 1 | 103.9 | 119.8 | 4.8 | 228.5 | 1,563,528 |
+  | MKL PARDISO | 16 | 114.2 | 47.3 | 4.6 | 166.2 | 1,563,528 |
+
+  Two results worth reading twice. COLAMD carries 47% more fill than METIS and still factors
+  faster (39 wide supernodes against METIS's 321 narrow ones — the fatter dense blocks win the
+  difference back in BLAS-3 efficiency), so fill is a first-order proxy for cost and not more
+  than that. And `LeftRightLU` under AMD gets **nothing** from 16 threads while `SupernodalLU`
+  nearly halves its factorization: with only 29 supernodes there is no assembly-DAG parallelism
+  to find, and the intra-supernode chunking that could still help is the one mechanism
+  `LeftRightLU` does not have (see [What's different from
+  SupernodalLU](#whats-different-from-supernodallu)).
+
+Fill is printed as each solver reports it: ours and `Eigen::SparseLU` count the diagonal in
+both factors, PARDISO's `IPARM(18)` counts it once, so those columns are comparable only up to
+an offset of `n`. The exit code counts only *our* solvers failing `resid < 1e-6` — the
+benchmark is not a bug report against Eigen or MKL.
 
 ### Parallel scaling (measured)
 
@@ -1292,11 +1346,23 @@ Practical notes:
   structural mirror, measured on `B` — the graph actually eliminated, i.e. *after* matching.
   A symmetric-pattern input can therefore still report below 1: matching permutes rows.
   **`structurallySymmetric()`** is the exact `== 1` case.
-- **Stay on the default `AMDOrdering`.** It minimizes degree in exactly the `A + Aᵀ` graph
-  this factorization eliminates. `COLAMDOrdering` (what `Eigen::SparseLU` defaults to) targets
-  the partial-pivoting `AᵀA` bound, a different objective; measured on a 900-column upwind
-  grid it gives `nnzL` 15,181 against AMD's 13,679. Reach for `MetisOrdering`, not COLAMD,
-  when AMD's fill is too high.
+- **Try the other orderings** — the default `AMDOrdering` is a reasonable start (it minimizes
+  degree in exactly the `A + Aᵀ` graph this factorization eliminates), but the symmetrized
+  graph it sees on an unsymmetric pattern can be far denser than the one AMD was designed for,
+  and the gap between orderings is much wider here than on symmetric-pattern matrices. On
+  `setfos_2` (n=3048, 238 nnz/row, symmetry 0.44):
+
+  | ordering | fill (nnzL+nnzU) | factor ms | supernodes |
+  |---|--:|--:|--:|
+  | `AMDOrdering` (default) | 3,933,570 | 201 | 29 |
+  | `MetisOrdering` | **1,609,832** | 127 | 321 |
+  | `COLAMDOrdering` | 2,360,714 | **116** | 39 |
+
+  COLAMD wins on *time* while losing on fill: it leaves 39 wide supernodes against METIS's 321
+  narrow ones, and the fatter dense blocks pay back the extra flops in BLAS-3 efficiency. Fill
+  is the right first-order proxy for cost, but on a matrix this dense it is not the whole
+  story — measure. (On sparse structured matrices the ordering ranking is the usual one:
+  AMD 13,679 `nnzL` against COLAMD's 15,181 on a 900-column upwind grid.)
 - A custom ordering functor that returns the **direct** permutation (rather than the inverse,
   as AMD and METIS do) needs a one-line `left_right_lu::OrderingConvention` specialization;
   Eigen's own AMD/METIS/COLAMD/Natural functors are all handled already. Getting this

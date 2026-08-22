@@ -231,12 +231,19 @@ class LeftRightLUTransposeView
  *    values are worth knowing about because the extra structure compounds
  *    through fill, not linearly. It measures `B`, the graph actually eliminated,
  *    so a symmetric-pattern A can still report below 1: matching permutes rows.
- *  - The default AMDOrdering is still the right ordering here: it minimizes
- *    degree in exactly the `A + A^T` graph this factorization eliminates.
- *    COLAMDOrdering (which Eigen::SparseLU defaults to) targets the
- *    partial-pivoting `A^T A` bound instead, a different objective, and measured
- *    on unsymmetric-pattern matrices it gives *more* fill here, not less. Reach
- *    for MetisOrdering, not COLAMD, when AMD's fill is too high.
+ *  - The default AMDOrdering is a reasonable starting point -- it minimizes
+ *    degree in exactly the `A + A^T` graph this factorization eliminates -- but
+ *    on an unsymmetric pattern it is worth trying the others, because the
+ *    symmetrized graph AMD sees can be much denser than the one it was designed
+ *    for. Measured on setfos_2 (n=3048, 238 nnz/row, symmetry 0.44), fill and
+ *    factor time for the same system:
+ *        AMD     3,933,570   201 ms
+ *        METIS   1,609,832   127 ms
+ *        COLAMD  2,360,714   116 ms
+ *    Note COLAMD wins on *time* while losing on fill: it left 39 wide supernodes
+ *    against METIS's 321 narrow ones, and the fatter dense blocks pay for the
+ *    extra flops in BLAS-3 efficiency. Fill is the right first-order proxy for
+ *    cost, but on a matrix this dense it is not the whole story -- measure.
  *  - On a strongly unsymmetric pattern with no good vertex separators, the fill
  *    can exceed what a partial-pivoting solver would need by orders of
  *    magnitude. setMaxFactorNonzeros() turns that into a clean, immediate error
@@ -653,10 +660,15 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_nnzU = 0;
   }
 
-  // analysis helpers (shared design with SupernodalLU). buildSymmetricAdjacency
-  // is what makes an unsymmetric input pattern work: it unions the pattern with
-  // its transpose, and records how much that union added (m_patternSymmetry).
-  void buildSymmetricAdjacency(const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency);
+  // analysis helpers (shared design with SupernodalLU).
+  //
+  // The symmetrized pattern is what makes an unsymmetric input pattern work: it
+  // unions the pattern with its transpose. It is built ONCE, in the matrix's own
+  // numbering (buildSymmetrizedPattern), and then relabelled into whichever
+  // internal numbering the pipeline currently holds (relabelAdjacency) -- the
+  // numbering changes when the postorder is folded in, but the graph does not.
+  void buildSymmetrizedPattern(const MatrixType& matrix);
+  void relabelAdjacency(std::vector<std::vector<StorageIndex>>& adjacency) const;
   void computeEliminationTree(const std::vector<std::vector<StorageIndex>>& adjacency,
                               std::vector<StorageIndex>& parent) const;
   void computePostorder(const std::vector<StorageIndex>& parent, std::vector<StorageIndex>& postorder) const;
@@ -750,6 +762,12 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   bool m_structurallySymmetric;
   int m_matchSign;
 
+  // The symmetrized pattern of the matched matrix, in that matrix's own
+  // numbering: CSR, diagonal excluded, each list duplicate-free but unordered.
+  // Built once by buildSymmetrizedPattern, relabelled per numbering.
+  std::vector<std::size_t> m_patternStart;
+  std::vector<StorageIndex> m_patternIndex;
+
   // Per-supernode in-block pivot permutations (internal local order). *Row*
   // permutation P_s from partial/complete pivoting; *column* permutation Q_s from
   // complete pivoting. m_rowPivot[s][k] / m_colPivot[s][k] = local block row /
@@ -811,37 +829,75 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 //  Analysis (symbolic) phase  -- shared design with SupernodalLU
 // ===========================================================================
 
+// Build the symmetrized (pattern(A + A^T), diagonal excluded) adjacency of
+// `matrix` in ITS OWN numbering, as a flat CSR in m_patternStart/m_patternIndex.
+// Row order within a node's list is not maintained -- relabelAdjacency does not
+// need it -- but each list is duplicate-free, which it does need.
 template <typename MatrixType, typename OrderingType, typename Executor>
-void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetricAdjacency(
-    const MatrixType& matrix, std::vector<std::vector<StorageIndex>>& adjacency) {
+void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetrizedPattern(
+    const MatrixType& matrix) {
   const StorageIndex n = m_size;
-  adjacency.assign(n, std::vector<StorageIndex>());
+  m_patternStart.assign(static_cast<std::size_t>(n) + 1, 0);
+  if (n == 0) {
+    m_patternIndex.clear();
+    m_patternSymmetry = RealScalar(1);
+    m_structurallySymmetric = true;
+    return;
+  }
+
+  // Pass 1: degree of every node with duplicates still in, so the CSR can be
+  // filled without any per-row reallocation.
   Index offDiagonal = 0;  // off-diagonal nonzeros of `matrix`
   for (StorageIndex j = 0; j < n; ++j) {
-    const StorageIndex jj = m_toInternal[j];
     for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
-      const StorageIndex ii = m_toInternal[static_cast<StorageIndex>(it.index())];
-      if (ii == jj) continue;
+      const StorageIndex i = static_cast<StorageIndex>(it.index());
+      if (i == j) continue;
       ++offDiagonal;
       // Both directions go in: this union with the transpose is what lets an
       // unsymmetric pattern through without the caller symmetrizing it.
-      adjacency[jj].push_back(ii);
-      adjacency[ii].push_back(jj);
+      ++m_patternStart[static_cast<std::size_t>(j) + 1];
+      ++m_patternStart[static_cast<std::size_t>(i) + 1];
     }
   }
-  Index distinct = 0;  // adjacency slots surviving the dedup
+  for (StorageIndex j = 0; j < n; ++j) m_patternStart[j + 1] += m_patternStart[j];
+
+  // Pass 2: scatter.
+  m_patternIndex.resize(m_patternStart[static_cast<std::size_t>(n)]);
+  std::vector<std::size_t> cursor(m_patternStart.begin(), m_patternStart.end() - 1);
   for (StorageIndex j = 0; j < n; ++j) {
-    auto& row = adjacency[j];
-    std::sort(row.begin(), row.end());
-    row.erase(std::unique(row.begin(), row.end()), row.end());
-    distinct += static_cast<Index>(row.size());
+    for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+      const StorageIndex i = static_cast<StorageIndex>(it.index());
+      if (i == j) continue;
+      m_patternIndex[cursor[static_cast<std::size_t>(j)]++] = i;
+      m_patternIndex[cursor[static_cast<std::size_t>(i)]++] = j;
+    }
   }
 
-  // Every off-diagonal entry pushed 2 slots, so `distinct` = 2u for u unordered
-  // pairs in the symmetrized pattern; a pair present in both directions was
-  // pushed twice and collapsed. With m off-diagonal entries and p mirrored
-  // pairs, m = u + p, so the mirrored fraction 2p/m is (2m - distinct)/m.
-  // distinct == m is exactly the already-symmetric case.
+  // Pass 3: drop duplicates, compacting in place. A stamped marker array does
+  // this in O(nnz) -- sorting each list first would cost O(nnz log d) for an
+  // ordering nothing downstream reads.
+  std::vector<StorageIndex> seen(static_cast<std::size_t>(n), StorageIndex(-1));
+  std::size_t write = 0;
+  for (StorageIndex j = 0; j < n; ++j) {
+    const std::size_t begin = m_patternStart[static_cast<std::size_t>(j)];
+    const std::size_t end = m_patternStart[static_cast<std::size_t>(j) + 1];
+    m_patternStart[static_cast<std::size_t>(j)] = write;
+    for (std::size_t k = begin; k < end; ++k) {
+      const StorageIndex v = m_patternIndex[k];
+      if (seen[static_cast<std::size_t>(v)] == j) continue;
+      seen[static_cast<std::size_t>(v)] = j;
+      m_patternIndex[write++] = v;
+    }
+  }
+  const Index distinct = static_cast<Index>(write);
+  m_patternStart[static_cast<std::size_t>(n)] = write;
+  m_patternIndex.resize(write);
+
+  // Every off-diagonal entry contributed 2 slots, so `distinct` = 2u for u
+  // unordered pairs in the symmetrized pattern; a pair present in both
+  // directions was written twice and collapsed. With m off-diagonal entries and
+  // p mirrored pairs, m = u + p, so the mirrored fraction 2p/m is
+  // (2m - distinct)/m. distinct == m is exactly the already-symmetric case.
   if (offDiagonal > 0) {
     const RealScalar ratio =
         RealScalar(2 * offDiagonal - distinct) / RealScalar(offDiagonal);
@@ -852,6 +908,42 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetricAdjacency(
   } else {
     m_patternSymmetry = RealScalar(1);  // diagonal-only: trivially symmetric
     m_structurallySymmetric = true;
+  }
+}
+
+// Relabel the once-built symmetrized pattern into the current m_toInternal
+// numbering. Downstream (computeEliminationTree, computeSupernodePartition)
+// requires each list ASCENDING, and it comes out that way with no sort: the
+// outer loop walks source nodes in increasing INTERNAL order and appends each
+// one to its neighbours' lists, so every list is filled in ascending order by
+// construction, and every list's exact length is known in advance from the
+// node's degree. That is why the pattern is kept separately from the adjacency
+// -- analyzePattern needs the adjacency twice in two different numberings, and
+// sorting every list twice is the single most expensive thing the symbolic
+// phase would otherwise do (on setfos_2 it is the difference between a 58 ms
+// and a 38 ms analyzePattern).
+template <typename MatrixType, typename OrderingType, typename Executor>
+void LeftRightLU<MatrixType, OrderingType, Executor>::relabelAdjacency(
+    std::vector<std::vector<StorageIndex>>& adjacency) const {
+  const StorageIndex n = m_size;
+  adjacency.assign(n, std::vector<StorageIndex>());
+  if (n == 0) return;
+
+  // Degree is a property of the node, not of the numbering, so the exact size
+  // of every list is known up front and no list ever reallocates.
+  std::vector<StorageIndex> inverse(static_cast<std::size_t>(n));
+  for (StorageIndex o = 0; o < n; ++o) {
+    const StorageIndex u = m_toInternal[o];
+    inverse[static_cast<std::size_t>(u)] = o;
+    adjacency[u].reserve(m_patternStart[static_cast<std::size_t>(o) + 1] -
+                         m_patternStart[static_cast<std::size_t>(o)]);
+  }
+
+  for (StorageIndex u = 0; u < n; ++u) {
+    const StorageIndex o = inverse[static_cast<std::size_t>(u)];
+    const std::size_t end = m_patternStart[static_cast<std::size_t>(o) + 1];
+    for (std::size_t k = m_patternStart[static_cast<std::size_t>(o)]; k < end; ++k)
+      adjacency[m_toInternal[m_patternIndex[k]]].push_back(u);
   }
 }
 
@@ -1156,9 +1248,12 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
     for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = orderingPerm.indices()(i);
   }
 
-  // 2) elimination tree of the ordered, symmetrized (B + B^T) pattern.
+  // 2) elimination tree of the ordered, symmetrized (B + B^T) pattern. The
+  //    pattern itself is numbering-independent, so it is built once here and
+  //    only relabelled below.
+  buildSymmetrizedPattern(B);
   std::vector<std::vector<StorageIndex>> adjacency;
-  buildSymmetricAdjacency(B, adjacency);
+  relabelAdjacency(adjacency);
   std::vector<StorageIndex> parent;
   computeEliminationTree(adjacency, parent);
 
@@ -1169,9 +1264,13 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   for (StorageIndex t = 0; t < n; ++t) relabel[postorder[t]] = t;
   for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = relabel[m_toInternal[i]];
 
-  // 4) recompute adjacency + tree in the final numbering.
-  buildSymmetricAdjacency(B, adjacency);
+  // 4) re-express adjacency + tree in the final numbering. Nothing reads the CSR
+  //    after this, and it is O(nnz) of the input -- tens of MB on a large matrix
+  //    -- so release it rather than carry it for the solver's lifetime.
+  relabelAdjacency(adjacency);
   computeEliminationTree(adjacency, parent);
+  std::vector<std::size_t>().swap(m_patternStart);
+  std::vector<StorageIndex>().swap(m_patternIndex);
 
   // 5) symbolic factorization + supernode partition (streaming).
   std::vector<std::vector<StorageIndex>> supernodeOffDiagRows;

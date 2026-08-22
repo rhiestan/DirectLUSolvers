@@ -121,6 +121,25 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# dlu_test_runtime_path(<test> <native dir>)
+#
+# Prepend a directory to a test's PATH so a DLL it needs at run time is found.
+#
+# The escaping is the whole point. A CTest ENVIRONMENT property is a CMake LIST,
+# and on Windows $ENV{PATH} is full of semicolons -- pasted in raw, every PATH
+# entry becomes a separate environment assignment, leaving the test with a PATH
+# of just the one directory. That fails in the least helpful way available: the
+# named DLL loads (its directory is the surviving entry) and then its own
+# dependencies do not, so CTest reports exit code 0xc06d007e with no output and
+# it reads as a solver crash. Escaping the separators keeps PATH one element.
+function(dlu_test_runtime_path test_name dir)
+  if(NOT WIN32 OR NOT dir)
+    return()
+  endif()
+  string(REPLACE ";" "\\;" _host_path "$ENV{PATH}")
+  set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "PATH=${dir}\\;${_host_path}")
+endfunction()
+
 # Common settings for every test binary. The testdata path is baked in as an
 # absolute path so tests do not depend on the working directory CTest picks.
 add_library(dlu_test_common INTERFACE)
@@ -181,6 +200,15 @@ if(DLU_WITH_PARDISO)
   target_link_libraries(dlu_pardiso INTERFACE "${DLU_MKL_RT_LIBRARY}")
   target_compile_definitions(dlu_pardiso INTERFACE HAVE_PARDISO)
   message(STATUS "MKL PARDISO: ${DLU_MKL_RT_LIBRARY}")
+
+  # mkl_rt.dll must be locatable at run time -- linking against mkl_rt.lib is not
+  # enough, and a missing DLL surfaces as CTest exit code 0xc0000135 with no
+  # output, which reads as a solver crash rather than a PATH problem. Hand CTest
+  # the directory instead of making the developer remember it (same treatment as
+  # tbb12.dll below).
+  if(WIN32 AND EXISTS "${DLU_MKL_DIR}/bin")
+    file(TO_NATIVE_PATH "${DLU_MKL_DIR}/bin" DLU_MKL_BIN)
+  endif()
 endif()
 
 # --- optional: OpenMP executor ---------------------------------------------
@@ -302,10 +330,7 @@ if(DLU_WITH_TBB)
 endif()
 add_dlu_test(test_executors SOURCE test/test_executors.cpp
              LABELS "quick;correctness;parallel" LINK ${DLU_EXECUTOR_LINK})
-if(DLU_TBB_BIN)
-  set_tests_properties(test_executors PROPERTIES
-                       ENVIRONMENT "PATH=${DLU_TBB_BIN};$ENV{PATH}")
-endif()
+dlu_test_runtime_path(test_executors "${DLU_TBB_BIN}")
 add_dlu_test(test_edge_cases   SOURCE test/test_edge_cases.cpp   LABELS "quick;correctness")
 
 add_dlu_test(test_suitesparse SOURCE test/test_suitesparse.cpp
@@ -315,6 +340,7 @@ add_dlu_test(test_suitesparse SOURCE test/test_suitesparse.cpp
 # binary by hand (no arguments) for the full corpus.
 add_dlu_test(compare_testdata SOURCE test/compare_testdata.cpp
              ARGS --tier large LABELS "testdata;benchmark" LINK ${DLU_COMPARE_LINK})
+dlu_test_runtime_path(compare_testdata "${DLU_MKL_BIN}")
 
 # Thread-count scaling sweep with per-phase timing. Registered with --quick
 # (synthetic matrices only) so CTest exercises the code path without spending
@@ -326,6 +352,15 @@ add_dlu_test(bench_parallel SOURCE test/bench_parallel.cpp
 # The --quick form uses only the synthetic matrix so CTest stays fast.
 add_dlu_test(bench_ceiling SOURCE test/bench_ceiling.cpp
              ARGS --quick LABELS "benchmark;parallel")
+
+# Per-matrix solver/ordering shootout with warm-up and per-phase timing. Picks up
+# METIS and PARDISO rows when those switches are on; --quick keeps CTest to two
+# synthetic matrices, so run the binary bare (or with matrix paths) for the real
+# comparison.
+add_dlu_test(bench_solvers SOURCE test/bench_solvers.cpp
+             ARGS --quick --reps 1 --threads 1,4 LABELS "benchmark"
+             LINK ${DLU_COMPARE_LINK})
+dlu_test_runtime_path(bench_solvers "${DLU_MKL_BIN}")
 
 # The regression suite also has a synthetic-only mode that needs no testdata and
 # runs in well under a second -- worth having in the "quick" set so the fill
