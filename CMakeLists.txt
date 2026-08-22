@@ -333,5 +333,40 @@ add_dlu_test(bench_ceiling SOURCE test/bench_ceiling.cpp
 add_dlu_test_variant(test_regression_synthetic TARGET test_regression
                      ARGS --synthetic-only LABELS "quick;regression")
 
+# ---------------------------------------------------------------------------
+#  Profiling driver (not a test)
+# ---------------------------------------------------------------------------
+#
+# A profiler needs the three phases separately attributable, which compute()
+# does not give it. profile_driver runs analyzePattern/factorize/solve as
+# distinct, individually selectable phases over the SuiteSparse corpus. It is
+# NOT registered with CTest -- it asserts nothing.
+#
+#   cmake --build build --target profile_driver
+#   build/profile_driver --solver snlu --phase factorize --reps 5
+#
+# With DLU_WITH_ITT=ON the phases also emit VTune ITT task markers, so one run
+# can be split by "Task Type" in the GUI instead of profiling each phase twice.
+option(DLU_BUILD_PROFILE_DRIVER "Build the VTune profiling driver" OFF)
+option(DLU_WITH_ITT "Emit VTune ITT task markers from the profiling driver" OFF)
+
+if(DLU_BUILD_PROFILE_DRIVER)
+  add_executable(profile_driver test/profile_driver.cpp)
+  target_link_libraries(profile_driver PRIVATE dlu_test_common)
+  if(DLU_WITH_ITT)
+    set(DLU_ITT_DIR "" CACHE PATH "VTune SDK root (the directory containing include/ittnotify.h)")
+    if(NOT DLU_ITT_DIR AND DEFINED ENV{VTUNE_PROFILER_DIR})
+      set(DLU_ITT_DIR "$ENV{VTUNE_PROFILER_DIR}/sdk")
+    endif()
+    if(NOT EXISTS "${DLU_ITT_DIR}/include/ittnotify.h")
+      message(FATAL_ERROR "DLU_WITH_ITT=ON but ittnotify.h not found under "
+                          "'${DLU_ITT_DIR}'. Set -DDLU_ITT_DIR=<VTune>/sdk.")
+    endif()
+    target_include_directories(profile_driver PRIVATE "${DLU_ITT_DIR}/include")
+    target_link_libraries(profile_driver PRIVATE "${DLU_ITT_DIR}/lib64/libittnotify.lib")
+    target_compile_definitions(profile_driver PRIVATE DLU_WITH_ITT)
+  endif()
+endif()
+
 message(STATUS "DirectLUSolvers tests: METIS=${DLU_WITH_METIS} PARDISO=${DLU_WITH_PARDISO}")
 message(STATUS "  testdata: ${DLU_TESTDATA_DIR}")
