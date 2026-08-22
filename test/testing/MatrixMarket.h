@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <complex>
 #include <fstream>
 #include <istream>
@@ -73,6 +74,55 @@ struct MMValue<std::complex<Real>> {
     return true;
   }
   static bool acceptsComplexFile() { return true; }
+};
+
+// Character-scanning counterparts of the two `read`s above.
+//
+// WHY THESE EXIST: the entry loop runs once per stored nonzero -- 725k times on
+// the largest corpus matrix -- and constructing a std::istringstream per line
+// there costs a heap allocation plus a locale-bound stream setup per ENTRY.
+// Profiling the benchmark suites showed that construction, not the solvers,
+// as the single largest cost in the whole run. strtod/strtoll parse the same
+// grammar (both are C-locale numeric conversions, as a default-imbued
+// istringstream is) with no allocation at all.
+//
+// Each returns false and leaves `p` unspecified on a malformed field, so the
+// call sites keep reporting exactly the errors they did before.
+inline bool scanIndex(const char*& p, long long& out) {
+  char* end = nullptr;
+  const long long v = std::strtoll(p, &end, 10);
+  if (end == p) return false;
+  p = end;
+  out = v;
+  return true;
+}
+
+template <typename Scalar>
+struct MMScan {
+  static bool read(const char*& p, Scalar& v) {
+    char* end = nullptr;
+    const double re = std::strtod(p, &end);
+    if (end == p) return false;
+    p = end;
+    v = static_cast<Scalar>(re);
+    return true;
+  }
+};
+
+template <typename Real>
+struct MMScan<std::complex<Real>> {
+  static bool read(const char*& p, std::complex<Real>& v) {
+    char* end = nullptr;
+    const double re = std::strtod(p, &end);
+    if (end == p) return false;
+    p = end;
+    const char* q = p;
+    const double im = std::strtod(q, &end);
+    if (end == q) return false;
+    p = end;
+    v = std::complex<Real>(static_cast<Real>(re), static_cast<Real>(im));
+    return true;
+  }
 };
 
 inline std::string toLower(std::string s) {
@@ -189,11 +239,12 @@ Eigen::SparseMatrix<Scalar> loadMatrixMarketAs(const std::string& path,
     for (long long k = 0; k < declared; ++k) {
       if (!detail::nextDataLine(in, line))
         throw std::runtime_error("unexpected EOF reading entries in " + path);
-      std::istringstream iss(line);
+      const char* p = line.c_str();
       long long i = 0, j = 0;
-      if (!(iss >> i >> j)) throw std::runtime_error("malformed entry in " + path);
+      if (!detail::scanIndex(p, i) || !detail::scanIndex(p, j))
+        throw std::runtime_error("malformed entry in " + path);
       Scalar v = Scalar(1);
-      if (h.field != MMField::Pattern && !detail::MMValue<Scalar>::read(iss, v))
+      if (h.field != MMField::Pattern && !detail::MMScan<Scalar>::read(p, v))
         throw std::runtime_error("malformed value in " + path);
       --i;
       --j;  // MatrixMarket indices are 1-based
@@ -214,9 +265,9 @@ Eigen::SparseMatrix<Scalar> loadMatrixMarketAs(const std::string& path,
     auto readInto = [&](long long i, long long j) {
       if (!detail::nextDataLine(in, line))
         throw std::runtime_error("unexpected EOF reading array values in " + path);
-      std::istringstream iss(line);
+      const char* p = line.c_str();
       Scalar v = Scalar(1);
-      if (h.field != MMField::Pattern && !detail::MMValue<Scalar>::read(iss, v))
+      if (h.field != MMField::Pattern && !detail::MMScan<Scalar>::read(p, v))
         throw std::runtime_error("malformed value in " + path);
       if (v == Scalar(0)) return;  // keep the sparse result sparse
       triplets.emplace_back(static_cast<typename SpMat::StorageIndex>(i),
