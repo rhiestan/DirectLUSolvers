@@ -953,9 +953,17 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::computeSupernodePartition(
       const std::vector<StorageIndex>& cs = columnStructure[c];
       auto childBeyond = std::upper_bound(cs.begin(), cs.end(), j);
       if (childBeyond == cs.end()) continue;
-      scratch2.clear();
-      scratch2.reserve(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
-      std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), std::back_inserter(scratch2));
+      // Write into a PRE-SIZED buffer rather than through back_inserter. The
+      // union can never exceed the sum of its inputs, so sizing scratch2 to
+      // that bound up front lets set_union store through a contiguous iterator
+      // -- a plain pointer write per element -- instead of a push_back whose
+      // capacity check on every element also defeats any bulk copy of the tail
+      // that remains when one input runs out. Same result, and this is the
+      // single hottest line in analyzePattern.
+      scratch2.resize(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
+      const auto unionEnd =
+          std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), scratch2.begin());
+      scratch2.resize(static_cast<std::size_t>(unionEnd - scratch2.begin()));
       scratch.swap(scratch2);
     }
     columnStructure[j].clear();
@@ -1222,31 +1230,40 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex s
   StorageIndex lastFacing = firstFacingBlock;
   while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
 
-  for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
-    const RowBlock& colBlock = m_rowBlocks[cb];
-    const StorageIndex columnCount = colBlock.height();
-    const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
-    const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);
-    const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);
-
-    for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);
-      if (rb < lastFacing) {
-        const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
+  // ROW BLOCK OUTER, COLUMN BLOCK INNER -- see the matching note in
+  // SupernodalLU::applyUpdate. Each (rb, cb) pair writes its own disjoint
+  // destination sub-block, so the nesting order does not affect the result;
+  // putting rb outside hoists rowPanelPosition()'s binary search out of the
+  // cb loop, where it was otherwise repeated once per facing column block.
+  for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);
+    const bool facingRows = (rb < lastFacing);
+    const StorageIndex destRow = facingRows ? StorageIndex(rowBlock.firstRow - targetFirstColumn)
+                                            : rowPanelPosition(target, rowBlock.firstRow);
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);
+      if (facingRows)
         targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      } else {
-        const StorageIndex destRow = rowPanelPosition(target, rowBlock.firstRow);
+      else
         targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      }
     }
+  }
 
-    for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
-      const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);
+  for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
+    const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);
       targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
     }
   }
@@ -1326,15 +1343,36 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
     StorageIndex pr = k, pc = k;
     if (colPivot) {
       // complete pivoting: largest-magnitude entry of the whole trailing block.
+      //
+      // TWO PASSES, deliberately. maxCoeff(&index) has to track which lane holds
+      // the running maximum, costing a compare plus a select and a horizontal
+      // "any lane won?" test per packet on top of the max itself; plain
+      // maxCoeff() is a bare vectorized reduction. Only the WINNING column's row
+      // index is ever used, so the indexed form is needed once per elimination
+      // step rather than once per trailing column. Profiling put this search at
+      // roughly 44% of factorize() on the benchmark corpus -- it is what made
+      // LeftRightLU slower than SupernodalLU on pivot-heavy matrices.
+      //
+      // The pivot CHOICE is unchanged: `best` still starts at the diagonal and
+      // still only yields to a strictly larger magnitude, so ties keep going to
+      // the earliest column-major position exactly as before, and bestCol is the
+      // same column the one-pass loop would have settled on.
       RealScalar best = numext::abs(diag(k, k));
+      StorageIndex bestCol = 0;
+      bool found = false;
       for (StorageIndex jj = k; jj < w; ++jj) {
-        Index rel = 0;
-        const RealScalar m = diag.col(jj).segment(k, w - k).cwiseAbs().maxCoeff(&rel);
+        const RealScalar m = diag.col(jj).segment(k, w - k).cwiseAbs().maxCoeff();
         if (m > best) {
           best = m;
-          pr = k + static_cast<StorageIndex>(rel);
-          pc = jj;
+          bestCol = jj;
+          found = true;
         }
+      }
+      if (found) {
+        Index rel = 0;
+        diag.col(bestCol).segment(k, w - k).cwiseAbs().maxCoeff(&rel);
+        pr = k + static_cast<StorageIndex>(rel);
+        pc = bestCol;
       }
     } else if (rowPivot) {
       // partial pivoting: largest-magnitude entry of column k, rows [k,w).

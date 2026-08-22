@@ -1050,9 +1050,17 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::computeSupernodePartition
       const std::vector<StorageIndex>& cs = columnStructure[c];
       auto childBeyond = std::upper_bound(cs.begin(), cs.end(), j);
       if (childBeyond == cs.end()) continue;  // nothing from this child survives past j
-      scratch2.clear();
-      scratch2.reserve(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
-      std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), std::back_inserter(scratch2));
+      // Write into a PRE-SIZED buffer rather than through back_inserter. The
+      // union can never exceed the sum of its inputs, so sizing scratch2 to
+      // that bound up front lets set_union store through a contiguous iterator
+      // -- a plain pointer write per element -- instead of a push_back whose
+      // capacity check on every element also defeats any bulk copy of the tail
+      // that remains when one input runs out. Same result, and this is the
+      // single hottest line in analyzePattern.
+      scratch2.resize(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
+      const auto unionEnd =
+          std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), scratch2.begin());
+      scratch2.resize(static_cast<std::size_t>(unionEnd - scratch2.begin()));
       scratch.swap(scratch2);
     }
     columnStructure[j].clear();
@@ -1355,36 +1363,48 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
   StorageIndex lastFacing = firstFacingBlock;
   while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
 
-  // Each facing block contributes a contiguous set of the target's columns.
-  for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
-    const RowBlock& colBlock = m_rowBlocks[cb];
-    const StorageIndex columnCount = colBlock.height();
-    const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
-    const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);  // wSrc x cc
-    const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);   // cc x wSrc
+  // ROW BLOCK OUTER, COLUMN BLOCK INNER -- deliberately. The destination of a
+  // GEMM is (rb, cb)-disjoint: rb picks the target rows, cb the target columns,
+  // so every (rb, cb) pair writes its own sub-block and the two loops may be
+  // nested either way with bit-identical results. Nesting rb outside lets
+  // rowPanelPosition() -- a binary search over the source's row blocks, and
+  // dependent on rb alone -- be hoisted out of the cb loop, instead of being
+  // repeated once per facing column block. On the benchmark corpus that search
+  // was the largest non-BLAS cost in factorize().
 
-    // L-side: every source block from the first facing block onward contributes
-    // to these target columns (diagonal rows if facing, lower panel if below).
-    for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);  // rc x wSrc
-      if (rb < lastFacing) {  // facing rows -> target diagonal block
-        const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
+  // L-side: every source block from the first facing block onward contributes
+  // to the facing target columns (diagonal rows if facing, lower panel if below).
+  for (StorageIndex rb = firstFacingBlock; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const auto lower = srcLower.block(rowBlock.panelOffset, 0, rowCount, wSrc);  // rc x wSrc
+    const bool facingRows = (rb < lastFacing);
+    const StorageIndex destRow = facingRows ? StorageIndex(rowBlock.firstRow - targetFirstColumn)
+                                            : rowPanelPosition(target, rowBlock.firstRow);
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);  // wSrc x cc
+      if (facingRows)  // facing rows -> target diagonal block
         targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      } else {  // below rows -> target lower panel
-        const StorageIndex destRow = rowPanelPosition(target, rowBlock.firstRow);
+      else  // below rows -> target lower panel
         targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
-      }
     }
+  }
 
-    // U-side: only source blocks below the facing range contribute to the
-    // target's upper panel (its off-diagonal columns).
-    for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
-      const RowBlock& rowBlock = m_rowBlocks[rb];
-      const StorageIndex rowCount = rowBlock.height();
-      const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
-      const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);  // wSrc x rc
+  // U-side: only source blocks below the facing range contribute to the
+  // target's upper panel (its off-diagonal columns).
+  for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+    const RowBlock& rowBlock = m_rowBlocks[rb];
+    const StorageIndex rowCount = rowBlock.height();
+    const StorageIndex destCol = rowPanelPosition(target, rowBlock.firstRow);
+    const auto upper = srcUpper.block(0, rowBlock.panelOffset, wSrc, rowCount);  // wSrc x rc
+    for (StorageIndex cb = firstFacingBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex columnCount = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);  // cc x wSrc
       targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
     }
   }
