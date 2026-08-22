@@ -47,7 +47,13 @@ struct IttTask {
 
 using Eigen::SparseMatrix;
 using Eigen::VectorXd;
+using Eigen::supernodal_lu::PooledExecutor;
 using Clock = std::chrono::steady_clock;
+
+// Threaded instantiations. PooledExecutor (not StdThreadExecutor) so the thread
+// count can be set after construction.
+using SnluMT = Eigen::SupernodalLU<SparseMatrix<double>, Eigen::AMDOrdering<int>, PooledExecutor>;
+using LrluMT = Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>, PooledExecutor>;
 
 namespace {
 
@@ -73,10 +79,12 @@ struct Timing {
 enum class Phase { All, Analyze, Factorize, Solve };
 
 template <typename Solver>
-Timing profileOne(const SparseMatrix<double>& A, const VectorXd& b, Phase phase, int reps) {
+Timing profileOne(const SparseMatrix<double>& A, const VectorXd& b, Phase phase, int reps,
+                  int threads) {
   Timing t;
   Solver s;
   s.setMaxFactorNonzeros(kFillLimit);
+  if (threads > 1) s.executor() = PooledExecutor(threads);
 
   // analyzePattern is idempotent, so repeating it is legitimate; factorize and
   // solve are repeated against the one analysis, which is how a caller with
@@ -134,6 +142,8 @@ int main(int argc, char** argv) {
   std::string solver = "both";
   Phase phase = Phase::All;
   int reps = 1;
+  int threads = 1;
+  std::string synthetic;
   std::vector<std::string> want;
 
   for (int i = 1; i < argc; ++i) {
@@ -141,6 +151,8 @@ int main(int argc, char** argv) {
     if (a == "--solver" && i + 1 < argc) solver = argv[++i];
     else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
     else if (a == "--matrix" && i + 1 < argc) want.push_back(argv[++i]);
+    else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+    else if (a == "--synthetic" && i + 1 < argc) synthetic = argv[++i];
     else if (a == "--phase" && i + 1 < argc) {
       const std::string p = argv[++i];
       if (p == "all") phase = Phase::All;
@@ -155,6 +167,28 @@ int main(int argc, char** argv) {
     }
   }
   if (reps < 1) reps = 1;
+
+  // A synthetic run replaces the corpus entirely: these are the regular-grid
+  // Laplacians whose elimination trees have a big root separator, which is the
+  // shape that exposes scheduler tail behaviour.
+  if (!synthetic.empty()) {
+    SparseMatrix<double> A;
+    if (synthetic == "lap2d") A = lu_testing::laplacian2d(300, 300);
+    else if (synthetic == "lap3d") A = lu_testing::laplacian3d(30, 30, 30);
+    else { std::printf("unknown --synthetic '%s'\n", synthetic.c_str()); return 2; }
+    const VectorXd b = deterministicRhs(A);
+    std::printf("%-30s %9s %10s %10s %10s %10s %12s\n", "matrix", "n", "solver",
+                "analyze/s", "factor/s", "solve/s", "fill");
+    auto show = [&](const char* who, const Timing& t) {
+      std::printf("%-30s %9lld %10s %10.4f %10.4f %10.4f %12lld\n", synthetic.c_str(),
+                  (long long)A.rows(), who, t.analyze, t.factorize, t.solve, t.fill);
+    };
+    if (solver == "snlu" || solver == "both")
+      show("SNLU", profileOne<SnluMT>(A, b, phase, reps, threads));
+    if (solver == "lrlu" || solver == "both")
+      show("LRLU", profileOne<LrluMT>(A, b, phase, reps, threads));
+    return 0;
+  }
 
   std::vector<lu_testing::SuiteSparseMatrix> selected;
   for (const auto& m : lu_testing::suitesparseMatrices()) {
@@ -195,9 +229,9 @@ int main(int argc, char** argv) {
     };
 
     if (solver == "snlu" || solver == "both")
-      report("SNLU", profileOne<Eigen::SupernodalLU<SparseMatrix<double>>>(A, b, phase, reps));
+      report("SNLU", profileOne<SnluMT>(A, b, phase, reps, threads));
     if (solver == "lrlu" || solver == "both")
-      report("LRLU", profileOne<Eigen::LeftRightLU<SparseMatrix<double>>>(A, b, phase, reps));
+      report("LRLU", profileOne<LrluMT>(A, b, phase, reps, threads));
   }
 
   std::printf("\ntotal: load %.3fs  analyze %.3fs  factorize %.3fs  solve %.3fs\n",
