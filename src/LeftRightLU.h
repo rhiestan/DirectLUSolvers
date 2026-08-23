@@ -735,19 +735,31 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   // with neighbouring levels, since the tail sweep is a hard phase boundary. In
   // exchange each of its supernodes gets the whole pool applied inside it.
   //
-  // Measured on lap2d_300^2 and lap3d_30^3, factorize seconds, clang/AVX2:
+  // Re-measured 2026-08-22 on 16 cores / 32 lanes (clang 22, -O3, default
+  // x86-64 ISA), factorize seconds, best of 3 INTERLEAVED rounds -- see the
+  // protocol note in SupernodalLU.h before retuning this:
   //
-  //   slack   lap3d t2/t4/t8        lap2d t2/t4/t8
-  //     8     0.863 0.828 0.421     0.166 0.121 0.107
-  //     4     0.866 0.516 0.437     0.163 0.122 0.106
-  //     2     0.660 0.464 0.477     0.162 0.119 0.113
-  //     1     0.627 0.452 0.440     0.166 0.129 0.125
+  //   slack   lap3d_30^3 t2/t4/t8/t16/t32        lap2d_300^2 t2/t4/t8/t16/t32
+  //     1     0.377 0.260 0.206 0.194 0.208      0.083 0.060 0.053 0.058 0.073
+  //     2     0.379 0.263 0.197 0.187 0.199      0.083 0.059 0.050 0.054 0.064
+  //     4     0.379 0.267 0.209 0.176 0.189      0.083 0.059 0.050 0.050 0.057
+  //     8     0.379 0.267 0.215 0.192 0.178      0.082 0.058 0.049 0.050 0.051
+  //    16     0.379 0.267 0.215 0.197 0.193      0.082 0.059 0.049 0.048 0.050
+  //    32     0.375 0.268 0.215 0.198 0.197      0.082 0.058 0.049 0.048 0.049
   //
-  // 4 is the compromise: it matches 8 on the wide 2D tree at every thread count
-  // while recovering the 4-thread 3D case (0.83 -> 0.52), where 8 never fires at
-  // all because size*8 <= lanes needs 8 lanes before a single-supernode level
-  // qualifies. Going lower keeps helping the 3D tail but starts costing the 2D
-  // tree the overlap described above, which is what 1 shows.
+  // 4 stays, but read the table before quoting it: at 32 lanes NO value wins
+  // both trees. 4 is best on the 3D tail at 16 lanes (0.176, against 0.192 for
+  // 8); 8 is best on it at 32 (0.178 against 0.189) and better on the 2D tree
+  // everywhere above 8 lanes; 1 and 2 lose the 2D tree badly at 32 lanes (0.073
+  // and 0.064 against 0.049), which is the cross-level overlap this carve gives
+  // up. The spread across the whole column is 5-15%, so the choice is a
+  // compromise inside a shallow optimum rather than a peak. The t2/t4 columns
+  // are flat: below 8 lanes the slack test cannot fire and the size==1 rule in
+  // factorize() carries the tail on its own.
+  //
+  // What does NOT depend on the table: 8 cannot fire at 4 lanes at all without
+  // that size==1 rule, so a slack chosen for the 32-lane column must not be the
+  // only thing standing between a 4-thread run and its tail parallelism.
   static constexpr Index kTailLevelSlack = 4;
 
   Index intraChunkRows(Index total) const {
@@ -1913,11 +1925,17 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     // one core.
     // THE TAIL. Near the root the assembly DAG narrows to a chain of separator
     // supernodes -- few nodes, each enormous -- and a scheduler that only
-    // parallelizes ACROSS supernodes has nothing left to hand out: measured on
-    // lap3d_30^3 at 8 threads, effective CPU utilization was 13.7% (1.1 of 8
-    // cores) with the idle time being starvation, not lock contention. Those
-    // levels are therefore carved out of the DAG phase and swept afterwards
-    // with the pool applied INSIDE each supernode instead.
+    // parallelizes ACROSS supernodes has nothing left to hand out. VTune's
+    // threading analysis on lap3d_30^3, re-run 2026-08-22 on 16 cores / 32
+    // lanes, with the tail sweep DISABLED: effective CPU utilization 1.18 of the
+    // 8 lanes given, and 1.32 of 32 -- adding 24 lanes bought 0.14 of a lane.
+    // The idle time is STARVATION, not contention: the per-worker deque locks
+    // took 0.04s of wait across ~8500 acquisitions in a 4.6s factorization, so
+    // the queue is not what the workers are waiting on; there is simply no
+    // second supernode to hand them. Those levels are therefore carved out of
+    // the DAG phase and swept afterwards with the pool applied INSIDE each
+    // supernode instead, which takes the same measurement to 2.72 of 8 lanes and
+    // 6.39 of 32 (wall clock: 3.08x at 32 threads, against 1.18x without it).
     //
     // The split is necessary because the executor's parallelFor is fork-join and
     // NOT nestable: while the DAG workers are running, all lanes are already
@@ -1926,9 +1944,11 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     //
     // Level 0 is the leaves and the last group is the root, so the tail is the
     // suffix of m_levelGroups that stays too narrow to fill the lanes. The
-    // `size * 8 <= lanes` test is SupernodalLU's, and for the same measured
-    // reason: wider levels keep the outer per-supernode parallelism, which beats
-    // chunking for moderate panels.
+    // `size * kTailLevelSlack <= lanes` test mirrors SupernodalLU's, for the
+    // same measured reason: wider levels keep the outer per-supernode
+    // parallelism, which beats chunking for moderate panels -- and on the wide
+    // 2D tree carving them costs real time at high lane counts (see the measured
+    // table at kTailLevelSlack).
     std::vector<char> isTail(static_cast<std::size_t>(supernodeNbr), 0);
     StorageIndex tailCount = 0;
     if (m_intraParallel && !m_levelGroups.empty()) {

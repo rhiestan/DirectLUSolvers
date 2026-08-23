@@ -37,6 +37,7 @@
 #include <Eigen/OrderingMethods>
 
 #include "SupernodalLU.h"
+#include "SupernodalLUSymbolic.h"
 
 #include <algorithm>
 #include <limits>
@@ -82,7 +83,7 @@ class AutoOrdering {
     static constexpr StorageIndex kFullSelectionLimit = 20000;
     if (n > kFullSelectionLimit) {
       IndexVector indexPtr, innerIndices;
-      buildSymmetrizedGraph(A, indexPtr, innerIndices);
+      symbolic::buildSymmetrizedGraph<StorageIndex>(A, indexPtr, innerIndices);
       if (runMetis(n, indexPtr, innerIndices, /*seed=*/0, matperm)) {
         m_lastChoice = Choice::Metis;
         m_lastSeed = 0;
@@ -97,7 +98,7 @@ class AutoOrdering {
     // Symmetrized adjacency (A+A^T pattern, no diagonal), shared by every
     // candidate's fill estimate and by every METIS call.
     IndexVector indexPtr, innerIndices;
-    buildSymmetrizedGraph(A, indexPtr, innerIndices);
+    symbolic::buildSymmetrizedGraph<StorageIndex>(A, indexPtr, innerIndices);
 
     // Candidate 0: Eigen's AMD (matches SupernodalLU's own default ordering,
     // called the same way -- directly on A, which AMDOrdering symmetrizes
@@ -105,7 +106,7 @@ class AutoOrdering {
     PermutationType best;
     AMDOrdering<StorageIndex> amd;
     amd(A, best);
-    double bestNnzL = estimateFillFromPermutation(n, indexPtr, innerIndices, best);
+    double bestNnzL = symbolic::estimateFillFromPermutation(n, indexPtr, innerIndices, best);
     m_lastNnzL = bestNnzL;
 
     // METIS_NodeND restarts with fixed, distinct seeds (reproducible, unlike
@@ -115,7 +116,7 @@ class AutoOrdering {
     for (int seed = 0; seed < numSeeds; ++seed) {
       PermutationType candidate;
       if (!runMetis(n, indexPtr, innerIndices, seed, candidate)) continue;
-      const double nnzL = estimateFillFromPermutation(n, indexPtr, innerIndices, candidate);
+      const double nnzL = symbolic::estimateFillFromPermutation(n, indexPtr, innerIndices, candidate);
       if (nnzL < bestNnzL) {
         bestNnzL = nnzL;
         best = candidate;
@@ -138,58 +139,6 @@ class AutoOrdering {
     return 1;  // up to kFullSelectionLimit
   }
 
-  // A+A^T pattern (no diagonal) as CSR: indexPtr size n+1, innerIndices size
-  // indexPtr(n). Identical in spirit to Eigen::MetisOrdering's own
-  // get_symmetrized_graph (protected there, so not reusable directly).
-  template <typename MatrixType>
-  static void buildSymmetrizedGraph(const MatrixType& A, IndexVector& indexPtr, IndexVector& innerIndices) {
-    const StorageIndex n = internal::convert_index<StorageIndex>(A.cols());
-    MatrixType At = A.transpose();
-    IndexVector visited(n);
-    visited.setConstant(-1);
-    Index totalNz = 0;
-    for (StorageIndex j = 0; j < n; ++j) {
-      visited(j) = j;  // exclude the diagonal
-      for (typename MatrixType::InnerIterator it(A, j); it; ++it) {
-        const StorageIndex idx = static_cast<StorageIndex>(it.index());
-        if (visited(idx) != j) {
-          visited(idx) = j;
-          ++totalNz;
-        }
-      }
-      for (typename MatrixType::InnerIterator it(At, j); it; ++it) {
-        const StorageIndex idx = static_cast<StorageIndex>(it.index());
-        if (visited(idx) != j) {
-          visited(idx) = j;
-          ++totalNz;
-        }
-      }
-    }
-
-    indexPtr.resize(n + 1);
-    innerIndices.resize(totalNz);
-    visited.setConstant(-1);
-    StorageIndex cur = 0;
-    for (StorageIndex j = 0; j < n; ++j) {
-      indexPtr(j) = cur;
-      visited(j) = j;
-      for (typename MatrixType::InnerIterator it(A, j); it; ++it) {
-        const StorageIndex idx = static_cast<StorageIndex>(it.index());
-        if (visited(idx) != j) {
-          visited(idx) = j;
-          innerIndices(cur++) = idx;
-        }
-      }
-      for (typename MatrixType::InnerIterator it(At, j); it; ++it) {
-        const StorageIndex idx = static_cast<StorageIndex>(it.index());
-        if (visited(idx) != j) {
-          visited(idx) = j;
-          innerIndices(cur++) = idx;
-        }
-      }
-    }
-    indexPtr(n) = cur;
-  }
 
   // Direct METIS_NodeND call with a fixed seed (everything else at METIS's
   // own defaults). Mirrors MetisOrdering::operator()'s perm/iperm handling:
@@ -210,147 +159,6 @@ class AutoOrdering {
     return true;
   }
 
-  // --- symbolic fill estimate: mirrors SupernodalLU::analyzePattern's
-  //     ordering -> elimination tree -> postorder -> recompute -> column
-  //     structures pipeline, on the graph alone (no values, no amalgamation:
-  //     amalgamation adds roughly the same relative overhead to any base
-  //     ordering, so comparing pre-amalgamation fill is enough to rank
-  //     candidates). Cost is one real symbolic analysis, paid per candidate.
-
-  static void adjacencyForPermutation(StorageIndex n, const IndexVector& indexPtr, const IndexVector& innerIndices,
-                                      const std::vector<StorageIndex>& toNew,
-                                      std::vector<std::vector<StorageIndex>>& adjacency) {
-    adjacency.assign(n, std::vector<StorageIndex>());
-    for (StorageIndex j = 0; j < n; ++j) {
-      const StorageIndex nj = toNew[j];
-      for (StorageIndex k = indexPtr(j); k < indexPtr(j + 1); ++k) adjacency[nj].push_back(toNew[innerIndices(k)]);
-    }
-    for (auto& row : adjacency) std::sort(row.begin(), row.end());
-  }
-
-  // Liu's elimination-tree algorithm with path compression (verbatim copy of
-  // SupernodalLU::computeEliminationTree's body, parameterized on n instead
-  // of reading a class member).
-  static void computeEliminationTreeOf(StorageIndex n, const std::vector<std::vector<StorageIndex>>& adjacency,
-                                       std::vector<StorageIndex>& parent) {
-    parent.assign(n, StorageIndex(-1));
-    std::vector<StorageIndex> ancestor(n, StorageIndex(-1));
-    for (StorageIndex j = 0; j < n; ++j) {
-      for (StorageIndex neighbor : adjacency[j]) {
-        if (neighbor >= j) continue;
-        StorageIndex r = neighbor;
-        while (ancestor[r] != StorageIndex(-1) && ancestor[r] != j) {
-          StorageIndex next = ancestor[r];
-          ancestor[r] = j;
-          r = next;
-        }
-        if (ancestor[r] == StorageIndex(-1)) {
-          ancestor[r] = j;
-          parent[r] = j;
-        }
-      }
-    }
-  }
-
-  // Verbatim copy of SupernodalLU::computePostorder's body.
-  static void computePostorderOf(StorageIndex n, const std::vector<StorageIndex>& parent,
-                                 std::vector<StorageIndex>& postorder) {
-    std::vector<StorageIndex> childHead(n, StorageIndex(-1));
-    std::vector<StorageIndex> childNext(n, StorageIndex(-1));
-    for (StorageIndex j = n - 1; j >= 0; --j) {
-      if (parent[j] != StorageIndex(-1)) {
-        childNext[j] = childHead[parent[j]];
-        childHead[parent[j]] = j;
-      }
-      if (j == 0) break;  // avoid unsigned underflow if StorageIndex is unsigned
-    }
-    postorder.clear();
-    postorder.reserve(n);
-    std::vector<StorageIndex> stack;
-    std::vector<StorageIndex> nextChild = childHead;
-    for (StorageIndex root = 0; root < n; ++root) {
-      if (parent[root] != StorageIndex(-1)) continue;
-      stack.push_back(root);
-      while (!stack.empty()) {
-        StorageIndex node = stack.back();
-        StorageIndex child = nextChild[node];
-        if (child != StorageIndex(-1)) {
-          nextChild[node] = childNext[child];
-          stack.push_back(child);
-        } else {
-          postorder.push_back(node);
-          stack.pop_back();
-        }
-      }
-    }
-  }
-
-  // Verbatim copy of SupernodalLU::computeColumnStructures's body (parent[]
-  // must already be in postorder, i.e. parent[j] > j).
-  static void computeColumnStructuresOf(StorageIndex n, const std::vector<std::vector<StorageIndex>>& adjacency,
-                                        const std::vector<StorageIndex>& parent,
-                                        std::vector<std::vector<StorageIndex>>& columnStructure) {
-    columnStructure.assign(n, std::vector<StorageIndex>());
-    std::vector<std::vector<StorageIndex>> children(n);
-    for (StorageIndex j = 0; j < n; ++j)
-      if (parent[j] != StorageIndex(-1)) children[parent[j]].push_back(j);
-
-    std::vector<StorageIndex> markedAt(n, StorageIndex(-1));
-    std::vector<StorageIndex> scratch;
-    for (StorageIndex j = 0; j < n; ++j) {
-      scratch.clear();
-      scratch.push_back(j);
-      markedAt[j] = j;
-      for (StorageIndex neighbor : adjacency[j]) {
-        if (neighbor > j && markedAt[neighbor] != j) {
-          markedAt[neighbor] = j;
-          scratch.push_back(neighbor);
-        }
-      }
-      for (StorageIndex c : children[j]) {
-        for (StorageIndex r : columnStructure[c]) {
-          if (r > j && markedAt[r] != j) {
-            markedAt[r] = j;
-            scratch.push_back(r);
-          }
-        }
-      }
-      std::sort(scratch.begin(), scratch.end());
-      columnStructure[j] = scratch;
-    }
-  }
-
-  static double estimateFillFromPermutation(StorageIndex n, const IndexVector& indexPtr,
-                                            const IndexVector& innerIndices, const PermutationType& matperm) {
-    std::vector<StorageIndex> toNew(n);
-    for (StorageIndex i = 0; i < n; ++i) toNew[i] = matperm.indices()(i);
-
-    std::vector<std::vector<StorageIndex>> adjacency;
-    adjacencyForPermutation(n, indexPtr, innerIndices, toNew, adjacency);
-    std::vector<StorageIndex> parent;
-    computeEliminationTreeOf(n, adjacency, parent);
-
-    // postorder and fold into a second numbering (required so parent[j] > j
-    // before computing column structures, exactly as analyzePattern does).
-    std::vector<StorageIndex> postorder;
-    computePostorderOf(n, parent, postorder);
-    std::vector<StorageIndex> relabel(n);
-    for (StorageIndex t = 0; t < n; ++t) relabel[postorder[t]] = t;
-    std::vector<StorageIndex> toFinal(n);
-    for (StorageIndex i = 0; i < n; ++i) toFinal[i] = relabel[toNew[i]];
-
-    std::vector<std::vector<StorageIndex>> adjacency2;
-    adjacencyForPermutation(n, indexPtr, innerIndices, toFinal, adjacency2);
-    std::vector<StorageIndex> parent2;
-    computeEliminationTreeOf(n, adjacency2, parent2);
-
-    std::vector<std::vector<StorageIndex>> columnStructure;
-    computeColumnStructuresOf(n, adjacency2, parent2, columnStructure);
-
-    double total = 0.0;
-    for (const auto& col : columnStructure) total += static_cast<double>(col.size());
-    return total;
-  }
 };
 
 }  // namespace supernodal_lu

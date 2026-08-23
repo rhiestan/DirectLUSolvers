@@ -65,6 +65,7 @@
 #include <vector>
 
 #include "LeftRightLU.h"
+#include "PointBlockLU.h"
 #include "SupernodalLU.h"
 #include "testing/Check.h"
 #include "testing/MatrixMarket.h"
@@ -87,6 +88,10 @@ typedef Eigen::SupernodalLU<SpMat, Eigen::AMDOrdering<int>, PooledExecutor> Snlu
 #ifdef HAVE_METIS
 typedef Eigen::LeftRightLU<SpMat, Eigen::MetisOrdering<int>, PooledExecutor> LrluMetis;
 #endif
+
+// PointBlockLU is single-threaded by design and takes no executor, so it needs
+// its own runner below rather than runOurs().
+typedef Eigen::PointBlockLU<SpMat, Eigen::COLAMDOrdering<int>> PblkColamd;
 
 namespace {
 
@@ -169,6 +174,47 @@ Row runOurs(const std::string& name, int threads, const Options& opt, const SpMa
     one.fill = static_cast<long long>(s.nnzL()) + s.nnzU();
     return true;
   });
+}
+
+// PointBlockLU's headline number is the REPLAY, not the first factorization:
+// analyzePattern() plus one full factorize() happen once per pattern, and every
+// Newton step after that pays only the replay. Timing the first factorization
+// instead would measure a cost the target workload amortizes to nothing, so the
+// factor column here is the replay and the row says so.
+template <typename Solver>
+Row runPointBlock(const std::string& name, const Options& opt, const SpMat& A, const VectorXd& b,
+                  const VectorXd& xTrue) {
+  Row r;
+  r.solver = name;
+  r.threads = 1;
+  Solver s;
+  const auto t0 = Clock::now();
+  s.analyzePattern(A);
+  const auto t1 = Clock::now();
+  s.factorize(A);  // full factorization: records the pattern and the pivots
+  if (s.info() != Eigen::Success) {
+    r.note = "factorize failed: " + s.lastErrorMessage();
+    return r;
+  }
+  r.analyzeMs = ms(t0, t1);
+  r.factorMs = 1e300;
+  r.solveMs = 1e300;
+  VectorXd x;
+  for (int rep = 0; rep <= opt.reps; ++rep) {
+    const auto a0 = Clock::now();
+    s.factorize(A);
+    const auto a1 = Clock::now();
+    x = s.solve(b);
+    const auto a2 = Clock::now();
+    if (rep == 0) continue;  // warm-up
+    r.factorMs = std::min(r.factorMs, ms(a0, a1));
+    r.solveMs = std::min(r.solveMs, ms(a1, a2));
+  }
+  r.err = (x - xTrue).norm() / xTrue.norm();
+  r.resid = (A * x - b).norm() / b.norm();
+  r.fill = static_cast<long long>(s.nnzL()) + s.nnzU();
+  r.ok = true;
+  return r;
 }
 
 Row runSparseLU(const Options& opt, const SpMat& A, const VectorXd& b, const VectorXd& xTrue) {
@@ -360,6 +406,7 @@ int main(int argc, char** argv) {
 #endif
       rows.push_back(runOurs<SnluAmd>("SupernodalLU AMD (on Asym)", t, opt, Asym, A, b, xTrue));
     }
+    rows.push_back(runPointBlock<PblkColamd>("PointBlockLU COLAMD (replay)", opt, A, b, xTrue));
     rows.push_back(runSparseLU(opt, A, b, xTrue));
 #ifdef HAVE_PARDISO
     for (int t : opt.threads) rows.push_back(runPardiso(t, opt, A, b, xTrue));

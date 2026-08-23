@@ -289,6 +289,7 @@ endfunction()
 
 add_dlu_test(test_supernodal_lu SOURCE test/test_supernodal_lu.cpp LABELS "quick;correctness")
 add_dlu_test(test_leftright_lu  SOURCE test/test_leftright_lu.cpp  LABELS "quick;correctness")
+add_dlu_test(test_pointblock_lu SOURCE test/test_pointblock_lu.cpp LABELS "quick;correctness")
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 
 # The reader's own unit tests are instant; the registry sweep that follows them

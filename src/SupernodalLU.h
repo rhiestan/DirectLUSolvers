@@ -654,6 +654,27 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // size * kIntraLevelSlack <= lanes. A level of ONE supernode is handled
   // separately and unconditionally -- see the level loop in factorize().
   // The counterpart of LeftRightLU::kTailLevelSlack.
+  //
+  // Re-measured 2026-08-22 on 16 cores / 32 lanes, interleaved (see the protocol
+  // note in factorize()), factorize seconds, best of 3 rounds:
+  //
+  //   slack  lap3d_30^3 t2/t4/t8/t16/t32        lap2d_300^2 t2/t4/t8/t16/t32
+  //     1    0.363 0.244 0.190 0.172 0.186      0.076 0.057 0.051 0.055 0.070
+  //     2    0.366 0.254 0.191 0.167 0.174      0.076 0.057 0.048 0.052 0.060
+  //     4    0.366 0.258 0.205 0.169 0.169      0.075 0.058 0.050 0.050 0.055
+  //     8    0.366 0.256 0.209 0.185 0.172      0.076 0.058 0.051 0.050 0.051
+  //    16    0.366 0.257 0.210 0.191 0.187      0.077 0.059 0.051 0.052 0.052
+  //    32    0.365 0.257 0.209 0.191 0.189      0.075 0.059 0.051 0.051 0.052
+  //
+  // 8 stays. The value is a genuine 3D-vs-2D TRADE and no setting wins both: a
+  // small slack carves more levels into chunked mode, which the deep 3D tree
+  // wants (lap3d/t8 0.209 -> 0.190 going 8 -> 1) and which costs the wide 2D
+  // tree at high lane counts, where those levels had real inter-supernode
+  // parallelism to give up (lap2d/t32 0.051 -> 0.070, 37% worse). The t2 and t4
+  // columns are flat because below 8 lanes the slack test cannot fire at all and
+  // the size==1 rule in factorize() is doing all the work. On the real FEM
+  // matrix laoss_2 the same shape holds: slack 2 leads at 4-8 lanes (t8 0.207 vs
+  // 0.231) and slack 8 at 32 (0.199 vs 0.202).
   static constexpr Index kIntraLevelSlack = 8;
 
   // Chunk extent to use when splitting `total` rows/columns across the pool.
@@ -663,9 +684,13 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   // ceil(total/128) chunks NO MATTER how many threads exist. Measured on this
   // project's matrices at 32 lanes, the heaviest supernodes carry ~1400-1650
   // off-diagonal rows and so would get only 11-13 chunks: 20 of 32 threads idle
-  // through the supernodes that dominate the factorization. Weighted by work,
-  // 52% (lap3d_30^3) and 44% (laoss_1) of all factorization work sits in
-  // supernodes that could not fill the machine that way.
+  // through the supernodes that dominate the factorization. Instrumented at 32
+  // lanes (2026-08-22), the supernodes that run in chunked mode are 84 of
+  // laoss_1's 49928 and 31 of lap3d_30^3's 12558 -- and they carry 76% and 80%
+  // of factorize wall time respectively, so that is the share at stake. The
+  // chunked share GROWS with the lane count (laoss_1: 35% at 8 lanes, 41% at 16,
+  // 76% at 32), because more lanes make more levels too narrow to fill in outer
+  // mode.
   //
   // The result is never coarser than kIntraChunkSize and never finer than the
   // floor above.
@@ -1840,23 +1865,38 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
     // 4-thread runs got NO intra-supernode parallelism at all, precisely where
     // the single-supernode root-separator levels cost the most.
     //
-    // factorize seconds, clang/AVX2, best of 3 (A/B INTERLEAVED -- see below):
+    // factorize seconds, best of 3 interleaved rounds, re-measured 2026-08-22 on
+    // 16 cores / 32 lanes (clang 22, -O3, default x86-64 ISA):
     //
-    //             lap3d_30^3  t2     t4     t8      lap2d_300^2  t2     t4     t8
-    //   slack only            0.817  0.756  0.392                0.150  0.121  0.109
-    //   + size==1             0.581  0.419  0.380                0.145  0.111  0.111
-    //                         1.41x  1.80x  1.03x                1.03x  1.09x  0.98x
+    //     lap3d_30^3    t2     t4     t8    t16    t32
+    //   slack only    0.537  0.521  0.210  0.185  0.170
+    //   + size==1     0.362  0.255  0.207  0.184  0.170
+    //                 1.48x  2.04x  1.01x  1.01x  1.00x
     //
-    // t8 is unchanged because size*8 <= 8 already admitted size==1 there; the
-    // gain is entirely the 2- and 4-lane cases the old test could not reach.
+    //     lap2d_300^2   t2     t4     t8    t16    t32
+    //   slack only    0.081  0.068  0.051  0.051  0.051
+    //   + size==1     0.075  0.058  0.051  0.050  0.051
+    //                 1.08x  1.17x  1.00x  1.02x  1.00x
     //
-    // MEASURE THIS INTERLEAVED IF YOU RETUNE IT. This is a 15W mobile part, and
-    // running one configuration to completion and then the other put thermal
-    // drift squarely on the parameter: identical builds of lap2d/t2 measured
-    // 0.143s and 0.377s in two sequential passes, and lap3d/t8 swung 0.382s to
-    // 0.852s. Alternating the two binaries run by run brought the within-arm
-    // spread down to 2-5%, which is where the table above comes from. The
-    // sequential numbers were worthless and nearly bought a wrong conclusion.
+    // The gain is exactly where the structural argument says it is and nowhere
+    // else: at 8 lanes and above, size*8 <= lanes already admits size==1, so the
+    // two arms are the same code and measure the same. At 2 and 4 lanes -- the
+    // cases the slack test could not reach -- the 3D tree gains 1.48x and 2.04x.
+    // The 2D tree gains a little rather than losing, so the trade the older
+    // (noisier) measurement of this suggested does not exist.
+    //
+    // MEASURE THIS INTERLEAVED IF YOU RETUNE IT. The original of this table came
+    // off a 15W mobile part where running one configuration to completion and
+    // then the other put thermal drift squarely on the parameter -- 2.2x to 2.6x
+    // swings between identical builds, against an effect of interest around
+    // 10-40%. A 16-core desktop that dissipates over 100W removes that hazard
+    // and replaces it with a quieter one: on THIS machine a factorization
+    // measured after earlier heavy work in the same process runs 9% (32 lanes)
+    // to 49% (2 lanes) slower than the first one in a fresh process, and stays
+    // slow -- it is not thermal, a 10s idle gap does not restore it. Either
+    // hazard lands on whichever arm is measured second. Alternating the two
+    // binaries run by run, with a discarded warm-up inside each, brought the
+    // within-arm spread to 1-3%, which is where the table above comes from.
     bool innerMode = m_intraParallel && lanes > 1 &&
                      (groupSize == 1 || groupSize * kIntraLevelSlack <= lanes);
     if (innerMode) {

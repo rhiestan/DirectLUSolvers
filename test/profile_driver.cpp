@@ -5,7 +5,13 @@
 // a run can be restricted to one solver and one phase.
 //
 //   profile_driver [--solver snlu|lrlu] [--phase all|analyze|factorize|solve]
-//                  [--reps N] [--matrix <group/name> ...]
+//                  [--reps N] [--matrix <group/name> ...] [--threads N]
+//                  [--synthetic lap2d|lap3d] [--no-intra]
+//
+// --no-intra turns setIntraSupernodeParallelism OFF in both solvers, which is
+// what isolates the scheduler under a threading profile: with it ON, the narrow
+// top levels are chunked across the pool, so the starvation the level/DAG
+// schedule suffers there no longer appears in the timeline.
 //
 // Phases are wrapped in ITT task markers when built with DLU_WITH_ITT, so
 // VTune's "Task Type" grouping splits the timeline without a second run.
@@ -80,11 +86,12 @@ enum class Phase { All, Analyze, Factorize, Solve };
 
 template <typename Solver>
 Timing profileOne(const SparseMatrix<double>& A, const VectorXd& b, Phase phase, int reps,
-                  int threads) {
+                  int threads, bool intra) {
   Timing t;
   Solver s;
   s.setMaxFactorNonzeros(kFillLimit);
   if (threads > 1) s.executor() = PooledExecutor(threads);
+  s.setIntraSupernodeParallelism(intra);
 
   // analyzePattern is idempotent, so repeating it is legitimate; factorize and
   // solve are repeated against the one analysis, which is how a caller with
@@ -143,6 +150,7 @@ int main(int argc, char** argv) {
   Phase phase = Phase::All;
   int reps = 1;
   int threads = 1;
+  bool intra = true;
   std::string synthetic;
   std::vector<std::string> want;
 
@@ -153,6 +161,7 @@ int main(int argc, char** argv) {
     else if (a == "--matrix" && i + 1 < argc) want.push_back(argv[++i]);
     else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
     else if (a == "--synthetic" && i + 1 < argc) synthetic = argv[++i];
+    else if (a == "--no-intra") intra = false;
     else if (a == "--phase" && i + 1 < argc) {
       const std::string p = argv[++i];
       if (p == "all") phase = Phase::All;
@@ -162,7 +171,7 @@ int main(int argc, char** argv) {
       else { std::printf("unknown phase '%s'\n", p.c_str()); return 2; }
     } else {
       std::printf("usage: %s [--solver snlu|lrlu|both] [--phase all|analyze|factorize|solve]\n"
-                  "          [--reps N] [--matrix <group/name>]...\n", argv[0]);
+                  "          [--reps N] [--matrix <group/name>]... [--threads N] [--no-intra]\n", argv[0]);
       return 2;
     }
   }
@@ -184,9 +193,9 @@ int main(int argc, char** argv) {
                   (long long)A.rows(), who, t.analyze, t.factorize, t.solve, t.fill);
     };
     if (solver == "snlu" || solver == "both")
-      show("SNLU", profileOne<SnluMT>(A, b, phase, reps, threads));
+      show("SNLU", profileOne<SnluMT>(A, b, phase, reps, threads, intra));
     if (solver == "lrlu" || solver == "both")
-      show("LRLU", profileOne<LrluMT>(A, b, phase, reps, threads));
+      show("LRLU", profileOne<LrluMT>(A, b, phase, reps, threads, intra));
     return 0;
   }
 
@@ -229,9 +238,9 @@ int main(int argc, char** argv) {
     };
 
     if (solver == "snlu" || solver == "both")
-      report("SNLU", profileOne<SnluMT>(A, b, phase, reps, threads));
+      report("SNLU", profileOne<SnluMT>(A, b, phase, reps, threads, intra));
     if (solver == "lrlu" || solver == "both")
-      report("LRLU", profileOne<LrluMT>(A, b, phase, reps, threads));
+      report("LRLU", profileOne<LrluMT>(A, b, phase, reps, threads, intra));
   }
 
   std::printf("\ntotal: load %.3fs  analyze %.3fs  factorize %.3fs  solve %.3fs\n",

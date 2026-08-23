@@ -1,0 +1,3 @@
+// Eigen-style umbrella include for the PointBlockLU module.
+// Usage:  #include <PointBlockLU>   (with DirectLUSolvers/src on the include path)
+#include "PointBlockLU.h"

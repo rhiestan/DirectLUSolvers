@@ -17,10 +17,12 @@
 //      the achievable speedup no matter how good the factorization scheduler
 //      gets -- and the "many right-hand sides against one factorization" use
 //      case the README advertises makes solve() the dominant term.
-//   2. Which MECHANISM pays. SupernodalLU has two: elimination-tree level
-//      parallelism, and intra-supernode chunking (setIntraSupernodeParallelism).
-//      LeftRightLU has a third, its barrier-free DAG scheduler. Measuring them
-//      separately says which one to invest in.
+//   2. Which MECHANISM pays. Each solver has two, and they are separable:
+//      SupernodalLU schedules elimination-tree LEVELS and chunks the work INSIDE
+//      a supernode (setIntraSupernodeParallelism); LeftRightLU runs a
+//      barrier-free DAG and, once that runs dry near the root, sweeps the narrow
+//      tail levels with the pool applied inside each supernode (same switch).
+//      Both switches are toggled here, so each row isolates one mechanism.
 //
 // So this sweeps thread counts and reports every phase separately, per solver,
 // with the intra-supernode mechanism toggled on and off.
@@ -34,8 +36,11 @@
 //   bench_parallel --quick               # synthetic matrices only, fast
 //   bench_parallel path/to/A.mtx ...     # explicit matrices
 //
-// Timings are best-of-reps (not mean): the minimum is the least noisy estimator
-// of achievable time on a loaded desktop.
+// Timings are best-of-reps after a DISCARDED WARM-UP run (not mean): the minimum
+// is the least noisy estimator of achievable time on a loaded desktop, and the
+// warm-up is what makes the rows comparable to each other at all -- see the
+// comment on bestOf() below, which is worth reading before trusting any number
+// this program prints.
 
 #include <Eigen/SparseCore>
 
@@ -84,8 +89,23 @@ struct PhaseRow {
   bool parallelizable = true;  // false => a flat row is expected, not a defect
 };
 
+// Best of `reps` TIMED runs, after one DISCARDED warm-up run.
+//
+// The warm-up is not a formality, and leaving it out silently biases the table.
+// Measured on this machine (lap3d_30^3, SupernodalLU levels+intra): the very
+// first heavy factorization in a fresh process runs 0.257s at 4 lanes, and every
+// factorization after a preceding heavy one runs 0.351s -- 35% slower, at every
+// thread count (49% at 2 lanes, 9% at 32), and PERMANENTLY: the process never
+// returns to the fast state, and a 10-second idle gap does not restore it, so it
+// is not thermal. Whatever the cause (it survives pool teardown, so it is not
+// thread placement), the consequence for a benchmark is the same: the
+// configuration measured FIRST reports a time no later configuration can reach,
+// and the sweep below measures four configurations in a fixed order. Warming up
+// each one puts every row in the same steady state, which is the state a caller
+// factorizing inside a running application actually gets.
 double bestOf(int reps, const std::function<void()>& body) {
   double best = 1e300;
+  body();  // warm-up, discarded
   for (int r = 0; r < reps; ++r) {
     const auto t0 = Clock::now();
     body();
@@ -124,7 +144,8 @@ MatrixResult sweep(const std::string& label, const SparseMatrix<double>& A, cons
   PhaseRow analyze{"analyze (symbolic)", std::vector<double>(T, 0.0), /*parallelizable=*/false};
   PhaseRow factorLevels{"SNLU factor, levels only", std::vector<double>(T, 0.0), true};
   PhaseRow factorIntra{"SNLU factor, levels+intra", std::vector<double>(T, 0.0), true};
-  PhaseRow factorDag{"LRLU factor, DAG scheduler", std::vector<double>(T, 0.0), true};
+  PhaseRow factorDag{"LRLU factor, DAG only", std::vector<double>(T, 0.0), true};
+  PhaseRow factorDagIntra{"LRLU factor, DAG+intra", std::vector<double>(T, 0.0), true};
   PhaseRow solve1{"SNLU solve, 1 rhs", std::vector<double>(T, 0.0), true};
   PhaseRow solveK{"SNLU solve, " + std::to_string(opt.rhs) + " rhs", std::vector<double>(T, 0.0), true};
 
@@ -165,19 +186,30 @@ MatrixResult sweep(const std::string& label, const SparseMatrix<double>& A, cons
       result.worstResid = std::max(result.worstResid, resid);
     }
 
-    // --- LeftRightLU, barrier-free dynamic scheduler
+    // --- LeftRightLU, barrier-free DAG alone: parallelism ACROSS supernodes
+    //     and nothing else, the counterpart of the "levels only" row above.
     {
       Lrlu s;
       s.executor() = PooledExecutor(threads);
+      s.setIntraSupernodeParallelism(false);
       s.analyzePattern(A);
       factorDag.timeMs[ti] = bestOf(opt.reps, [&] { s.factorize(A); });
+    }
+
+    // --- LeftRightLU, DAG plus the chunked tail sweep (the shipping default)
+    {
+      Lrlu s;
+      s.executor() = PooledExecutor(threads);
+      s.setIntraSupernodeParallelism(true);
+      s.analyzePattern(A);
+      factorDagIntra.timeMs[ti] = bestOf(opt.reps, [&] { s.factorize(A); });
       s.setMaxIterativeRefinements(0);
       const VectorXd x = s.solve(b);
       result.worstResid = std::max(result.worstResid, (A * x - b).norm() / b.norm());
     }
   }
 
-  result.rows = {analyze, factorLevels, factorIntra, factorDag, solve1, solveK};
+  result.rows = {analyze, factorLevels, factorIntra, factorDag, factorDagIntra, solve1, solveK};
   return result;
 }
 
@@ -207,8 +239,8 @@ void printMatrixResult(const MatrixResult& r, const Options& opt) {
   const std::size_t last = opt.threads.size() - 1;
   const double analyzeMs = r.rows[0].timeMs[last];
   const double factorMs = r.rows[2].timeMs[last];   // levels+intra, the default
-  const double solveMs = r.rows[4].timeMs[last];    // 1 rhs
-  const double solveKMs = r.rows[5].timeMs[last];
+  const double solveMs = r.rows[5].timeMs[last];    // 1 rhs
+  const double solveKMs = r.rows[6].timeMs[last];
   const double totalOne = analyzeMs + factorMs + solveMs;
   if (totalOne > 0.0) {
     std::printf("  at %d threads, one solve:   analyze %.0f%%  factor %.0f%%  solve %.0f%%\n",
