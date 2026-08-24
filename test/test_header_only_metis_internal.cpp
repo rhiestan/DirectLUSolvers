@@ -25,6 +25,7 @@
 #include "HeaderOnlyMetis/Coarsen.h"
 #include "HeaderOnlyMetis/Compress.h"
 #include "HeaderOnlyMetis/Graph.h"
+#include "HeaderOnlyMetis/InitialSeparator.h"
 #include "HeaderOnlyMetis/MinimumDegree.h"
 #include "HeaderOnlyMetis/PQueue.h"
 #include "HeaderOnlyMetis/Random.h"
@@ -580,6 +581,7 @@ void checkMatch(const std::string& name, bool useSHEM, idx_t nvtxs, std::vector<
   portGraph.vwgt = vwgt;
   portGraph.adjncy = adjncy;
   portGraph.adjwgt = adjwgt;
+  portGraph.nedges = static_cast<idx_t>(adjncy.size());
   portGraph.cmap.assign(static_cast<std::size_t>(nvtxs), idx_t(0));
   portGraph.setupTvwgt();
   header_only_metis::Ctrl<idx_t, real_t> portCtrl;
@@ -728,6 +730,7 @@ void checkCoarsenGraphDriver(const std::string& name, bool useSHEM, idx_t nvtxs,
   portGraph.vwgt = vwgt;
   portGraph.adjncy = adjncy;
   portGraph.adjwgt = adjwgt;
+  portGraph.nedges = static_cast<idx_t>(adjncy.size());
   portGraph.setupTvwgt();
   header_only_metis::Ctrl<idx_t, real_t> portCtrl;
   portCtrl.CoarsenTo = coarsenTo;
@@ -918,6 +921,7 @@ void checkSepRefine(const std::string& name, idx_t nvtxs, std::vector<idx_t> xad
   portGraph.vwgt = vwgt;
   portGraph.adjncy = adjncy;
   portGraph.adjwgt = adjwgt;
+  portGraph.nedges = static_cast<idx_t>(adjncy.size());
   portGraph.setupTvwgt();
   header_only_metis::allocate2WayNodePartitionMemory(&portGraph);
   portGraph.where = where0;
@@ -966,6 +970,94 @@ void checkSeparatorRefinementModule() {
   }
 }
 
+// --- InitialSeparator.h ---------------------------------------------------
+
+extern "C" {
+ctrl_t* metis_bridge_MakeCtrlForInitSep(graph_t* graph, int compress);
+void metis_bridge_InitSeparator(ctrl_t* ctrl, graph_t* graph, idx_t niparts);
+}
+
+void checkInitSeparator(const std::string& name, idx_t nvtxs, std::vector<idx_t> xadj,
+                        std::vector<idx_t> adjncy, idx_t seed, idx_t niparts, bool compress) {
+  std::vector<idx_t> vwgt(static_cast<std::size_t>(nvtxs), idx_t(1));
+  std::vector<idx_t> adjwgt(adjncy.size(), idx_t(1));
+
+  graph_t* refGraph = metis_bridge_MakeGraph(nvtxs, xadj.data(), adjncy.data(), vwgt.data(), adjwgt.data());
+  ctrl_t* ctrl = metis_bridge_MakeCtrlForInitSep(refGraph, compress ? 1 : 0);
+  isrand(seed);
+  metis_bridge_InitSeparator(ctrl, refGraph, niparts);
+
+  header_only_metis::Graph<idx_t, real_t> portGraph;
+  portGraph.nvtxs = nvtxs;
+  portGraph.xadj = xadj;
+  portGraph.vwgt = vwgt;
+  portGraph.adjncy = adjncy;
+  portGraph.adjwgt = adjwgt;
+  portGraph.nedges = static_cast<idx_t>(adjncy.size());
+  portGraph.setupTvwgt();
+
+  header_only_metis::Ctrl<idx_t, real_t> portCtrl;
+  portCtrl.compress = compress;
+  header_only_metis::randSeed<idx_t>(seed);
+  header_only_metis::initSeparator(portCtrl, &portGraph, niparts);
+
+  const std::vector<idx_t> refWhere(metis_bridge_graph_where(refGraph),
+                                    metis_bridge_graph_where(refGraph) + nvtxs);
+  const std::vector<idx_t> refPwgts(metis_bridge_graph_pwgts(refGraph), metis_bridge_graph_pwgts(refGraph) + 3);
+  const idx_t refMincut = metis_bridge_graph_mincut(refGraph);
+  const idx_t refNbnd = metis_bridge_graph_nbnd(refGraph);
+
+  checkTrue(refWhere == portGraph.where, name + ": where matches");
+  checkTrue(refPwgts == portGraph.pwgts, name + ": pwgts matches");
+  checkTrue(refMincut == portGraph.mincut, name + ": mincut matches");
+  checkTrue(refNbnd == portGraph.nbnd, name + ": nbnd matches");
+
+  // Independent sanity check: where must be a genuine {0,1,2} tri-partition
+  // and pwgts must actually sum the vertex weights per partition.
+  idx_t sumCheck[3] = {0, 0, 0};
+  bool validWhere = true;
+  for (idx_t i = 0; i < nvtxs; ++i) {
+    const idx_t w = portGraph.where[static_cast<std::size_t>(i)];
+    if (w < 0 || w > 2) validWhere = false;
+    else
+      sumCheck[w] += portGraph.vwgt[static_cast<std::size_t>(i)];
+  }
+  checkTrue(validWhere, name + ": port where values in {0,1,2}");
+  checkTrue(sumCheck[0] == portGraph.pwgts[0] && sumCheck[1] == portGraph.pwgts[1] &&
+                sumCheck[2] == portGraph.pwgts[2],
+            name + ": port pwgts consistent with where/vwgt");
+
+  metis_bridge_FreeCtrl(&ctrl);
+  metis_bridge_FreeGraph(&refGraph);
+}
+
+void checkInitialSeparatorModule() {
+  idx_t seed = 3000;
+  // GrowBisection path (nedges > 0).
+  for (idx_t n : {20, 100, 500, 1200}) {
+    for (double density : {0.02, 0.08, 0.2}) {
+      std::vector<idx_t> adjncy;
+      std::vector<idx_t> xadj = randomGraphXadj(n, density, static_cast<unsigned>(seed), adjncy);
+
+      const std::string base = "initsep: n=" + std::to_string(n) + " density=" + std::to_string(density) +
+                               " seed=" + std::to_string(seed);
+      checkInitSeparator(base + " niparts=1", n, xadj, adjncy, seed, idx_t(1), true);
+      checkInitSeparator(base + " niparts=3", n, xadj, adjncy, seed, idx_t(3), true);
+      checkInitSeparator(base + " nocompress", n, xadj, adjncy, seed, idx_t(3), false);
+      seed++;
+    }
+  }
+  // RandomBisection path (nedges == 0: fully disconnected).
+  for (idx_t n : {10, 50, 200}) {
+    std::vector<idx_t> xadj(static_cast<std::size_t>(n) + 1, 0);
+    std::vector<idx_t> adjncy;
+    const std::string base = "initsep disconnected: n=" + std::to_string(n) + " seed=" + std::to_string(seed);
+    checkInitSeparator(base + " niparts=1", n, xadj, adjncy, seed, idx_t(1), true);
+    checkInitSeparator(base + " niparts=3", n, xadj, adjncy, seed, idx_t(3), true);
+    seed++;
+  }
+}
+
 #endif  // HAVE_METIS
 
 }  // namespace
@@ -981,6 +1073,7 @@ int main() {
   checkCoarsenGraphDriverModule();
   checkPQueueModule();
   checkSeparatorRefinementModule();
+  checkInitialSeparatorModule();
 #else
   note("built without DLU_WITH_METIS -- nothing to check, pass by default");
 #endif

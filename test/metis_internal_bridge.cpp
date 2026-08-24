@@ -134,4 +134,35 @@ idx_t* metis_bridge_graph_pwgts(graph_t* g) { return g->pwgts; }
 idx_t metis_bridge_graph_mincut(graph_t* g) { return g->mincut; }
 idx_t metis_bridge_graph_nbnd(graph_t* g) { return g->nbnd; }
 
+// --- InitialSeparator.h support ------------------------------------------
+
+ctrl_t* metis_bridge_MakeCtrlForInitSep(graph_t* graph, int compress) {
+  ctrl_t* ctrl = SetupCtrl(METIS_OP_OMETIS, NULL, 1, 3, NULL, NULL);
+  ctrl->compress = compress;
+  AllocateWorkSpace(ctrl, graph);
+  return ctrl;
+}
+
+void metis_bridge_InitSeparator(ctrl_t* ctrl, graph_t* graph, idx_t niparts) {
+  InitSeparator(ctrl, graph, niparts);
+}
+
+// Isolation helper: GrowBisection/RandomBisection alone, without the
+// ConstructSeparator step that follows in InitSeparator.
+void metis_bridge_GrowBisection(ctrl_t* ctrl, graph_t* graph, real_t* ntpwgts, idx_t niparts) {
+  GrowBisection(ctrl, graph, ntpwgts, niparts);
+}
+void metis_bridge_RandomBisection(ctrl_t* ctrl, graph_t* graph, real_t* ntpwgts, idx_t niparts) {
+  RandomBisection(ctrl, graph, ntpwgts, niparts);
+}
+void metis_bridge_Setup2WayBalMultipliers(ctrl_t* ctrl, graph_t* graph, real_t* ntpwgts) {
+  Setup2WayBalMultipliers(ctrl, graph, ntpwgts);
+}
+void metis_bridge_Compute2WayPartitionParams(ctrl_t* ctrl, graph_t* graph) {
+  Compute2WayPartitionParams(ctrl, graph);
+}
+idx_t* metis_bridge_graph_bndind(graph_t* g) { return g->bndind; }
+idx_t* metis_bridge_graph_id(graph_t* g) { return g->id; }
+idx_t* metis_bridge_graph_ed(graph_t* g) { return g->ed; }
+
 }  // extern "C"
