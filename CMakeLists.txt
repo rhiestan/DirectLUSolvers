@@ -313,6 +313,33 @@ endif()
 add_dlu_test(test_regression SOURCE test/test_regression.cpp
              LABELS "testdata;regression" LINK ${DLU_REGRESSION_LINK})
 
+# Oracle harness for the header-only METIS nested-dissection port (see
+# DirectLUSolvers/src/HeaderOnlyMetis* once it exists). Registered
+# unconditionally like test_mc64/test_scalar_types below: without
+# DLU_WITH_METIS it just reports "nothing to check" and passes.
+set(DLU_HEADER_ONLY_METIS_LINK "")
+if(DLU_WITH_METIS)
+  list(APPEND DLU_HEADER_ONLY_METIS_LINK dlu_metis)
+endif()
+add_dlu_test(test_header_only_metis SOURCE test/test_header_only_metis.cpp
+             LABELS "testdata;correctness;metis" LINK ${DLU_HEADER_ONLY_METIS_LINK})
+add_dlu_test(test_header_only_metis_internal SOURCE test/test_header_only_metis_internal.cpp
+             LABELS "quick;correctness;metis" LINK ${DLU_HEADER_ONLY_METIS_LINK})
+if(DLU_WITH_METIS)
+  # metis_internal_bridge.cpp needs METIS's own (non-installed) internal
+  # headers -- metislib.h, struct.h, rename.h, gklib_rename.h, ... -- to reach
+  # ctrl_t/graph_t/CompressGraph/etc. See that file for why it is a separate
+  # translation unit from test_header_only_metis_internal.cpp.
+  target_sources(test_header_only_metis_internal PRIVATE test/metis_internal_bridge.cpp)
+  # Only libmetis/ (for metislib.h/struct.h/rename.h/...), NOT METIS/include:
+  # the raw source metis.h needs -DIDXTYPEWIDTH/-DREALTYPEWIDTH injected by
+  # METIS's own CMake build to define idx_t/real_t: pulling it in directly
+  # here (instead of resolving metis.h via dlu_metis's already-installed,
+  # already-configured copy) fails with "unknown type name 'idx_t'".
+  target_include_directories(test_header_only_metis_internal PRIVATE
+                             "${CMAKE_CURRENT_SOURCE_DIR}/../METIS/libmetis")
+endif()
+
 # SuiteSparse corpus sweep. The matrices are fetched on demand into a git-ignored
 # cache (test/matrices/fetch_suitesparse.py); with nothing downloaded the suite
 # reports how to get them and passes, so this is safe to register unconditionally.
