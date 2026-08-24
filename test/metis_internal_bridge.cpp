@@ -48,4 +48,61 @@ idx_t* metis_bridge_graph_label(graph_t* g) { return g->label; }
 
 void metis_bridge_FreeGraph(graph_t** g) { FreeGraph(g); }
 
+// --- Coarsen.h support -------------------------------------------------
+
+// Builds a standalone graph_t by copying the given arrays (ncon=1, matching
+// this port's scope). Caller must release via metis_bridge_FreeGraph.
+graph_t* metis_bridge_MakeGraph(idx_t nvtxs, idx_t* xadj, idx_t* adjncy, idx_t* vwgt, idx_t* adjwgt) {
+  graph_t* graph = CreateGraph();
+  const idx_t nedges = xadj[nvtxs];
+  graph->nvtxs = nvtxs;
+  graph->ncon = 1;
+  graph->nedges = nedges;
+  graph->xadj = imalloc(nvtxs + 1, "bridge: xadj");
+  icopy(nvtxs + 1, xadj, graph->xadj);
+  graph->vwgt = imalloc(nvtxs, "bridge: vwgt");
+  icopy(nvtxs, vwgt, graph->vwgt);
+  graph->adjncy = imalloc(nedges > 0 ? nedges : 1, "bridge: adjncy");
+  icopy(nedges, adjncy, graph->adjncy);
+  graph->adjwgt = imalloc(nedges > 0 ? nedges : 1, "bridge: adjwgt");
+  icopy(nedges, adjwgt, graph->adjwgt);
+  graph->cmap = imalloc(nvtxs, "bridge: cmap");
+  SetupGraph_tvwgt(graph);
+  SetupGraph_label(graph);
+  return graph;
+}
+
+// ctypeIsSHEM: 0 -> METIS_CTYPE_RM, nonzero -> METIS_CTYPE_SHEM. Also calls
+// AllocateWorkSpace(ctrl, graph), which Match_RM/Match_SHEM/CreateCoarseGraph
+// all depend on (iwspacemalloc against ctrl->mcore) -- matching the one-time
+// setup METIS_NodeND itself does before any algorithm runs.
+ctrl_t* metis_bridge_MakeCtrlForCoarsen(graph_t* graph, idx_t coarsenTo, idx_t maxvwgt,
+                                        int ctypeIsSHEM, int no2hop) {
+  ctrl_t* ctrl = SetupCtrl(METIS_OP_OMETIS, NULL, 1, 3, NULL, NULL);
+  ctrl->CoarsenTo = coarsenTo;
+  ctrl->maxvwgt[0] = maxvwgt;
+  ctrl->ctype = ctypeIsSHEM ? METIS_CTYPE_SHEM : METIS_CTYPE_RM;
+  ctrl->no2hop = no2hop;
+  AllocateWorkSpace(ctrl, graph);
+  return ctrl;
+}
+
+void metis_bridge_FreeCtrl(ctrl_t** ctrl) { FreeCtrl(ctrl); }
+
+idx_t metis_bridge_MatchRM(ctrl_t* ctrl, graph_t* graph) { return Match_RM(ctrl, graph); }
+idx_t metis_bridge_MatchSHEM(ctrl_t* ctrl, graph_t* graph) { return Match_SHEM(ctrl, graph); }
+
+graph_t* metis_bridge_graph_coarser(graph_t* g) { return g->coarser; }
+idx_t* metis_bridge_graph_cmap(graph_t* g) { return g->cmap; }
+
+// Runs the full multi-level CoarsenGraph driver (its own eqewgts computation,
+// maxvwgt computation, and do-while termination condition -- not exercised by
+// the single-level Match_RM/Match_SHEM bridge above). Returns the coarsest
+// graph reached; every intermediate level is still reachable by walking
+// ->finer from it, and everything is freed by walking that chain in the
+// caller (metis_bridge_FreeGraph is single-level, matching FreeGraph itself).
+graph_t* metis_bridge_CoarsenGraph(ctrl_t* ctrl, graph_t* graph) { return CoarsenGraph(ctrl, graph); }
+
+graph_t* metis_bridge_graph_finer(graph_t* g) { return g->finer; }
+
 }  // extern "C"

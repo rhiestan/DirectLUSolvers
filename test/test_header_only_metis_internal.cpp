@@ -22,6 +22,7 @@
 #ifdef HAVE_METIS
 #include <metis.h>
 
+#include "HeaderOnlyMetis/Coarsen.h"
 #include "HeaderOnlyMetis/Compress.h"
 #include "HeaderOnlyMetis/Graph.h"
 #include "HeaderOnlyMetis/MinimumDegree.h"
@@ -540,6 +541,245 @@ void checkCompressModule() {
   }
 }
 
+// --- Coarsen.h ---------------------------------------------------------
+
+extern "C" {
+struct ctrl_t;
+graph_t* metis_bridge_MakeGraph(idx_t nvtxs, idx_t* xadj, idx_t* adjncy, idx_t* vwgt, idx_t* adjwgt);
+ctrl_t* metis_bridge_MakeCtrlForCoarsen(graph_t* graph, idx_t coarsenTo, idx_t maxvwgt, int ctypeIsSHEM,
+                                        int no2hop);
+void metis_bridge_FreeCtrl(ctrl_t** ctrl);
+idx_t metis_bridge_MatchRM(ctrl_t* ctrl, graph_t* graph);
+idx_t metis_bridge_MatchSHEM(ctrl_t* ctrl, graph_t* graph);
+graph_t* metis_bridge_graph_coarser(graph_t* g);
+idx_t* metis_bridge_graph_cmap(graph_t* g);
+}
+
+void checkMatch(const std::string& name, bool useSHEM, idx_t nvtxs, std::vector<idx_t> xadj,
+                std::vector<idx_t> adjncy, std::vector<idx_t> vwgt, std::vector<idx_t> adjwgt,
+                idx_t coarsenTo, idx_t seed, bool no2hop) {
+  idx_t tvwgt = 0;
+  for (idx_t w : vwgt) tvwgt += w;
+  const idx_t maxvwgt =
+      static_cast<idx_t>(1.5 * static_cast<double>(tvwgt) / static_cast<double>(coarsenTo));
+
+  graph_t* refGraph =
+      metis_bridge_MakeGraph(nvtxs, xadj.data(), adjncy.data(), vwgt.data(), adjwgt.data());
+  ctrl_t* ctrl =
+      metis_bridge_MakeCtrlForCoarsen(refGraph, coarsenTo, maxvwgt, useSHEM ? 1 : 0, no2hop ? 1 : 0);
+  isrand(seed);
+  const idx_t refCnvtxs =
+      useSHEM ? metis_bridge_MatchSHEM(ctrl, refGraph) : metis_bridge_MatchRM(ctrl, refGraph);
+  graph_t* refCoarse = metis_bridge_graph_coarser(refGraph);
+
+  header_only_metis::Graph<idx_t, real_t> portGraph;
+  portGraph.nvtxs = nvtxs;
+  portGraph.xadj = xadj;
+  portGraph.vwgt = vwgt;
+  portGraph.adjncy = adjncy;
+  portGraph.adjwgt = adjwgt;
+  portGraph.cmap.assign(static_cast<std::size_t>(nvtxs), idx_t(0));
+  portGraph.setupTvwgt();
+  header_only_metis::Ctrl<idx_t> portCtrl;
+  portCtrl.CoarsenTo = coarsenTo;
+  portCtrl.maxvwgt = maxvwgt;
+  portCtrl.no2hop = no2hop;
+  header_only_metis::randSeed<idx_t>(seed);
+  const idx_t portCnvtxs = useSHEM ? header_only_metis::matchSHEM(portCtrl, &portGraph)
+                                   : header_only_metis::matchRM(portCtrl, &portGraph);
+  auto* portCoarse = portGraph.coarser.get();
+
+  checkTrue(refCnvtxs == portCnvtxs, name + ": cnvtxs matches");
+
+  const std::vector<idx_t> refCmap(metis_bridge_graph_cmap(refGraph),
+                                   metis_bridge_graph_cmap(refGraph) + nvtxs);
+  checkTrue(refCmap == portGraph.cmap, name + ": cmap matches");
+
+  const idx_t refCnvtxsG = metis_bridge_graph_nvtxs(refCoarse);
+  const idx_t refCnedges = metis_bridge_graph_nedges(refCoarse);
+  checkTrue(refCnvtxsG == portCoarse->nvtxs, name + ": coarse nvtxs matches");
+  checkTrue(refCnedges == portCoarse->nedges, name + ": coarse nedges matches");
+
+  const std::vector<idx_t> refXadj(metis_bridge_graph_xadj(refCoarse),
+                                   metis_bridge_graph_xadj(refCoarse) + refCnvtxsG + 1);
+  const std::vector<idx_t> refVwgt(metis_bridge_graph_vwgt(refCoarse),
+                                   metis_bridge_graph_vwgt(refCoarse) + refCnvtxsG);
+  const std::vector<idx_t> refAdjncy(metis_bridge_graph_adjncy(refCoarse),
+                                     metis_bridge_graph_adjncy(refCoarse) + refCnedges);
+  const std::vector<idx_t> refAdjwgt(metis_bridge_graph_adjwgt(refCoarse),
+                                     metis_bridge_graph_adjwgt(refCoarse) + refCnedges);
+  const idx_t refTvwgt = metis_bridge_graph_tvwgt(refCoarse);
+  const real_t refInvtvwgt = metis_bridge_graph_invtvwgt(refCoarse);
+
+  checkTrue(refXadj == portCoarse->xadj, name + ": coarse xadj matches");
+  checkTrue(refVwgt == portCoarse->vwgt, name + ": coarse vwgt matches");
+  checkTrue(refAdjncy == portCoarse->adjncy, name + ": coarse adjncy matches");
+  checkTrue(refAdjwgt == portCoarse->adjwgt, name + ": coarse adjwgt matches");
+  checkTrue(refTvwgt == portCoarse->tvwgt, name + ": coarse tvwgt matches");
+  checkTrue(refInvtvwgt == portCoarse->invtvwgt, name + ": coarse invtvwgt matches");
+
+  metis_bridge_FreeCtrl(&ctrl);
+  metis_bridge_FreeGraph(&refCoarse);  // FreeGraph does not cascade to graph->coarser
+  metis_bridge_FreeGraph(&refGraph);
+}
+
+void checkCoarsenModule() {
+  std::mt19937 rng(42);
+  idx_t seed = 1;
+
+  // Level-0-realistic: uniform vwgt=1, adjwgt=1 (Eigen's actual call
+  // convention). With adjwgt uniform, CoarsenGraph's own eqewgts check would
+  // always dispatch to Match_RM even when ctype=SHEM -- but Match_SHEM is
+  // still tested directly here since a standalone module needs to be correct
+  // on its own, and it IS reachable at level 1+ (see below).
+  for (idx_t n : {5, 20, 50, 200, 600}) {
+    for (double density : {0.02, 0.1, 0.3}) {
+      std::vector<idx_t> adjncy;
+      std::vector<idx_t> xadj = randomGraphXadj(n, density, static_cast<unsigned>(seed), adjncy);
+      std::vector<idx_t> vwgt(static_cast<std::size_t>(n), idx_t(1));
+      std::vector<idx_t> adjwgt(adjncy.size(), idx_t(1));
+      const idx_t coarsenTo = std::max<idx_t>(1, n / 2);
+
+      const std::string base = "coarsen L0: n=" + std::to_string(n) +
+                               " density=" + std::to_string(density) + " seed=" + std::to_string(seed);
+      checkMatch(base + " RM", false, n, xadj, adjncy, vwgt, adjwgt, coarsenTo, seed, false);
+      checkMatch(base + " SHEM", true, n, xadj, adjncy, vwgt, adjwgt, coarsenTo, seed, false);
+      checkMatch(base + " RM no2hop", false, n, xadj, adjncy, vwgt, adjwgt, coarsenTo, seed, true);
+      seed++;
+    }
+  }
+
+  // Level-1+-realistic: varied vwgt/adjwgt (as a graph would look after one
+  // round of contraction merged some vertices/edges), so Match_SHEM's
+  // heavy-edge selection is actually exercised, not degenerate.
+  for (idx_t n : {5, 20, 50, 200, 600}) {
+    for (double density : {0.05, 0.15, 0.3}) {
+      std::vector<idx_t> adjncy;
+      std::vector<idx_t> xadj = randomGraphXadj(n, density, static_cast<unsigned>(seed) + 1000, adjncy);
+      std::uniform_int_distribution<int> wgtDist(1, 5);
+      std::vector<idx_t> vwgt(static_cast<std::size_t>(n));
+      for (idx_t& w : vwgt) w = static_cast<idx_t>(wgtDist(rng));
+      std::vector<idx_t> adjwgt(adjncy.size());
+      for (idx_t& w : adjwgt) w = static_cast<idx_t>(wgtDist(rng));
+      const idx_t coarsenTo = std::max<idx_t>(1, n / 2);
+
+      const std::string base = "coarsen L1: n=" + std::to_string(n) +
+                               " density=" + std::to_string(density) + " seed=" + std::to_string(seed);
+      checkMatch(base + " RM", false, n, xadj, adjncy, vwgt, adjwgt, coarsenTo, seed, false);
+      checkMatch(base + " SHEM", true, n, xadj, adjncy, vwgt, adjwgt, coarsenTo, seed, false);
+      seed++;
+    }
+  }
+
+  // Small/edge cases: fully disconnected (all islands -> exercises the
+  // "island vertex" pairing path), and sizes straddling the UNMATCHEDFOR2HOP
+  // threshold so 2-hop matching actually triggers.
+  {
+    const idx_t n = 100;
+    std::vector<idx_t> xadj(static_cast<std::size_t>(n) + 1, 0);
+    std::vector<idx_t> adjncy;
+    std::vector<idx_t> vwgt(static_cast<std::size_t>(n), idx_t(1));
+    std::vector<idx_t> adjwgt;
+    checkMatch("coarsen: fully disconnected", false, n, xadj, adjncy, vwgt, adjwgt, n / 2, seed++, false);
+  }
+  // A sparse random graph tuned to leave >10% of vertices unmatched after the
+  // first pass, forcing Match_2Hop{Any,All} to actually run.
+  for (idx_t n : {200, 500, 1000}) {
+    std::vector<idx_t> adjncy;
+    std::vector<idx_t> xadj = randomGraphXadj(n, 0.006, static_cast<unsigned>(seed) + 5000, adjncy);
+    std::vector<idx_t> vwgt(static_cast<std::size_t>(n), idx_t(1));
+    std::vector<idx_t> adjwgt(adjncy.size(), idx_t(1));
+    const std::string base = "coarsen 2hop: n=" + std::to_string(n) + " seed=" + std::to_string(seed);
+    checkMatch(base + " RM", false, n, xadj, adjncy, vwgt, adjwgt, std::max<idx_t>(1, n / 2), seed, false);
+    checkMatch(base + " SHEM", true, n, xadj, adjncy, vwgt, adjwgt, std::max<idx_t>(1, n / 2), seed, false);
+    seed++;
+  }
+}
+
+// End-to-end multi-level driver check: matchRM/matchSHEM are already proven
+// correct in isolation above, so this validates CoarsenGraph's OWN loop logic
+// (the eqewgts scan, the maxvwgt computation, the do-while termination
+// condition) that single-level calls don't exercise.
+extern "C" {
+graph_t* metis_bridge_CoarsenGraph(ctrl_t* ctrl, graph_t* graph);
+graph_t* metis_bridge_graph_finer(graph_t* g);
+}
+
+void checkCoarsenGraphDriver(const std::string& name, bool useSHEM, idx_t nvtxs,
+                             std::vector<idx_t> xadj, std::vector<idx_t> adjncy, idx_t coarsenTo,
+                             idx_t seed) {
+  std::vector<idx_t> vwgt(static_cast<std::size_t>(nvtxs), idx_t(1));
+  std::vector<idx_t> adjwgt(adjncy.size(), idx_t(1));
+
+  graph_t* refGraph =
+      metis_bridge_MakeGraph(nvtxs, xadj.data(), adjncy.data(), vwgt.data(), adjwgt.data());
+  ctrl_t* ctrl = metis_bridge_MakeCtrlForCoarsen(refGraph, coarsenTo, 0, useSHEM ? 1 : 0, 0);
+  isrand(seed);
+  graph_t* refCoarsest = metis_bridge_CoarsenGraph(ctrl, refGraph);
+
+  int refLevels = 0;
+  for (graph_t* g = refCoarsest; g != nullptr; g = metis_bridge_graph_finer(g)) ++refLevels;
+
+  header_only_metis::Graph<idx_t, real_t> portGraph;
+  portGraph.nvtxs = nvtxs;
+  portGraph.xadj = xadj;
+  portGraph.vwgt = vwgt;
+  portGraph.adjncy = adjncy;
+  portGraph.adjwgt = adjwgt;
+  portGraph.setupTvwgt();
+  header_only_metis::Ctrl<idx_t> portCtrl;
+  portCtrl.CoarsenTo = coarsenTo;
+  portCtrl.ctype = useSHEM ? header_only_metis::CType::SHEM : header_only_metis::CType::RM;
+  portCtrl.no2hop = false;
+  header_only_metis::randSeed<idx_t>(seed);
+  auto* portCoarsest = header_only_metis::coarsenGraph(portCtrl, &portGraph);
+
+  int portLevels = 0;
+  for (auto* g = portCoarsest; g != nullptr; g = g->finer) ++portLevels;
+
+  checkTrue(refLevels == portLevels, name + ": level count matches");
+
+  const idx_t refCnvtxs = metis_bridge_graph_nvtxs(refCoarsest);
+  const idx_t refCnedges = metis_bridge_graph_nedges(refCoarsest);
+  checkTrue(refCnvtxs == portCoarsest->nvtxs, name + ": final nvtxs matches");
+  checkTrue(refCnedges == portCoarsest->nedges, name + ": final nedges matches");
+
+  const std::vector<idx_t> refXadj(metis_bridge_graph_xadj(refCoarsest),
+                                   metis_bridge_graph_xadj(refCoarsest) + refCnvtxs + 1);
+  const std::vector<idx_t> refAdjncy(metis_bridge_graph_adjncy(refCoarsest),
+                                     metis_bridge_graph_adjncy(refCoarsest) + refCnedges);
+  checkTrue(refXadj == portCoarsest->xadj, name + ": final xadj matches");
+  checkTrue(refAdjncy == portCoarsest->adjncy, name + ": final adjncy matches");
+
+  metis_bridge_FreeCtrl(&ctrl);
+  // Free the whole reference chain, coarsest-to-finest (FreeGraph is
+  // single-level and doesn't cascade -- see the earlier comment on it).
+  graph_t* g = refCoarsest;
+  while (g != refGraph) {
+    graph_t* finer = metis_bridge_graph_finer(g);
+    metis_bridge_FreeGraph(&g);
+    g = finer;
+  }
+  metis_bridge_FreeGraph(&refGraph);
+}
+
+void checkCoarsenGraphDriverModule() {
+  idx_t seed = 500;
+  for (idx_t n : {100, 500, 2000}) {
+    for (double density : {0.01, 0.05}) {
+      std::vector<idx_t> adjncy;
+      std::vector<idx_t> xadj = randomGraphXadj(n, density, static_cast<unsigned>(seed), adjncy);
+      // A small CoarsenTo relative to n forces several levels of coarsening.
+      const idx_t coarsenTo = std::max<idx_t>(4, n / 20);
+      const std::string base =
+          "coarsenGraph driver: n=" + std::to_string(n) + " density=" + std::to_string(density);
+      checkCoarsenGraphDriver(base + " RM", false, n, xadj, adjncy, coarsenTo, seed);
+      checkCoarsenGraphDriver(base + " SHEM", true, n, xadj, adjncy, coarsenTo, seed);
+      seed++;
+    }
+  }
+}
+
 #endif  // HAVE_METIS
 
 }  // namespace
@@ -551,6 +791,8 @@ int main() {
   checkSortingModule();
   checkQsortModule();
   checkCompressModule();
+  checkCoarsenModule();
+  checkCoarsenGraphDriverModule();
 #else
   note("built without DLU_WITH_METIS -- nothing to check, pass by default");
 #endif
