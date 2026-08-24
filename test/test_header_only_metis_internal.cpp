@@ -26,7 +26,9 @@
 #include "HeaderOnlyMetis/Compress.h"
 #include "HeaderOnlyMetis/Graph.h"
 #include "HeaderOnlyMetis/MinimumDegree.h"
+#include "HeaderOnlyMetis/PQueue.h"
 #include "HeaderOnlyMetis/Random.h"
+#include "HeaderOnlyMetis/SeparatorRefinement.h"
 #include "HeaderOnlyMetis/Sorting.h"
 #endif
 
@@ -580,7 +582,7 @@ void checkMatch(const std::string& name, bool useSHEM, idx_t nvtxs, std::vector<
   portGraph.adjwgt = adjwgt;
   portGraph.cmap.assign(static_cast<std::size_t>(nvtxs), idx_t(0));
   portGraph.setupTvwgt();
-  header_only_metis::Ctrl<idx_t> portCtrl;
+  header_only_metis::Ctrl<idx_t, real_t> portCtrl;
   portCtrl.CoarsenTo = coarsenTo;
   portCtrl.maxvwgt = maxvwgt;
   portCtrl.no2hop = no2hop;
@@ -727,7 +729,7 @@ void checkCoarsenGraphDriver(const std::string& name, bool useSHEM, idx_t nvtxs,
   portGraph.adjncy = adjncy;
   portGraph.adjwgt = adjwgt;
   portGraph.setupTvwgt();
-  header_only_metis::Ctrl<idx_t> portCtrl;
+  header_only_metis::Ctrl<idx_t, real_t> portCtrl;
   portCtrl.CoarsenTo = coarsenTo;
   portCtrl.ctype = useSHEM ? header_only_metis::CType::SHEM : header_only_metis::CType::RM;
   portCtrl.no2hop = false;
@@ -780,6 +782,190 @@ void checkCoarsenGraphDriverModule() {
   }
 }
 
+// --- PQueue.h ------------------------------------------------------------
+
+extern "C" {
+struct rpq_t;
+rpq_t* libmetis__rpqCreate(std::size_t maxnodes);
+void libmetis__rpqDestroy(rpq_t* queue);
+void libmetis__rpqReset(rpq_t* queue);
+std::size_t libmetis__rpqLength(rpq_t* queue);
+int libmetis__rpqInsert(rpq_t* queue, idx_t node, real_t key);
+int libmetis__rpqDelete(rpq_t* queue, idx_t node);
+void libmetis__rpqUpdate(rpq_t* queue, idx_t node, real_t newkey);
+idx_t libmetis__rpqGetTop(rpq_t* queue);
+}
+
+// Applies a scripted, seed-driven random sequence of insert/update/erase/
+// getTop operations to a reference rpq_t and a port PQueue in lockstep, and
+// checks getTop() agrees at every step. Exercises both filter-up and
+// filter-down paths in erase/update since keys are drawn from a wide range.
+void checkPQueueModule() {
+  const idx_t maxnodes = 200;
+  std::mt19937 rng(99);
+  std::uniform_real_distribution<float> keyDist(-1000.0f, 1000.0f);
+  std::uniform_int_distribution<idx_t> nodeDist(0, maxnodes - 1);
+  std::uniform_int_distribution<int> opDist(0, 3);  // insert/update/erase/getTop
+
+  for (int trial = 0; trial < 30; ++trial) {
+    rpq_t* refQ = libmetis__rpqCreate(static_cast<std::size_t>(maxnodes));
+    header_only_metis::PQueue<real_t, idx_t> portQ(static_cast<std::size_t>(maxnodes));
+    std::vector<char> present(static_cast<std::size_t>(maxnodes), 0);
+
+    bool ok = true;
+    for (int step = 0; step < 500 && ok; ++step) {
+      const int op = opDist(rng);
+      const idx_t node = nodeDist(rng);
+      const real_t key = static_cast<real_t>(keyDist(rng));
+
+      if (op == 0) {  // insert (only if absent)
+        if (!present[static_cast<std::size_t>(node)]) {
+          libmetis__rpqInsert(refQ, node, key);
+          portQ.insert(node, key);
+          present[static_cast<std::size_t>(node)] = 1;
+        }
+      } else if (op == 1) {  // update (only if present)
+        if (present[static_cast<std::size_t>(node)]) {
+          libmetis__rpqUpdate(refQ, node, key);
+          portQ.update(node, key);
+        }
+      } else if (op == 2) {  // erase (only if present)
+        if (present[static_cast<std::size_t>(node)]) {
+          libmetis__rpqDelete(refQ, node);
+          portQ.erase(node);
+          present[static_cast<std::size_t>(node)] = 0;
+        }
+      } else {  // getTop
+        const idx_t refTop = libmetis__rpqGetTop(refQ);
+        const idx_t portTop = portQ.getTop();
+        if (refTop != portTop) {
+          ok = false;
+          break;
+        }
+        if (refTop != -1) present[static_cast<std::size_t>(refTop)] = 0;
+      }
+
+      if (libmetis__rpqLength(refQ) != portQ.length()) {
+        ok = false;
+        break;
+      }
+    }
+
+    checkTrue(ok, "PQueue: scripted sequence trial " + std::to_string(trial));
+    libmetis__rpqDestroy(refQ);
+  }
+}
+
+// --- SeparatorRefinement.h -----------------------------------------------
+
+extern "C" {
+ctrl_t* metis_bridge_MakeCtrlForSepRefine(graph_t* graph, int compress);
+void metis_bridge_Allocate2WayNodePartitionMemory(ctrl_t* ctrl, graph_t* graph);
+void metis_bridge_SetWhere(graph_t* graph, idx_t* where);
+void metis_bridge_Compute2WayNodePartitionParams(ctrl_t* ctrl, graph_t* graph);
+void metis_bridge_FM_2WayNodeRefine2Sided(ctrl_t* ctrl, graph_t* graph, idx_t niter);
+void metis_bridge_FM_2WayNodeRefine1Sided(ctrl_t* ctrl, graph_t* graph, idx_t niter);
+void metis_bridge_FM_2WayNodeBalance(ctrl_t* ctrl, graph_t* graph);
+idx_t* metis_bridge_graph_where(graph_t* g);
+idx_t* metis_bridge_graph_pwgts(graph_t* g);
+idx_t metis_bridge_graph_mincut(graph_t* g);
+idx_t metis_bridge_graph_nbnd(graph_t* g);
+}
+
+// Builds a genuine tri-partition (0/1/2) from a graph: bisect by index, then
+// promote any vertex with a cross-edge to the separator (where=2). Simpler
+// than ConstructSeparator's own version, but the same idea -- this test only
+// needs a valid, non-trivial starting point for refinement, not a good one.
+std::vector<idx_t> buildTriPartition(idx_t nvtxs, const std::vector<idx_t>& xadj,
+                                     const std::vector<idx_t>& adjncy) {
+  std::vector<idx_t> where(static_cast<std::size_t>(nvtxs));
+  for (idx_t i = 0; i < nvtxs; ++i) where[static_cast<std::size_t>(i)] = (i < nvtxs / 2) ? idx_t(0) : idx_t(1);
+  for (idx_t i = 0; i < nvtxs; ++i) {
+    for (idx_t j = xadj[static_cast<std::size_t>(i)]; j < xadj[static_cast<std::size_t>(i) + 1]; ++j) {
+      const idx_t k = adjncy[static_cast<std::size_t>(j)];
+      if (where[static_cast<std::size_t>(i)] != where[static_cast<std::size_t>(k)]) {
+        where[static_cast<std::size_t>(i)] = 2;
+        break;
+      }
+    }
+  }
+  return where;
+}
+
+void checkSepRefine(const std::string& name, idx_t nvtxs, std::vector<idx_t> xadj,
+                    std::vector<idx_t> adjncy, idx_t seed, bool use2Sided, bool useBalance,
+                    bool compress) {
+  std::vector<idx_t> vwgt(static_cast<std::size_t>(nvtxs), idx_t(1));
+  std::vector<idx_t> adjwgt(adjncy.size(), idx_t(1));
+  std::vector<idx_t> where0 = buildTriPartition(nvtxs, xadj, adjncy);
+
+  graph_t* refGraph = metis_bridge_MakeGraph(nvtxs, xadj.data(), adjncy.data(), vwgt.data(), adjwgt.data());
+  ctrl_t* ctrl = metis_bridge_MakeCtrlForSepRefine(refGraph, compress ? 1 : 0);
+  metis_bridge_Allocate2WayNodePartitionMemory(ctrl, refGraph);
+  metis_bridge_SetWhere(refGraph, where0.data());
+  metis_bridge_Compute2WayNodePartitionParams(ctrl, refGraph);
+
+  isrand(seed);
+  if (useBalance) metis_bridge_FM_2WayNodeBalance(ctrl, refGraph);
+  if (use2Sided)
+    metis_bridge_FM_2WayNodeRefine2Sided(ctrl, refGraph, idx_t(4));
+  else
+    metis_bridge_FM_2WayNodeRefine1Sided(ctrl, refGraph, idx_t(4));
+
+  header_only_metis::Graph<idx_t, real_t> portGraph;
+  portGraph.nvtxs = nvtxs;
+  portGraph.xadj = xadj;
+  portGraph.vwgt = vwgt;
+  portGraph.adjncy = adjncy;
+  portGraph.adjwgt = adjwgt;
+  portGraph.setupTvwgt();
+  header_only_metis::allocate2WayNodePartitionMemory(&portGraph);
+  portGraph.where = where0;
+  header_only_metis::compute2WayNodePartitionParams(&portGraph);
+
+  header_only_metis::Ctrl<idx_t, real_t> portCtrl;
+  portCtrl.compress = compress;
+  header_only_metis::randSeed<idx_t>(seed);
+  if (useBalance) header_only_metis::fm2WayNodeBalance(portCtrl, &portGraph);
+  if (use2Sided)
+    header_only_metis::fm2WayNodeRefine2Sided(portCtrl, &portGraph, idx_t(4));
+  else
+    header_only_metis::fm2WayNodeRefine1Sided(portCtrl, &portGraph, idx_t(4));
+
+  const std::vector<idx_t> refWhere(metis_bridge_graph_where(refGraph),
+                                    metis_bridge_graph_where(refGraph) + nvtxs);
+  const std::vector<idx_t> refPwgts(metis_bridge_graph_pwgts(refGraph), metis_bridge_graph_pwgts(refGraph) + 3);
+  const idx_t refMincut = metis_bridge_graph_mincut(refGraph);
+  const idx_t refNbnd = metis_bridge_graph_nbnd(refGraph);
+
+  checkTrue(refWhere == portGraph.where, name + ": where matches");
+  checkTrue(refPwgts == portGraph.pwgts, name + ": pwgts matches");
+  checkTrue(refMincut == portGraph.mincut, name + ": mincut matches");
+  checkTrue(refNbnd == portGraph.nbnd, name + ": nbnd matches");
+
+  metis_bridge_FreeCtrl(&ctrl);
+  metis_bridge_FreeGraph(&refGraph);
+}
+
+void checkSeparatorRefinementModule() {
+  idx_t seed = 2000;
+  for (idx_t n : {20, 100, 500, 1200}) {
+    for (double density : {0.02, 0.08, 0.2}) {
+      std::vector<idx_t> adjncy;
+      std::vector<idx_t> xadj = randomGraphXadj(n, density, static_cast<unsigned>(seed), adjncy);
+
+      const std::string base =
+          "sepref: n=" + std::to_string(n) + " density=" + std::to_string(density) + " seed=" + std::to_string(seed);
+      checkSepRefine(base + " 2sided", n, xadj, adjncy, seed, true, false, true);
+      checkSepRefine(base + " 1sided", n, xadj, adjncy, seed, false, false, true);
+      checkSepRefine(base + " 2sided nocompress", n, xadj, adjncy, seed, true, false, false);
+      checkSepRefine(base + " balance+2sided", n, xadj, adjncy, seed, true, true, true);
+      checkSepRefine(base + " balance+1sided", n, xadj, adjncy, seed, false, true, true);
+      seed++;
+    }
+  }
+}
+
 #endif  // HAVE_METIS
 
 }  // namespace
@@ -793,6 +979,8 @@ int main() {
   checkCompressModule();
   checkCoarsenModule();
   checkCoarsenGraphDriverModule();
+  checkPQueueModule();
+  checkSeparatorRefinementModule();
 #else
   note("built without DLU_WITH_METIS -- nothing to check, pass by default");
 #endif

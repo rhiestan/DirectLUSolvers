@@ -105,4 +105,33 @@ graph_t* metis_bridge_CoarsenGraph(ctrl_t* ctrl, graph_t* graph) { return Coarse
 
 graph_t* metis_bridge_graph_finer(graph_t* g) { return g->finer; }
 
+// --- SeparatorRefinement.h support --------------------------------------
+
+ctrl_t* metis_bridge_MakeCtrlForSepRefine(graph_t* graph, int compress) {
+  ctrl_t* ctrl = SetupCtrl(METIS_OP_OMETIS, NULL, 1, 3, NULL, NULL);
+  ctrl->compress = compress;
+  AllocateWorkSpace(ctrl, graph);
+  return ctrl;
+}
+
+void metis_bridge_Allocate2WayNodePartitionMemory(ctrl_t* ctrl, graph_t* graph) {
+  Allocate2WayNodePartitionMemory(ctrl, graph);
+}
+void metis_bridge_SetWhere(graph_t* graph, idx_t* where) { icopy(graph->nvtxs, where, graph->where); }
+void metis_bridge_Compute2WayNodePartitionParams(ctrl_t* ctrl, graph_t* graph) {
+  Compute2WayNodePartitionParams(ctrl, graph);
+}
+void metis_bridge_FM_2WayNodeRefine2Sided(ctrl_t* ctrl, graph_t* graph, idx_t niter) {
+  FM_2WayNodeRefine2Sided(ctrl, graph, niter);
+}
+void metis_bridge_FM_2WayNodeRefine1Sided(ctrl_t* ctrl, graph_t* graph, idx_t niter) {
+  FM_2WayNodeRefine1Sided(ctrl, graph, niter);
+}
+void metis_bridge_FM_2WayNodeBalance(ctrl_t* ctrl, graph_t* graph) { FM_2WayNodeBalance(ctrl, graph); }
+
+idx_t* metis_bridge_graph_where(graph_t* g) { return g->where; }
+idx_t* metis_bridge_graph_pwgts(graph_t* g) { return g->pwgts; }
+idx_t metis_bridge_graph_mincut(graph_t* g) { return g->mincut; }
+idx_t metis_bridge_graph_nbnd(graph_t* g) { return g->nbnd; }
+
 }  // extern "C"

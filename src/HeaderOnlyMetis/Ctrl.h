@@ -17,12 +17,22 @@ namespace header_only_metis {
 // values genmmd's caller can dispatch to on the default-options path.
 enum class CType { RM, SHEM };
 
-template <typename IndexT>
+// METIS_RTYPE_SEP1SIDED / METIS_RTYPE_SEP2SIDED (metis.h's mrtype_et) -- the
+// only two values reachable from Refine2WayNode's rtype switch on the
+// default node-ND path (METIS_RTYPE_FM/GREEDY are the kmetis/pmetis values).
+enum class RType { SEP1SIDED, SEP2SIDED };
+
+template <typename IndexT, typename RealT>
 struct Ctrl {
   IndexT CoarsenTo = 0;  // target coarsest-graph vertex count for this bisection
   IndexT maxvwgt = 0;    // max allowed coarsened-vertex weight (ncon=1, so scalar not array)
   CType ctype = CType::SHEM;  // options.c OMETIS default
   bool no2hop = false;        // options.c OMETIS default: 2-hop matching enabled
+  IndexT niter = 10;           // options.c OMETIS default: refinement iterations per pass
+  RealT ubfactor = RealT(1.2);  // I2RUBFACTOR(OMETIS_DEFAULT_UFACTOR=200) = 1.0+0.001*200
+  bool compress = true;         // options.c OMETIS default: ctrl->compress
+  RealT pijbm[2] = {0, 0};      // Setup2WayBalMultipliers' output: invtvwgt/tpwgts[i], ncon=1
+  RType rtype = RType::SEP1SIDED;  // options.c OMETIS default
 };
 
 }  // namespace header_only_metis

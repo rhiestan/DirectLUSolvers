@@ -55,12 +55,12 @@ template <typename IndexT>
 constexpr IndexT kUnmatched = IndexT(-1);  // libmetis/defs.h: UNMATCHED
 
 template <typename IndexT, typename RealT>
-void createCoarseGraph(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, IndexT cnvtxs,
+void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, IndexT cnvtxs,
                        const std::vector<IndexT>& match);
 template <typename IndexT, typename RealT>
-IndexT matchRM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph);
+IndexT matchRM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph);
 template <typename IndexT, typename RealT>
-IndexT matchSHEM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph);
+IndexT matchSHEM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph);
 
 // This function takes a graph and creates a sequence of coarser graphs. It
 // implements the coarsening phase of the multilevel paradigm.
@@ -70,7 +70,7 @@ IndexT matchSHEM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph);
 // `graph` (or whichever object owns it) alive for as long as the returned
 // pointer, or any graph in the chain, is used.
 template <typename IndexT, typename RealT>
-Graph<IndexT, RealT>* coarsenGraph(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph) {
+Graph<IndexT, RealT>* coarsenGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
   IndexT eqewgts = 1;
   for (IndexT i = 1; i < graph->nedges; i++) {
     if (graph->adjwgt[0] != graph->adjwgt[static_cast<std::size_t>(i)]) {
@@ -110,7 +110,7 @@ Graph<IndexT, RealT>* coarsenGraph(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* gra
 // This function takes a graph and creates a sequence of nlevels coarser
 // graphs, where nlevels is an input parameter.
 template <typename IndexT, typename RealT>
-Graph<IndexT, RealT>* coarsenGraphNlevels(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph,
+Graph<IndexT, RealT>* coarsenGraphNlevels(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph,
                                           IndexT nlevels) {
   IndexT eqewgts = 1;
   for (IndexT i = 1; i < graph->nedges; i++) {
@@ -151,7 +151,7 @@ Graph<IndexT, RealT>* coarsenGraphNlevels(Ctrl<IndexT>& ctrl, Graph<IndexT, Real
 }
 
 template <typename IndexT, typename RealT>
-IndexT match2HopAny(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
+IndexT match2HopAny(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
                     std::vector<IndexT>& match, IndexT cnvtxs, std::size_t& nunmatched,
                     std::size_t maxdegree) {
   (void)ctrl;
@@ -215,7 +215,7 @@ IndexT match2HopAny(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, const std::
 }
 
 template <typename IndexT, typename RealT>
-IndexT match2HopAll(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
+IndexT match2HopAll(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
                     std::vector<IndexT>& match, IndexT cnvtxs, std::size_t& nunmatched,
                     std::size_t maxdegree) {
   (void)ctrl;
@@ -277,7 +277,7 @@ IndexT match2HopAll(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, const std::
 }
 
 template <typename IndexT, typename RealT>
-IndexT match2Hop(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
+IndexT match2Hop(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
                  std::vector<IndexT>& match, IndexT cnvtxs, std::size_t nunmatched) {
   cnvtxs = match2HopAny(ctrl, graph, perm, match, cnvtxs, nunmatched, std::size_t(2));
   cnvtxs = match2HopAll(ctrl, graph, perm, match, cnvtxs, nunmatched, std::size_t(64));
@@ -292,7 +292,7 @@ IndexT match2Hop(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, const std::vec
 // This function finds a matching by randomly selecting one of the unmatched
 // adjacent vertices.
 template <typename IndexT, typename RealT>
-IndexT matchRM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph) {
+IndexT matchRM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
   const IndexT nvtxs = graph->nvtxs;
   const std::vector<IndexT>& xadj = graph->xadj;
   const std::vector<IndexT>& vwgt = graph->vwgt;
@@ -392,7 +392,7 @@ IndexT matchRM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph) {
 // visited based on increasing degree to ensure that all vertices are given a
 // chance to match with something.
 template <typename IndexT, typename RealT>
-IndexT matchSHEM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph) {
+IndexT matchSHEM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
   const IndexT nvtxs = graph->nvtxs;
   const std::vector<IndexT>& xadj = graph->xadj;
   const std::vector<IndexT>& vwgt = graph->vwgt;
@@ -486,7 +486,7 @@ IndexT matchSHEM(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph) {
 // candidate adjacency lists it either uses a hash table or an array to do
 // duplicate detection.
 template <typename IndexT, typename RealT>
-void createCoarseGraph(Ctrl<IndexT>& ctrl, Graph<IndexT, RealT>* graph, IndexT cnvtxs,
+void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, IndexT cnvtxs,
                        const std::vector<IndexT>& match) {
   (void)ctrl;
   const IndexT nvtxs = graph->nvtxs;
