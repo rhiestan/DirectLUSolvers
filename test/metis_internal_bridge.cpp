@@ -102,6 +102,9 @@ idx_t* metis_bridge_graph_cmap(graph_t* g) { return g->cmap; }
 // ->finer from it, and everything is freed by walking that chain in the
 // caller (metis_bridge_FreeGraph is single-level, matching FreeGraph itself).
 graph_t* metis_bridge_CoarsenGraph(ctrl_t* ctrl, graph_t* graph) { return CoarsenGraph(ctrl, graph); }
+graph_t* metis_bridge_CoarsenGraphNlevels(ctrl_t* ctrl, graph_t* graph, idx_t nlevels) {
+  return CoarsenGraphNlevels(ctrl, graph, nlevels);
+}
 
 graph_t* metis_bridge_graph_finer(graph_t* g) { return g->finer; }
 
@@ -164,5 +167,41 @@ void metis_bridge_Compute2WayPartitionParams(ctrl_t* ctrl, graph_t* graph) {
 idx_t* metis_bridge_graph_bndind(graph_t* g) { return g->bndind; }
 idx_t* metis_bridge_graph_id(graph_t* g) { return g->id; }
 idx_t* metis_bridge_graph_ed(graph_t* g) { return g->ed; }
+
+// --- NestedDissection.h support ------------------------------------------
+
+ctrl_t* metis_bridge_MakeCtrlForND(graph_t* graph) {
+  ctrl_t* ctrl = SetupCtrl(METIS_OP_OMETIS, NULL, 1, 3, NULL, NULL);
+  AllocateWorkSpace(ctrl, graph);
+  return ctrl;
+}
+void metis_bridge_MlevelNodeBisectionMultiple(ctrl_t* ctrl, graph_t* graph) {
+  MlevelNodeBisectionMultiple(ctrl, graph);
+}
+void metis_bridge_MlevelNodeBisectionL1(ctrl_t* ctrl, graph_t* graph, idx_t niparts) {
+  MlevelNodeBisectionL1(ctrl, graph, niparts);
+}
+void metis_bridge_FreeRData(graph_t* graph) { FreeRData(graph); }
+// Mutates CoarsenTo on an EXISTING ctrl, which is what a step-by-step
+// comparison against the port needs: building a fresh ctrl_t instead (via any
+// of the MakeCtrlFor* helpers above) routes through SetupCtrl, which calls
+// InitRandom(ctrl->seed) (options.c:128) and so silently rewinds the global
+// RNG stream mid-comparison.
+void metis_bridge_SetCoarsenTo(ctrl_t* ctrl, idx_t coarsenTo) { ctrl->CoarsenTo = coarsenTo; }
+void metis_bridge_Refine2WayNode(ctrl_t* ctrl, graph_t* orggraph, graph_t* graph) {
+  Refine2WayNode(ctrl, orggraph, graph);
+}
+void metis_bridge_SplitGraphOrder(ctrl_t* ctrl, graph_t* graph, graph_t** lgraph, graph_t** rgraph) {
+  SplitGraphOrder(ctrl, graph, lgraph, rgraph);
+}
+void metis_bridge_MMDOrder(ctrl_t* ctrl, graph_t* graph, idx_t* order, idx_t lastvtx) {
+  MMDOrder(ctrl, graph, order, lastvtx);
+}
+void metis_bridge_MlevelNestedDissection(ctrl_t* ctrl, graph_t* graph, idx_t* order, idx_t lastvtx) {
+  MlevelNestedDissection(ctrl, graph, order, lastvtx);
+}
+int metis_bridge_NodeND(idx_t nvtxs, idx_t* xadj, idx_t* adjncy, idx_t* perm, idx_t* iperm) {
+  return METIS_NodeND(&nvtxs, xadj, adjncy, NULL, NULL, perm, iperm);
+}
 
 }  // extern "C"

@@ -83,6 +83,24 @@ struct Graph {
     label.resize(static_cast<std::size_t>(nvtxs));
     for (IndexT i = 0; i < nvtxs; ++i) label[static_cast<std::size_t>(i)] = i;
   }
+
+  // Matches FreeRData (graph.c): drops the partition/refinement fields
+  // (where/pwgts/id/ed/bndptr/bndind/nrinfo), leaving the graph's structural
+  // fields (xadj/adjncy/vwgt/...) untouched. Every allocator downstream
+  // (allocate2WayNodePartitionMemory, ...) unconditionally re-.assign()s
+  // these on the next use, so this exists to match the reference's memory
+  // lifecycle between repeated bisection trials on the same graph object
+  // (MlevelNodeBisectionL2's 5-run loop) -- not because a stale value here is
+  // ever read before being overwritten.
+  void freeRData() {
+    where.clear();
+    pwgts.clear();
+    bndptr.clear();
+    bndind.clear();
+    id.clear();
+    ed.clear();
+    nrinfo.clear();
+  }
 };
 
 }  // namespace header_only_metis

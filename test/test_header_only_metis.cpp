@@ -1,18 +1,12 @@
-// Oracle test harness for the header-only METIS nested-dissection port
-// (planned under DirectLUSolvers/src/HeaderOnlyMetis*, not yet implemented).
+// Oracle test harness for the header-only METIS nested-dissection port.
 //
-// Phase 1 of that project's plan: build the comparison infrastructure BEFORE
-// porting a single algorithm file. Right now (no port exists yet) this suite
-// exercises the REFERENCE side only:
-//   - determinism: METIS_NodeND(options=NULL) must return the same perm/iperm
-//     on every call, now that GKlib is built with -DGKRAND=ON (MT19937-64
-//     instead of the platform CRT's rand()). This generalizes the one-off
-//     repro_check from the plan's Phase 0 across the whole corpus.
-//   - validity: perm/iperm together must be a genuine permutation of [0,n).
-// Once DirectLUSolvers/src/HeaderOnlyMetis.h exists (Phase 2), extend
-// checkGraph() below to also call the port's nodeND() on the same xadj/adjncy
-// and assert byte-for-byte equality against the reference -- that comparison
-// is the actual bit-identical gate this suite exists to become.
+// This is Phase 3 of the port's plan: the full-corpus bit-identical gate.
+// checkGraph() below calls both the reference METIS_NodeND(options=NULL) and
+// the port's nodeND() on the SAME xadj/adjncy and asserts perm/iperm are
+// byte-for-byte identical -- the actual point of this whole project. It also
+// keeps Phase 1's reference-only checks (determinism across repeated calls,
+// permutation validity), since those still catch a broken/nondeterministic
+// reference independent of the port.
 //
 // Build + run via CTest (from the DirectLUSolvers directory), requires METIS:
 //   cmake -S . -B build -G Ninja -DDLU_WITH_METIS=ON && cmake --build build
@@ -33,6 +27,8 @@
 
 #ifdef HAVE_METIS
 #include <metis.h>
+
+#include "HeaderOnlyMetis/NestedDissection.h"
 #endif
 
 using Eigen::SparseMatrix;
@@ -46,9 +42,9 @@ namespace {
 
 // Runs METIS_NodeND(options=NULL, vwgt=NULL) on (xadj, adjncy) and checks:
 //   1. it succeeds and returns a valid permutation of [0, nvtxs);
-//   2. it is bit-for-bit deterministic across repeated calls.
-// This is the "reference self-consistency" half of the oracle; the "compare
-// to the header-only port" half is TODO until Phase 2 lands (see file header).
+//   2. it is bit-for-bit deterministic across repeated calls;
+//   3. the header-only port's nodeND() produces byte-identical perm/iperm on
+//      the same input -- the actual bit-identical gate this suite exists for.
 void checkGraph(const std::string& name, std::vector<idx_t>& xadj, std::vector<idx_t>& adjncy) {
   idx_t nvtxs = static_cast<idx_t>(xadj.size()) - 1;
   if (nvtxs <= 0) {
@@ -82,9 +78,13 @@ void checkGraph(const std::string& name, std::vector<idx_t>& xadj, std::vector<i
   checkTrue(perm1 == perm2, name + ": perm deterministic across repeated calls");
   checkTrue(iperm1 == iperm2, name + ": iperm deterministic across repeated calls");
 
-  // TODO(Phase 2): once DirectLUSolvers/src/HeaderOnlyMetis.h exists, call its
-  // nodeND(nvtxs, xadj, adjncy, permPort, ipermPort) here and assert
-  // permPort == perm1 && ipermPort == iperm1 -- the actual bit-identical gate.
+  // The actual point of this whole project: does the header-only port match
+  // the reference bit-for-bit on the same input?
+  std::vector<idx_t> permPort(static_cast<std::size_t>(nvtxs)), ipermPort(static_cast<std::size_t>(nvtxs));
+  header_only_metis::nodeND<idx_t, real_t>(nvtxs, xadj.data(), adjncy.data(), nullptr, permPort.data(),
+                                           ipermPort.data());
+  checkTrue(permPort == perm1, name + ": port perm bit-identical to reference");
+  checkTrue(ipermPort == iperm1, name + ": port iperm bit-identical to reference");
 }
 
 void checkMatrix(const std::string& name, const SparseMatrix<double>& A) {

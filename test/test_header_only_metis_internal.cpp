@@ -1063,6 +1063,7 @@ void checkInitialSeparatorModule() {
 }  // namespace
 
 int main() {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
 #ifdef HAVE_METIS
   checkRandomModule();
   checkMmdModule();

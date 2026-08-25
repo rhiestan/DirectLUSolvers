@@ -29,10 +29,28 @@ struct Ctrl {
   CType ctype = CType::SHEM;  // options.c OMETIS default
   bool no2hop = false;        // options.c OMETIS default: 2-hop matching enabled
   IndexT niter = 10;           // options.c OMETIS default: refinement iterations per pass
-  RealT ubfactor = RealT(1.2);  // I2RUBFACTOR(OMETIS_DEFAULT_UFACTOR=200) = 1.0+0.001*200
+  // I2RUBFACTOR(OMETIS_DEFAULT_UFACTOR=200) = 1.0+0.001*200 = 1.2, stored into
+  // a real_t array by SetupCtrl -- and then nudged by a fixed epsilon:
+  //
+  //   ctrl->ubfactors[i] += 0.0000499;      (options.c:120-121)
+  //
+  // That epsilon is load-bearing, not cosmetic. Every balance threshold on
+  // this path is an integer truncation of a product involving ubfactor --
+  // e.g. badmaxpwgt = (idx_t)(0.5*ubfactor*(pwgts[0]+pwgts[1])) in
+  // FM_2WayNodeBalance -- so whenever 0.6*pwgtsum lands in the narrow band
+  // just below an integer, dropping the epsilon shifts the threshold down by
+  // one, admits a different vertex, and (because the FM loops draw from the
+  // shared RNG stream per boundary vertex) desynchronizes every random draw
+  // that follows.
+  //
+  // The two-step rounding is reproduced deliberately: narrow 1.2 to RealT
+  // first, then add the double-typed epsilon and narrow again, matching C's
+  // `float += double` semantics on ctrl->ubfactors[i] exactly.
+  RealT ubfactor = static_cast<RealT>(static_cast<RealT>(1.0 + 0.001 * 200) + 0.0000499);
   bool compress = true;         // options.c OMETIS default: ctrl->compress
   RealT pijbm[2] = {0, 0};      // Setup2WayBalMultipliers' output: invtvwgt/tpwgts[i], ncon=1
   RType rtype = RType::SEP1SIDED;  // options.c OMETIS default
+  IndexT nseps = 1;  // options.c OMETIS default; ometis.c bumps this to 2 if compression achieves >1.5x
 };
 
 }  // namespace header_only_metis

@@ -84,6 +84,8 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `src/SupernodalLUExecutorTBB.h` | `TBBExecutor` — optional, requires oneAPI Threading Building Blocks (see [below](#tbbexecutor)). |
 | `src/SupernodalLUMetis.h` | `SupernodalLUMetis<Mat[,Executor]>` alias wiring in METIS nested dissection. Optional, requires METIS + GKlib. |
 | `src/SupernodalLUAutoOrdering.h` | `SupernodalLUAuto<Mat[,Executor]>` alias: tries AMD and several METIS restarts, keeps the least-fill one. Optional, requires METIS + GKlib. |
+| `src/HeaderOnlyMetis.h` | `Eigen::HeaderOnlyMetisOrdering<StorageIndex>` — a drop-in `MetisOrdering` replacement with **nothing to link**. Eigen only. |
+| `src/HeaderOnlyMetis/` | The templated `METIS_NodeND` reimplementation behind it (coarsening, initial separator, FM refinement, nested-dissection driver, MT19937-64 RNG). |
 | `CMakeLists.txt` | Builds and registers every suite with CTest. See [Testing](#testing). |
 | `test/test_supernodal_lu.cpp` | Correctness tests (dependency-free — only needs Eigen). |
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
@@ -104,6 +106,9 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/profile_driver.cpp` | Per-phase driver for a profiler (not a test, not built by default). See [Profiling: where the time actually goes](#profiling-where-the-time-actually-goes). |
 | `test/test_pointblock_lu.cpp` | `PointBlockLU` correctness: orderings and their permutation conventions, unsymmetric patterns, the replay path against fresh factorizations, degenerate sizes, structural singularity. |
 | `test/test_parallel_consistency.cpp` | Serial-vs-parallel agreement for the chunked intra-supernode paths of both solvers: fill must match exactly, and the parallel solve must be no less accurate. |
+| `test/test_header_only_metis.cpp` | Full-corpus gate for the header-only METIS port: `perm`/`iperm` must be byte-identical to the linked C `METIS_NodeND` on every test matrix. Passes trivially without METIS. |
+| `test/test_header_only_metis_internal.cpp` | Per-module white-box comparison against METIS internals (`libmetis__*`), so a mismatch localizes to one algorithm instead of one permutation. Uses `test/metis_internal_bridge.cpp`. |
+| `test/test_header_only_metis_ordering.cpp` | The `Eigen::HeaderOnlyMetisOrdering` wiring: permutation parity with `MetisOrdering`, identical solver fill, and — when built without METIS — that it works with nothing linked. |
 | `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
@@ -190,6 +195,13 @@ class SupernodalLU;
     well-separated meshes; can also be *worse* than AMD on small/irregular matrices (measured on
     this project's `testdata/`: up to +200% fill on one matrix, -5% on another) — there is no
     universally correct choice.
+  - `Eigen::HeaderOnlyMetisOrdering<StorageIndex>` (`HeaderOnlyMetis.h`, **no library to
+    link**) — a templated reimplementation of `METIS_NodeND` that produces *bit-identical*
+    permutations to `Eigen::MetisOrdering`, verified against the linked C library across this
+    project's whole test corpus. Use it wherever `MetisOrdering` would go when you would rather
+    not depend on METIS + GKlib at build time. Bit-identity is defined against a reference METIS
+    built with the default 32-bit `idx_t`/`real_t` and GKlib's `GKRAND=ON` (its portable
+    MT19937-64 rather than the platform `rand()`).
   - `Eigen::AutoOrdering<StorageIndex>` (needs the same METIS dependency) — or the alias
     `Eigen::SupernodalLUAuto<Mat[,Executor]>` from `SupernodalLUAutoOrdering.h`. Tries AMD plus
     several deterministic METIS restarts, predicts each candidate's fill with a real (but
@@ -755,6 +767,21 @@ std::cout << "nnz(L) = " << solver.nnzL() << "\n";
 
 Both can be combined with a parallel executor via the alias's second template parameter:
 `Eigen::SupernodalLUMetis<Eigen::SparseMatrix<double>, Eigen::supernodal_lu::StdThreadExecutor>`.
+
+Both of the above link METIS + GKlib. For the same nested-dissection ordering with **nothing to
+link**, use `HeaderOnlyMetisOrdering` — a templated reimplementation of `METIS_NodeND` whose
+permutations are bit-identical to the C library's:
+
+```cpp
+#include <HeaderOnlyMetis.h>
+Eigen::SupernodalLU<Eigen::SparseMatrix<double>,
+                    Eigen::HeaderOnlyMetisOrdering<int>> solver;
+solver.compute(A);
+```
+
+It is the ordering functor on its own rather than a solver alias, so it drops into `LeftRightLU`
+and `PointBlockLU` the same way. Being bit-identical, it gives exactly the fill and timings the
+`MetisOrdering` rows report throughout this README — the only thing that changes is the build.
 
 ### 10. Tuning amalgamation for a very fragmented matrix
 

@@ -325,6 +325,29 @@ add_dlu_test(test_header_only_metis SOURCE test/test_header_only_metis.cpp
              LABELS "testdata;correctness;metis" LINK ${DLU_HEADER_ONLY_METIS_LINK})
 add_dlu_test(test_header_only_metis_internal SOURCE test/test_header_only_metis_internal.cpp
              LABELS "quick;correctness;metis" LINK ${DLU_HEADER_ONLY_METIS_LINK})
+# Phase 4 wiring check for Eigen::HeaderOnlyMetisOrdering (src/HeaderOnlyMetis.h).
+# Registered unconditionally and WITHOUT dlu_metis in the no-METIS build: that
+# it still links and passes there is precisely the "no link-time METIS
+# dependency" claim under test.
+add_dlu_test(test_header_only_metis_ordering SOURCE test/test_header_only_metis_ordering.cpp
+             LABELS "quick;correctness;metis" LINK ${DLU_HEADER_ONLY_METIS_LINK})
+# Bit-identical parity with the reference depends on float arithmetic (the
+# ubfactor/balance comparisons in coarsening and FM refinement) producing the
+# EXACT same rounding as the reference build, not just an equally-valid one.
+# Without this, clang is free to fuse a*b+c into a single-rounding FMA within
+# one statement (the C/C++ standard's default FP_CONTRACT=DEFAULT) wherever
+# the port's source happens to keep an expression in one statement and the
+# reference's doesn't (or vice versa) -- a source-shape accident, not an
+# algorithmic difference, that can flip a borderline float comparison and
+# cascade into a completely different (but still "valid") separator choice.
+foreach(dlu_metis_parity_target test_header_only_metis test_header_only_metis_internal
+                               test_header_only_metis_ordering)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(${dlu_metis_parity_target} PRIVATE -ffp-contract=off)
+  elseif(MSVC)
+    target_compile_options(${dlu_metis_parity_target} PRIVATE /fp:strict)
+  endif()
+endforeach()
 if(DLU_WITH_METIS)
   # metis_internal_bridge.cpp needs METIS's own (non-installed) internal
   # headers -- metislib.h, struct.h, rename.h, gklib_rename.h, ... -- to reach
