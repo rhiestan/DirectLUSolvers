@@ -46,6 +46,8 @@
 #include <string>
 #include <vector>
 
+#include <Eigen/OrderingMethods>
+
 #include "HeaderOnlyMetis.h"
 #include "LeftRightLU.h"
 #include "SupernodalLU.h"
@@ -174,6 +176,16 @@ std::vector<Case> buildCases() {
                    [] { return lu_testing::randomSymmetricPattern(400, 0.02, 4242); }});
   cases.push_back({"weakdiag_500", true, Tier::Small, [] { return lu_testing::weakDiagonal(500, 7); }});
 
+  // Unsymmetric-pattern synthetics. Every other generated case here has a
+  // symmetric pattern, which left the path LeftRightLU exists for pinned only
+  // by whichever testdata matrices a checkout happens to have. upwind2d is a
+  // directional discretization, structurally unsymmetric by construction;
+  // randomUnsymmetricPattern is the unstructured counterpart.
+  cases.push_back({"upwind2d_60x60", true, Tier::Small, [] { return lu_testing::upwind2d(60, 60); }});
+  cases.push_back({"upwind2d_120x120", true, Tier::Small, [] { return lu_testing::upwind2d(120, 120); }});
+  cases.push_back({"randunsym_800", true, Tier::Small,
+                   [] { return lu_testing::randomUnsymmetricPattern(800, 0.004, 11); }});
+
   // Real matrices from the shared registry. pre2 (Tier::Huge) is excluded: the
   // solvers decline it by design, so there is no fill to pin.
   for (const lu_testing::BenchmarkMatrix& m : lu_testing::benchmarkMatrices()) {
@@ -185,6 +197,30 @@ std::vector<Case> buildCases() {
     cases.push_back({m.label, false, m.tier,
                      [path] { return lu_testing::loadMatrixMarket(path); }});
   }
+  // Strongly unsymmetric matrices from the SuiteSparse corpus. These are the
+  // stress case for solvers that factor a symmetric pattern, and until now they
+  // were only ever run for CORRECTNESS (test_suitesparse.cpp) -- their fill,
+  // which is what a symmetrization or ordering mistake actually moves, was
+  // pinned nowhere.
+  //
+  // Gated on psym and on availability: the files are downloaded on demand
+  // (test/matrices/fetch_suitesparse.py), so a checkout without them just
+  // measures fewer rows, and --update's merge keeps the rest of the baseline
+  // instead of deleting it.
+  for (const lu_testing::SuiteSparseMatrix& m : lu_testing::suitesparseMatrices()) {
+    if (!m.available || m.patternSymmetry >= 0.5) continue;
+    if (static_cast<int>(m.tier) > static_cast<int>(Tier::Large)) continue;
+    // One tier up from the manifest's. Being hard to order is exactly why
+    // these matrices are here, and it makes them slow out of proportion to
+    // their size -- SNAP/wiki-RfA is only 11k rows but factors for ~145s
+    // because it fills to 72M nonzeros. Bumping the tier keeps the
+    // manifest's "quick" entries in the default run and moves "standard"
+    // ones behind --tier huge, rather than making every run pay for them.
+    const Tier tier = (m.tier == Tier::Small) ? Tier::Large : Tier::Huge;
+    const std::string path = m.path;
+    cases.push_back({m.label(), false, tier, [path] { return lu_testing::loadMatrixMarket(path); }});
+  }
+
   return cases;
 }
 
@@ -415,6 +451,16 @@ int main(int argc, char** argv) {
     row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>,
                                               Eigen::HeaderOnlyMetisParallelOrdering<int>>>(
         c.label, "SupernodalLU+HOMetisPar", Asym));
+
+    // LeftRightLU under COLAMD, on the RAW matrix. COLAMD is the ordering an
+    // unsymmetric problem actually wants, and it is the one ordering here
+    // whose permutation runs the other way round -- it needs the
+    // left_right_lu::OrderingConvention<COLAMDOrdering> specialization
+    // declaring returnsInverse=false. Getting that wrong still yields a valid
+    // permutation and a machine-precision residual, and shows up ONLY as
+    // fill: exactly what this suite exists for, and previously unguarded.
+    row.push_back(measure<Eigen::LeftRightLU<SparseMatrix<double>, Eigen::COLAMDOrdering<int>>>(
+        c.label, "LeftRightLU+COLAMD", A));
 
     for (const Record& r : row) {
       if (r.factored())

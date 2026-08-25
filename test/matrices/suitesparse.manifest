@@ -69,3 +69,15 @@ Bai rw5151 quick 5151 20199 0.49 n statistical/mathematical problem
 Simon raefsky5 quick 6316 167178 0.00 n structural problem
 Mallya lhr10c quick 10672 232633 0.01 n chemical process simulation problem
 Pajek foldoc quick 13356 120238 0.48 n directed weighted graph
+YZhou circuit204 quick 1020 5883 0.44 n circuit simulation problem
+Pajek SmaGri quick 1059 4919 0.00 n directed multigraph
+Grund b2_ss quick 1089 3895 0.01 n chemical process simulation problem
+HB gre_1107 quick 1107 5664 0.00 n directed weighted graph
+HB mahindas quick 1258 7682 0.02 n economic problem
+CPM cz1268 quick 1268 12786 0.44 n 2D/3D problem
+Zitney extr1b quick 2836 10965 0.00 n chemical process simulation problem sequence
+Simon raefsky6 quick 3402 130371 0.00 n structural problem
+TSOPF TSOPF_RS_b9_c6 quick 7224 54082 0.15 n power network problem
+Hohn fd12 quick 7500 28462 0.00 n materials problem
+SNAP wiki-RfA standard 11380 188077 0.07 n directed weighted temporal multigraph
+ATandT onetone2 standard 36057 222596 0.11 n frequency-domain circuit simulation problem
