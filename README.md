@@ -85,7 +85,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `src/SupernodalLUMetis.h` | `SupernodalLUMetis<Mat[,Executor]>` alias wiring in METIS nested dissection. Optional, requires METIS + GKlib. |
 | `src/SupernodalLUAutoOrdering.h` | `SupernodalLUAuto<Mat[,Executor]>` alias: tries AMD and several METIS restarts, keeps the least-fill one. Optional, requires METIS + GKlib. |
 | `src/HeaderOnlyMetis.h` | `Eigen::HeaderOnlyMetisOrdering<StorageIndex>` — a drop-in `MetisOrdering` replacement with **nothing to link**. Eigen only. |
-| `src/HeaderOnlyMetis/` | The templated `METIS_NodeND` reimplementation behind it (coarsening, initial separator, FM refinement, nested-dissection driver, MT19937-64 RNG). |
+| `src/HeaderOnlyMetis/` | The templated `METIS_NodeND` reimplementation behind it (coarsening, initial separator, FM refinement, nested-dissection driver, MT19937-64 RNG, scratch workspace). |
 | `CMakeLists.txt` | Builds and registers every suite with CTest. See [Testing](#testing). |
 | `test/test_supernodal_lu.cpp` | Correctness tests (dependency-free — only needs Eigen). |
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
@@ -109,6 +109,7 @@ Benchmark your own matrices with `DirectLUSolvers/test/compare_testdata.cpp` bef
 | `test/test_header_only_metis.cpp` | Full-corpus gate for the header-only METIS port: `perm`/`iperm` must be byte-identical to the linked C `METIS_NodeND` on every test matrix. Passes trivially without METIS. |
 | `test/test_header_only_metis_internal.cpp` | Per-module white-box comparison against METIS internals (`libmetis__*`), so a mismatch localizes to one algorithm instead of one permutation. Uses `test/metis_internal_bridge.cpp`. |
 | `test/test_header_only_metis_ordering.cpp` | The `Eigen::HeaderOnlyMetisOrdering` wiring: permutation parity with `MetisOrdering`, identical solver fill, and — when built without METIS — that it works with nothing linked. |
+| `test/profile_header_only_metis.cpp` | VTune driver for the ordering: times the port head-to-head against the linked C library and checks the permutations still match. Built with `-DDLU_BUILD_PROFILE_DRIVER=ON`; not a CTest target. |
 | `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |

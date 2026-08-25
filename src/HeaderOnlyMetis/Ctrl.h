@@ -11,6 +11,8 @@
 #ifndef DIRECTLUSOLVERS_HEADER_ONLY_METIS_CTRL_H
 #define DIRECTLUSOLVERS_HEADER_ONLY_METIS_CTRL_H
 
+#include "Workspace.h"
+
 namespace header_only_metis {
 
 // METIS_CTYPE_RM / METIS_CTYPE_SHEM (metis.h's mctype_et), the only two
@@ -51,6 +53,13 @@ struct Ctrl {
   RealT pijbm[2] = {0, 0};      // Setup2WayBalMultipliers' output: invtvwgt/tpwgts[i], ncon=1
   RType rtype = RType::SEP1SIDED;  // options.c OMETIS default
   IndexT nseps = 1;  // options.c OMETIS default; ometis.c bumps this to 2 if compression achieves >1.5x
+
+  // Per-call scratch for the refinement/matching routines, standing in for
+  // ctrl->mcore + iwspacemalloc. Lives here (rather than as locals at each
+  // call site) purely so the buffers survive between calls; it carries no
+  // algorithmic state, and nothing reads a value from it that the same call
+  // did not first write.
+  Workspace<IndexT> wspace;
 };
 
 }  // namespace header_only_metis

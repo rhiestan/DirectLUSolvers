@@ -461,6 +461,27 @@ if(DLU_BUILD_PROFILE_DRIVER)
     target_link_libraries(profile_driver PRIVATE "${DLU_ITT_DIR}/lib64/libittnotify.lib")
     target_compile_definitions(profile_driver PRIVATE DLU_WITH_ITT)
   endif()
+
+  # Ordering-only driver for the header-only METIS port: profile_driver can only
+  # attribute the ordering as part of analyzePattern. Links dlu_metis when
+  # available so it can time the port against the C library it replaces.
+  add_executable(profile_header_only_metis test/profile_header_only_metis.cpp)
+  target_link_libraries(profile_header_only_metis PRIVATE dlu_test_common)
+  if(DLU_WITH_METIS)
+    target_link_libraries(profile_header_only_metis PRIVATE dlu_metis)
+  endif()
+  # Same FP pinning as the parity suites -- a profiling build that contracts
+  # float ops differently would not be measuring the shipped ordering.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(profile_header_only_metis PRIVATE -ffp-contract=off)
+  elseif(MSVC)
+    target_compile_options(profile_header_only_metis PRIVATE /fp:strict)
+  endif()
+  if(DLU_WITH_ITT)
+    target_include_directories(profile_header_only_metis PRIVATE "${DLU_ITT_DIR}/include")
+    target_link_libraries(profile_header_only_metis PRIVATE "${DLU_ITT_DIR}/lib64/libittnotify.lib")
+    target_compile_definitions(profile_header_only_metis PRIVATE DLU_WITH_ITT)
+  endif()
 endif()
 
 message(STATUS "DirectLUSolvers tests: METIS=${DLU_WITH_METIS} PARDISO=${DLU_WITH_PARDISO}")

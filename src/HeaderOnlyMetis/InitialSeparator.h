@@ -44,6 +44,7 @@
 #include "PQueue.h"
 #include "Random.h"
 #include "SeparatorRefinement.h"
+#include "Workspace.h"
 
 namespace header_only_metis {
 
@@ -143,8 +144,10 @@ void bnd2WayBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, cons
   std::vector<IndexT>& bndptr = graph->bndptr;
   std::vector<IndexT>& bndind = graph->bndind;
 
-  std::vector<IndexT> moved(static_cast<std::size_t>(nvtxs), IndexT(-1));
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const moved = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  std::fill(moved, moved + static_cast<std::size_t>(nvtxs), IndexT(-1));
 
   const IndexT tpwgts0 = static_cast<IndexT>(static_cast<RealT>(graph->tvwgt) * ntpwgts[0]);
   const IndexT tpwgts1 = graph->tvwgt - tpwgts0;
@@ -156,7 +159,7 @@ void bnd2WayBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, cons
   PQueue<IndexT, IndexT> queue(static_cast<std::size_t>(nvtxs));
 
   IndexT nbnd = graph->nbnd;
-  randArrayPermute<IndexT>(nbnd, perm.data(), nbnd / 5, 1);
+  randArrayPermute<IndexT>(nbnd, perm, nbnd / 5, 1);
   for (IndexT ii = 0; ii < nbnd; ii++) {
     const IndexT i = perm[static_cast<std::size_t>(ii)];
     if (where[static_cast<std::size_t>(bndind[static_cast<std::size_t>(i)])] == from &&
@@ -236,8 +239,10 @@ void general2WayBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, 
   std::vector<IndexT>& bndptr = graph->bndptr;
   std::vector<IndexT>& bndind = graph->bndind;
 
-  std::vector<IndexT> moved(static_cast<std::size_t>(nvtxs), IndexT(-1));
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const moved = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  std::fill(moved, moved + static_cast<std::size_t>(nvtxs), IndexT(-1));
 
   const IndexT tpwgts0 = static_cast<IndexT>(static_cast<RealT>(graph->tvwgt) * ntpwgts[0]);
   const IndexT tpwgts1 = graph->tvwgt - tpwgts0;
@@ -248,7 +253,7 @@ void general2WayBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, 
 
   PQueue<IndexT, IndexT> queue(static_cast<std::size_t>(nvtxs));
 
-  randArrayPermute<IndexT>(nvtxs, perm.data(), nvtxs / 5, 1);
+  randArrayPermute<IndexT>(nvtxs, perm, nvtxs / 5, 1);
   for (IndexT ii = 0; ii < nvtxs; ii++) {
     const IndexT i = perm[static_cast<std::size_t>(ii)];
     if (where[static_cast<std::size_t>(i)] == from && vwgt[static_cast<std::size_t>(i)] <= mindiff)
@@ -332,9 +337,10 @@ void fm2WayCutRefine(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
   std::vector<IndexT>& bndptr = graph->bndptr;
   std::vector<IndexT>& bndind = graph->bndind;
 
-  std::vector<IndexT> moved(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> swaps(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const moved = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const swaps = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
 
   const IndexT tpwgts0 = static_cast<IndexT>(static_cast<RealT>(graph->tvwgt) * ntpwgts[0]);
   const IndexT tpwgts1 = graph->tvwgt - tpwgts0;
@@ -349,7 +355,7 @@ void fm2WayCutRefine(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
                                       PQueue<IndexT, IndexT>(static_cast<std::size_t>(nvtxs))};
 
   const IndexT origdiff = std::abs(tpwgts[0] - pwgts[0]);
-  std::fill(moved.begin(), moved.end(), IndexT(-1));
+  std::fill(moved, moved + static_cast<std::size_t>(nvtxs), IndexT(-1));
   for (IndexT pass = 0; pass < niter; pass++) {
     queues[0].reset();
     queues[1].reset();
@@ -360,7 +366,7 @@ void fm2WayCutRefine(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
     IndexT mindiff = std::abs(tpwgts[0] - pwgts[0]);
 
     IndexT nbnd = graph->nbnd;
-    randArrayPermute<IndexT>(nbnd, perm.data(), nbnd, 1);
+    randArrayPermute<IndexT>(nbnd, perm, nbnd, 1);
     for (IndexT ii = 0; ii < nbnd; ii++) {
       const IndexT i = perm[static_cast<std::size_t>(ii)];
       queues[static_cast<std::size_t>(where[static_cast<std::size_t>(bndind[static_cast<std::size_t>(i)])])].insert(
@@ -483,8 +489,9 @@ void randomBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
   allocate2WayPartitionMemory(graph);
   std::vector<IndexT>& where = graph->where;
 
-  std::vector<IndexT> bestwhere(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const bestwhere = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
 
   const IndexT zeromaxpwgt = static_cast<IndexT>(ctrl.ubfactor * static_cast<RealT>(graph->tvwgt) * ntpwgts[0]);
 
@@ -493,7 +500,7 @@ void randomBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
     std::fill(where.begin(), where.end(), IndexT(1));
 
     if (inbfs > 0) {
-      randArrayPermute<IndexT>(nvtxs, perm.data(), nvtxs / 2, 1);
+      randArrayPermute<IndexT>(nvtxs, perm, nvtxs / 2, 1);
       IndexT pwgts[2] = {0, graph->tvwgt};
 
       for (IndexT ii = 0; ii < nvtxs; ii++) {
@@ -516,13 +523,13 @@ void randomBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
 
     if (inbfs == 0 || bestcut > graph->mincut) {
       bestcut = graph->mincut;
-      bestwhere = where;
+      std::copy(where.begin(), where.end(), bestwhere);  // icopy(nvtxs, where, bestwhere)
       if (bestcut == 0) break;
     }
   }
 
   graph->mincut = bestcut;
-  where = bestwhere;
+  std::copy(bestwhere, bestwhere + static_cast<std::size_t>(nvtxs), where.begin());
 }
 
 // This function takes a graph and produces a bisection by using a region
@@ -538,9 +545,10 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
   allocate2WayPartitionMemory(graph);
   std::vector<IndexT>& where = graph->where;
 
-  std::vector<IndexT> bestwhere(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> queue(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> touched(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const bestwhere = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const queue = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const touched = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
 
   const IndexT onemaxpwgt = static_cast<IndexT>(ctrl.ubfactor * static_cast<RealT>(graph->tvwgt) * ntpwgts[1]);
   const IndexT oneminpwgt = static_cast<IndexT>(
@@ -549,7 +557,7 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
   IndexT bestcut = 0;
   for (IndexT inbfs = 0; inbfs < niparts; inbfs++) {
     std::fill(where.begin(), where.end(), IndexT(1));
-    std::fill(touched.begin(), touched.end(), IndexT(0));
+    std::fill(touched, touched + static_cast<std::size_t>(nvtxs), IndexT(0));
 
     IndexT pwgts[2] = {0, graph->tvwgt};
 
@@ -617,13 +625,13 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
 
     if (inbfs == 0 || bestcut > graph->mincut) {
       bestcut = graph->mincut;
-      bestwhere = where;
+      std::copy(where.begin(), where.end(), bestwhere);  // icopy(nvtxs, where, bestwhere)
       if (bestcut == 0) break;
     }
   }
 
   graph->mincut = bestcut;
-  where = bestwhere;
+  std::copy(bestwhere, bestwhere + static_cast<std::size_t>(nvtxs), where.begin());
 }
 
 // This function takes a bisection and constructs a minimum weight vertex

@@ -18,6 +18,7 @@
 #define DIRECTLUSOLVERS_HEADER_ONLY_METIS_PQUEUE_H
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 namespace header_only_metis {
@@ -25,7 +26,17 @@ namespace header_only_metis {
 template <typename KeyT, typename ValT>
 class PQueue {
  public:
-  explicit PQueue(std::size_t maxnodes) : heap_(maxnodes), locator_(maxnodes, ValT(-1)), nnodes_(0) {}
+  // heap_ is deliberately left UNINITIALIZED, matching the reference's
+  // `queue->heap = KVMALLOC(maxnodes, ...)` (a bare malloc). Only the first
+  // nnodes_ entries are ever live, and every one of them is written before it
+  // is read, so zeroing the array up front is pure cost -- and not a small one
+  // here: FM_2WayCutRefine builds two full-size queues per call and is called
+  // once per initial-partition trial, so the memset shows up as a measurable
+  // share of the coarsest-level work. locator_ IS filled, because -1 means
+  // "absent" and is genuinely read for nodes never inserted (the reference
+  // fills it too, via gk_idxsmalloc).
+  explicit PQueue(std::size_t maxnodes)
+      : heap_(new Entry[maxnodes]), locator_(maxnodes, ValT(-1)), nnodes_(0) {}
 
   std::size_t length() const { return nnodes_; }
 
@@ -180,11 +191,13 @@ class PQueue {
   KeyT seeKey(ValT node) const { return heap_[static_cast<std::size_t>(locator_[static_cast<std::size_t>(node)])].key; }
 
  private:
+  // No default member initializers: they would make Entry non-trivial and
+  // force `new Entry[n]` to value-initialize, defeating the point above.
   struct Entry {
-    KeyT key{};
-    ValT val{};
+    KeyT key;
+    ValT val;
   };
-  std::vector<Entry> heap_;
+  std::unique_ptr<Entry[]> heap_;
   std::vector<ValT> locator_;
   std::size_t nnodes_;
 };

@@ -27,6 +27,7 @@
 #include "Graph.h"
 #include "PQueue.h"
 #include "Random.h"
+#include "Workspace.h"
 
 namespace header_only_metis {
 
@@ -168,10 +169,11 @@ void fm2WayNodeRefine2Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
   PQueue<IndexT, IndexT> queues[2] = {PQueue<IndexT, IndexT>(static_cast<std::size_t>(nvtxs)),
                                       PQueue<IndexT, IndexT>(static_cast<std::size_t>(nvtxs))};
 
-  std::vector<IndexT> moved(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> swaps(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> mptr(static_cast<std::size_t>(nvtxs) + 1);
-  std::vector<IndexT> mind(2 * static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const moved = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const swaps = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const mptr = ctrl.wspace.take(static_cast<std::size_t>(nvtxs) + 1);
+  IndexT* const mind = ctrl.wspace.take(2 * static_cast<std::size_t>(nvtxs));
 
   // Computed ONCE from the pre-refinement pwgts and reused unchanged across
   // every pass -- the reference does not recompute it as pwgts evolve during
@@ -181,7 +183,7 @@ void fm2WayNodeRefine2Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
       static_cast<IndexT>(mult * static_cast<RealT>(pwgts[0] + pwgts[1] + pwgts[2]));
 
   for (IndexT pass = 0; pass < niter; pass++) {
-    std::fill(moved.begin(), moved.end(), IndexT(-1));
+    std::fill(moved, moved + static_cast<std::size_t>(nvtxs), IndexT(-1));
     queues[0].reset();
     queues[1].reset();
 
@@ -191,7 +193,7 @@ void fm2WayNodeRefine2Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
     IndexT nbnd = graph->nbnd;
 
     /* use the swaps array in place of the traditional perm array to save memory */
-    randArrayPermute<IndexT>(nbnd, swaps.data(), nbnd, 1);
+    randArrayPermute<IndexT>(nbnd, swaps, nbnd, 1);
     for (IndexT ii = 0; ii < nbnd; ii++) {
       const IndexT i = bndind[static_cast<std::size_t>(swaps[static_cast<std::size_t>(ii)])];
       queues[0].insert(i, vwgt[static_cast<std::size_t>(i)] - rinfo[static_cast<std::size_t>(i)].edegrees[1]);
@@ -367,9 +369,14 @@ void fm2WayNodeRefine1Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
 
   PQueue<IndexT, IndexT> queue(static_cast<std::size_t>(nvtxs));
 
-  std::vector<IndexT> swaps(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> mptr(static_cast<std::size_t>(nvtxs) + 1);
-  std::vector<IndexT> mind(2 * static_cast<std::size_t>(nvtxs));
+  // iwspacemalloc equivalents -- see Workspace.h. swaps/mptr/mind are all
+  // written before they are read (swaps[nswaps] and mptr[nswaps+1] on the way
+  // down, mind[0..nmind) as vertices are pulled in), so handing them out
+  // uninitialized matches the reference exactly.
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const swaps = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const mptr = ctrl.wspace.take(static_cast<std::size_t>(nvtxs) + 1);
+  IndexT* const mind = ctrl.wspace.take(2 * static_cast<std::size_t>(nvtxs));
 
   // Computed ONCE, same reasoning as fm2WayNodeRefine2Sided.
   const RealT mult = RealT(0.5) * ctrl.ubfactor;
@@ -389,7 +396,7 @@ void fm2WayNodeRefine1Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
     IndexT nbnd = graph->nbnd;
 
     /* use the swaps array in place of the traditional perm array to save memory */
-    randArrayPermute<IndexT>(nbnd, swaps.data(), nbnd, 1);
+    randArrayPermute<IndexT>(nbnd, swaps, nbnd, 1);
     for (IndexT ii = 0; ii < nbnd; ii++) {
       const IndexT i = bndind[static_cast<std::size_t>(swaps[static_cast<std::size_t>(ii)])];
       queue.insert(i, vwgt[static_cast<std::size_t>(i)] - rinfo[static_cast<std::size_t>(i)].edegrees[other]);
@@ -539,12 +546,14 @@ void fm2WayNodeBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
 
   PQueue<IndexT, IndexT> queue(static_cast<std::size_t>(nvtxs));
 
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> moved(static_cast<std::size_t>(nvtxs), IndexT(-1));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const moved = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  std::fill(moved, moved + static_cast<std::size_t>(nvtxs), IndexT(-1));
 
   const IndexT nbndInit = graph->nbnd;
   IndexT nbnd = nbndInit;
-  randArrayPermute<IndexT>(nbnd, perm.data(), nbnd, 1);
+  randArrayPermute<IndexT>(nbnd, perm, nbnd, 1);
   for (IndexT ii = 0; ii < nbnd; ii++) {
     const IndexT i = bndind[static_cast<std::size_t>(perm[static_cast<std::size_t>(ii)])];
     queue.insert(i, vwgt[static_cast<std::size_t>(i)] - rinfo[static_cast<std::size_t>(i)].edegrees[other]);

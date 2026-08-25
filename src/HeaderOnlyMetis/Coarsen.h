@@ -11,9 +11,8 @@
 //     default-options OMETIS objtype is always METIS_OBJTYPE_NODE.
 //   - multi-constraint (ncon>1) branches: Graph<IndexT,RealT> hardcodes
 //     ncon=1, matching Eigen's MetisOrdering call convention.
-//   - ReAdjustMemory: exists in the reference to shrink an over-allocated
-//     upper-bound adjncy/adjwgt array back down; std::vector only ever holds
-//     exactly what's appended to it, so there's nothing to shrink.
+//   - ReAdjustMemory as a separate routine: the equivalent trim is a resize()
+//     at the end of createCoarseGraph.
 //
 // Two arithmetic precision traps worth flagging up front, both replicated
 // exactly here:
@@ -22,13 +21,12 @@
 //     only the truncated quotient gets promoted to double and multiplied by
 //     4.0, not the other way around.
 //   - CreateCoarseGraph builds each contracted vertex's edge list into a
-//     LOCAL, per-iteration window (the reference advances raw pointers
-//     `cadjncy += nedges` through one big pre-allocated array; a htable/
-//     dtable dedup pass writes into that window using 0-based *relative*
-//     indices). This port uses an explicit local scratch buffer per iteration
-//     instead, appended to the growing output vector afterward -- same
-//     relative-indexing semantics, no pointer arithmetic on the persistent
-//     vector's storage.
+//     LOCAL, per-iteration window: the htable/dtable dedup pass addresses that
+//     window with 0-based *relative* indices, so the window's base must move
+//     with each contracted vertex. This port keeps that structure, pointing
+//     the window at cgraph->adjncy[cnedges] exactly as the reference's
+//     `cadjncy += nedges` does. The array is over-allocated to the graph's
+//     edge count up front and trimmed once at the end.
 
 #ifndef DIRECTLUSOLVERS_HEADER_ONLY_METIS_COARSEN_H
 #define DIRECTLUSOLVERS_HEADER_ONLY_METIS_COARSEN_H
@@ -44,6 +42,7 @@
 #include "Graph.h"
 #include "Random.h"
 #include "Sorting.h"
+#include "Workspace.h"
 
 namespace header_only_metis {
 
@@ -151,7 +150,7 @@ Graph<IndexT, RealT>* coarsenGraphNlevels(Ctrl<IndexT, RealT>& ctrl, Graph<Index
 }
 
 template <typename IndexT, typename RealT>
-IndexT match2HopAny(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
+IndexT match2HopAny(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const IndexT* perm,
                     std::vector<IndexT>& match, IndexT cnvtxs, std::size_t& nunmatched,
                     std::size_t maxdegree) {
   (void)ctrl;
@@ -215,7 +214,7 @@ IndexT match2HopAny(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, cons
 }
 
 template <typename IndexT, typename RealT>
-IndexT match2HopAll(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
+IndexT match2HopAll(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const IndexT* perm,
                     std::vector<IndexT>& match, IndexT cnvtxs, std::size_t& nunmatched,
                     std::size_t maxdegree) {
   (void)ctrl;
@@ -277,7 +276,7 @@ IndexT match2HopAll(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, cons
 }
 
 template <typename IndexT, typename RealT>
-IndexT match2Hop(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const std::vector<IndexT>& perm,
+IndexT match2Hop(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const IndexT* perm,
                  std::vector<IndexT>& match, IndexT cnvtxs, std::size_t nunmatched) {
   cnvtxs = match2HopAny(ctrl, graph, perm, match, cnvtxs, nunmatched, std::size_t(2));
   cnvtxs = match2HopAll(ctrl, graph, perm, match, cnvtxs, nunmatched, std::size_t(64));
@@ -301,14 +300,15 @@ IndexT matchRM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
   const IndexT maxvwgt = ctrl.maxvwgt;
 
   std::vector<IndexT> match(static_cast<std::size_t>(nvtxs), kUnmatched<IndexT>);
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> tperm(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> degrees(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const tperm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const degrees = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
   std::size_t nunmatched = 0;
 
   /* Determine a "random" traversal order that is biased towards low-degree
      vertices */
-  randArrayPermute<IndexT>(nvtxs, tperm.data(), nvtxs / 8, 1);
+  randArrayPermute<IndexT>(nvtxs, tperm, nvtxs / 8, 1);
 
   const IndexT avgdegree = static_cast<IndexT>(4.0 * static_cast<double>(xadj[static_cast<std::size_t>(nvtxs)] / nvtxs));
   for (IndexT i = 0; i < nvtxs; i++) {
@@ -316,7 +316,7 @@ IndexT matchRM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
         1 + xadj[static_cast<std::size_t>(i) + 1] - xadj[static_cast<std::size_t>(i)])));
     degrees[static_cast<std::size_t>(i)] = (bnum > avgdegree ? avgdegree : bnum);
   }
-  bucketSortKeysInc<IndexT>(nvtxs, avgdegree, degrees.data(), tperm.data(), perm.data());
+  bucketSortKeysInc<IndexT>(nvtxs, avgdegree, degrees, tperm, perm);
 
   /* Traverse the vertices and compute the matching */
   IndexT cnvtxs = 0;
@@ -402,12 +402,13 @@ IndexT matchSHEM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
   const IndexT maxvwgt = ctrl.maxvwgt;
 
   std::vector<IndexT> match(static_cast<std::size_t>(nvtxs), kUnmatched<IndexT>);
-  std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> tperm(static_cast<std::size_t>(nvtxs));
-  std::vector<IndexT> degrees(static_cast<std::size_t>(nvtxs));
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const perm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const tperm = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
+  IndexT* const degrees = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
   std::size_t nunmatched = 0;
 
-  randArrayPermute<IndexT>(nvtxs, tperm.data(), nvtxs / 8, 1);
+  randArrayPermute<IndexT>(nvtxs, tperm, nvtxs / 8, 1);
 
   const IndexT avgdegree = static_cast<IndexT>(4.0 * static_cast<double>(xadj[static_cast<std::size_t>(nvtxs)] / nvtxs));
   for (IndexT i = 0; i < nvtxs; i++) {
@@ -415,7 +416,7 @@ IndexT matchSHEM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
         1 + xadj[static_cast<std::size_t>(i) + 1] - xadj[static_cast<std::size_t>(i)])));
     degrees[static_cast<std::size_t>(i)] = (bnum > avgdegree ? avgdegree : bnum);
   }
-  bucketSortKeysInc<IndexT>(nvtxs, avgdegree, degrees.data(), tperm.data(), perm.data());
+  bucketSortKeysInc<IndexT>(nvtxs, avgdegree, degrees, tperm, perm);
 
   IndexT cnvtxs = 0;
   IndexT last_unmatched = 0;
@@ -488,7 +489,6 @@ IndexT matchSHEM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
 template <typename IndexT, typename RealT>
 void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, IndexT cnvtxs,
                        const std::vector<IndexT>& match) {
-  (void)ctrl;
   const IndexT nvtxs = graph->nvtxs;
   const std::vector<IndexT>& xadj = graph->xadj;
   const std::vector<IndexT>& vwgt = graph->vwgt;
@@ -502,14 +502,32 @@ void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, I
   cgraph->nvtxs = cnvtxs;
   cgraph->xadj.assign(static_cast<std::size_t>(cnvtxs) + 1, IndexT(0));
   cgraph->vwgt.assign(static_cast<std::size_t>(cnvtxs), IndexT(0));
-  cgraph->adjncy.reserve(static_cast<std::size_t>(graph->nedges));
-  cgraph->adjwgt.reserve(static_cast<std::size_t>(graph->nedges));
 
-  std::vector<IndexT> htable(static_cast<std::size_t>(mask) + 1, IndexT(-1));
-  std::vector<IndexT> dtable(static_cast<std::size_t>(cnvtxs), IndexT(-1));
-
-  std::vector<IndexT> localAdjncy;
-  std::vector<IndexT> localAdjwgt;
+  // Each coarse vertex's edge list is built IN PLACE at cgraph->adjncy[cnedges]
+  // rather than in a scratch buffer that is then appended, which is what
+  // SetupCoarseGraph + `cadjncy = cgraph->adjncy + cnedges` do in the
+  // reference. Building it elsewhere and copying costs a second pass over
+  // every edge, and resizing that scratch per vertex re-zeroes its tail each
+  // time -- together the largest single cost difference against the C library
+  // measured on this function.
+  //
+  // graph->nedges bounds the total, exactly as it does in the reference; the
+  // extra slot covers the transient self-loop sentinel the hashtable path
+  // parks at index 0 before removing it.
+  //
+  // That upper bound is built in WORKSPACE rather than straight into the
+  // cgraph vectors: sizing a vector to the bound would value-initialize the
+  // whole thing (megabytes per level on a dense-ish graph -- it was the single
+  // largest remaining cost on setfos_2, whose 1.1M edges got zeroed once per
+  // coarsening level). Coarsening dedups heavily, so copying the cnedges that
+  // survive is much cheaper than zeroing the bound.
+  typename Workspace<IndexT>::Scope wscope(ctrl.wspace);
+  IndexT* const cadjncyBuf = ctrl.wspace.take(static_cast<std::size_t>(graph->nedges) + 1);
+  IndexT* const cadjwgtBuf = ctrl.wspace.take(static_cast<std::size_t>(graph->nedges) + 1);
+  IndexT* const htable = ctrl.wspace.take(static_cast<std::size_t>(mask) + 1);
+  IndexT* const dtable = ctrl.wspace.take(static_cast<std::size_t>(cnvtxs));
+  std::fill(htable, htable + static_cast<std::size_t>(mask) + 1, IndexT(-1));
+  std::fill(dtable, dtable + static_cast<std::size_t>(cnvtxs), IndexT(-1));
 
   cgraph->xadj[0] = 0;
   IndexT runningCnvtxs = 0;
@@ -527,12 +545,12 @@ void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, I
     const IndexT degu = xadj[static_cast<std::size_t>(u) + 1] - xadj[static_cast<std::size_t>(u)];
     IndexT nedges;
 
+    IndexT* const localAdjncy = cadjncyBuf + cnedges;
+    IndexT* const localAdjwgt = cadjwgtBuf + cnedges;
+
     if ((degv + degu) < (mask >> 2)) {
       /* use hashtable. put the ID of the contracted node itself at the start
          so it can be removed easily. */
-      localAdjncy.resize(static_cast<std::size_t>(degv + degu) + 1);
-      localAdjwgt.resize(static_cast<std::size_t>(degv + degu) + 1);
-
       htable[static_cast<std::size_t>(runningCnvtxs & mask)] = 0;
       localAdjncy[0] = runningCnvtxs;
       nedges = 1;
@@ -572,8 +590,6 @@ void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, I
       localAdjwgt[0] = localAdjwgt[static_cast<std::size_t>(nedges)];
     } else {
       /* use direct table */
-      localAdjncy.resize(static_cast<std::size_t>(degv + degu));
-      localAdjwgt.resize(static_cast<std::size_t>(degv + degu));
       nedges = 0;
 
       IndexT istart = xadj[static_cast<std::size_t>(v)];
@@ -618,11 +634,15 @@ void createCoarseGraph(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, I
       for (IndexT j = 0; j < nedges; j++) dtable[static_cast<std::size_t>(localAdjncy[static_cast<std::size_t>(j)])] = -1;
     }
 
-    cgraph->adjncy.insert(cgraph->adjncy.end(), localAdjncy.begin(), localAdjncy.begin() + nedges);
-    cgraph->adjwgt.insert(cgraph->adjwgt.end(), localAdjwgt.begin(), localAdjwgt.begin() + nedges);
     cnedges += nedges;
     cgraph->xadj[static_cast<std::size_t>(++runningCnvtxs)] = cnedges;
   }
+
+  // Hand over exactly the edges produced, so adjncy.size() keeps meaning
+  // "this graph's edge count" for everything downstream -- the equivalent of
+  // the reference's ReAdjustMemory.
+  cgraph->adjncy.assign(cadjncyBuf, cadjncyBuf + static_cast<std::size_t>(cnedges));
+  cgraph->adjwgt.assign(cadjwgtBuf, cadjwgtBuf + static_cast<std::size_t>(cnedges));
 
   cgraph->nedges = cnedges;
   cgraph->setupTvwgt();
