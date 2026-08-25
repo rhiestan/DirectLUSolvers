@@ -28,24 +28,38 @@
 // big (>=5000 vertex) nodes, and the obvious next move is to flatten those
 // into this dispatch -- (node, trial) pairs in one parallelFor -- so that the
 // top of the tree, where the frontier is only 1, 2, 4 nodes wide, still fills
-// the machine. It was implemented and measured twice, and it is NOT here
-// because it bought nothing. On laoss_1 at 16 PHYSICAL cores, best of 15 reps,
-// three runs each (noise band ~3%):
+// the machine. TWO variants of it were implemented and measured, and NEITHER
+// is here because neither bought anything. On laoss_1 at 16 PHYSICAL cores,
+// best of 15 reps, three runs each (noise band ~3%):
 //
-//   flattened     222.8 / 219.3 / 238.1 ms
-//   as written    222.7 / 215.1 / 226.5 ms
+//   as written (no flattening)      222.7 / 215.1 / 226.5 ms
+//   flatten every level             222.8 / 219.3 / 238.1 ms
+//   flatten only narrow levels      223.5 / 238.3 / 240.4 ms
 //
-// paid for with ~120 extra lines of scheduling, five clones of every big
-// node's coarsened graph, and two extra barriers per level.
+// each paid for with ~120 extra lines of scheduling, five clones of every
+// split node's coarsened graph, and two extra barriers per level.
 //
-// The cost model predicted ~16% and was wrong. Work is roughly flat per tree
-// level (laoss_1, serial, ms per level: 96, 72, 89, 85, 97, 65, 71, 46, 40,
-// 60, 21), and within a big node the split is coarsen ~39% / trials ~39% /
-// uncoarsen ~23%, so compressing the trial slice five-way at level 0 looked
-// like ~30ms off a 215ms run. The likely reason it does not appear: cloning
-// each big node's coarsened graph five times costs about what the compressed
-// trials save, and that clone is paid at every level holding big nodes, not
-// only at the root.
+// The narrow-levels variant existed because the first attempt cloned on EVERY
+// level, including the wide ones that already saturate the machine and gain
+// nothing -- so the clone cost looked like the obvious culprit. Restricting
+// flattening to levels below a fixed width did not help either, which rules
+// that explanation out.
+//
+// What is left is that the cost model was simply wrong about the root. Work is
+// roughly flat per tree level (laoss_1, serial, ms per level: 96, 72, 89, 85,
+// 97, 65, 71, 46, 40, 60, 21), and ACROSS ALL big nodes the split is coarsen
+// ~39% / trials ~39% / uncoarsen ~23% -- but that aggregate evidently does not
+// describe the root node, whose trial slice must be far smaller than 39% for
+// three independent implementations to show no change. Anyone tempted to try
+// again should first measure the root bisection's phase split ON ITS OWN,
+// rather than trusting the aggregate.
+//
+// NOTE, if a fourth attempt happens: the flatten/no-flatten choice must be a
+// fixed constant, never exec.concurrency(). The two schedules seed their
+// trials differently and so produce different (equally valid) orderings;
+// deriving the choice from the thread count would make the OUTPUT depend on
+// the thread count, breaking the determinism this path rests on and
+// invalidating its fill baselines.
 //
 // WHAT THE CEILING ACTUALLY IS
 // ----------------------------
