@@ -22,6 +22,35 @@
 // and FM refinement is inherently sequential (each move rewrites its
 // neighbours' gains). All the available parallelism is across tree nodes.
 //
+// A SECOND PARALLEL AXIS WAS TRIED AND DID NOT PAY
+// ------------------------------------------------
+// MlevelNodeBisectionL2 runs five INDEPENDENT speculative bisection trials on
+// big (>=5000 vertex) nodes, and the obvious next move is to flatten those
+// into this dispatch -- (node, trial) pairs in one parallelFor -- so that the
+// top of the tree, where the frontier is only 1, 2, 4 nodes wide, still fills
+// the machine. It was implemented and measured, and it is NOT here because it
+// bought nothing:
+//
+//   laoss_1, 32 threads, best of 3: 224ms flattened vs 225ms as written
+//   full corpus, 8 threads:         579ms flattened vs 586ms as written
+//
+// both inside the run-to-run noise, against ~120 extra lines of scheduling,
+// five clones of every big node's coarsened graph, and two extra barriers per
+// level. The cost model said it should have helped: work is roughly flat per
+// tree level (laoss_1, serial, ms per level: 96, 72, 89, 85, 97, 65, 71, 46,
+// 40, 60, 21), and within a big node the split is coarsen ~39% / trials ~39%
+// / uncoarsen ~23%, so compressing the trial slice five-way at level 0 should
+// have cut ~11% overall.
+//
+// It did not, and the likely reason is that this path stops being lane-bound
+// well before it runs out of parallelism: 16 -> 32 threads already only moved
+// 233ms -> 228ms. Past roughly 8-16 threads the limit looks like memory
+// bandwidth and pointer-chasing latency, not idle cores -- which is also why
+// adding a whole new axis of concurrency changed nothing. Anyone revisiting
+// this should measure that ceiling FIRST (e.g. VTune memory-access analysis on
+// the parallel path) rather than adding more parallelism to a bound that is
+// not lanes.
+//
 // WHY THE OUTPUT DIFFERS FROM METIS
 // ---------------------------------
 // The reference draws every random number of the whole recursion from one
