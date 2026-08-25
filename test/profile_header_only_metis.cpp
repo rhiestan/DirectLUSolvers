@@ -191,6 +191,7 @@ int main(int argc, char** argv) {
       const std::string sd = argv[++i];
       if (sd == "port") wantRef = false;
       else if (sd == "ref") wantPort = false;
+      else if (sd == "par") { wantPort = false; wantRef = false; }
       else if (sd != "both") { std::printf("unknown side '%s'\n", sd.c_str()); return 2; }
     } else {
       std::printf("usage: %s [--reps N] [--max-n N] [--only SUBSTRING] [--synthetic]\n"

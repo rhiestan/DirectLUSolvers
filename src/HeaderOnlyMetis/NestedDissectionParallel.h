@@ -28,28 +28,40 @@
 // big (>=5000 vertex) nodes, and the obvious next move is to flatten those
 // into this dispatch -- (node, trial) pairs in one parallelFor -- so that the
 // top of the tree, where the frontier is only 1, 2, 4 nodes wide, still fills
-// the machine. It was implemented and measured, and it is NOT here because it
-// bought nothing:
+// the machine. It was implemented and measured twice, and it is NOT here
+// because it bought nothing. On laoss_1 at 16 PHYSICAL cores, best of 15 reps,
+// three runs each (noise band ~3%):
 //
-//   laoss_1, 32 threads, best of 3: 224ms flattened vs 225ms as written
-//   full corpus, 8 threads:         579ms flattened vs 586ms as written
+//   flattened     222.8 / 219.3 / 238.1 ms
+//   as written    222.7 / 215.1 / 226.5 ms
 //
-// both inside the run-to-run noise, against ~120 extra lines of scheduling,
-// five clones of every big node's coarsened graph, and two extra barriers per
-// level. The cost model said it should have helped: work is roughly flat per
-// tree level (laoss_1, serial, ms per level: 96, 72, 89, 85, 97, 65, 71, 46,
-// 40, 60, 21), and within a big node the split is coarsen ~39% / trials ~39%
-// / uncoarsen ~23%, so compressing the trial slice five-way at level 0 should
-// have cut ~11% overall.
+// paid for with ~120 extra lines of scheduling, five clones of every big
+// node's coarsened graph, and two extra barriers per level.
 //
-// It did not, and the likely reason is that this path stops being lane-bound
-// well before it runs out of parallelism: 16 -> 32 threads already only moved
-// 233ms -> 228ms. Past roughly 8-16 threads the limit looks like memory
-// bandwidth and pointer-chasing latency, not idle cores -- which is also why
-// adding a whole new axis of concurrency changed nothing. Anyone revisiting
-// this should measure that ceiling FIRST (e.g. VTune memory-access analysis on
-// the parallel path) rather than adding more parallelism to a bound that is
-// not lanes.
+// The cost model predicted ~16% and was wrong. Work is roughly flat per tree
+// level (laoss_1, serial, ms per level: 96, 72, 89, 85, 97, 65, 71, 46, 40,
+// 60, 21), and within a big node the split is coarsen ~39% / trials ~39% /
+// uncoarsen ~23%, so compressing the trial slice five-way at level 0 looked
+// like ~30ms off a 215ms run. The likely reason it does not appear: cloning
+// each big node's coarsened graph five times costs about what the compressed
+// trials save, and that clone is paid at every level holding big nodes, not
+// only at the root.
+//
+// WHAT THE CEILING ACTUALLY IS
+// ----------------------------
+// Not idle lanes. Summing level_ms / min(level_width, 16) over the table above
+// puts this schedule's own structural ideal at 190ms on 16 cores, and the
+// measured 215ms is 88% of that -- there is very little scheduling slack left
+// to reclaim. The ceiling is simply that LEVEL 0 IS A SINGLE NODE COSTING
+// 96ms: 45% of the measured time, irreducible without parallelism INSIDE a
+// bisection, which the serial dependencies above rule out. Anything that does
+// not shrink the root bisection cannot move this number much.
+//
+// Two related traps for anyone re-measuring here. The dev machine reports 32
+// hardware threads but has 16 physical cores, so 16 -> 32 buys almost nothing
+// and is NOT evidence of a memory-bandwidth wall. And it is an AMD Ryzen:
+// VTune's memory-access and uarch-exploration analyses need Intel PMU/uncore
+// events and fail outright on it, leaving only software-sampling hotspots.
 //
 // WHY THE OUTPUT DIFFERS FROM METIS
 // ---------------------------------
