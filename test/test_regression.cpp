@@ -46,6 +46,7 @@
 #include <string>
 #include <vector>
 
+#include "HeaderOnlyMetis.h"
 #include "LeftRightLU.h"
 #include "SupernodalLU.h"
 #include "testing/Check.h"
@@ -401,6 +402,19 @@ int main(int argc, char** argv) {
     row.push_back(measure<Eigen::SupernodalLUMetis<SparseMatrix<double>>>(
         c.label, "SupernodalLU+METIS", Asym));
 #endif
+    // The parallel nested-dissection ordering. Pinned here rather than guarded
+    // by a ratio against another ordering, because a relative check cannot see
+    // the two moving together -- exactly the blind spot this file exists to
+    // close. Pinning it is only possible because that ordering is
+    // deterministic; measured with the default SerialExecutor so the recorded
+    // numbers do not depend on the machine's core count (thread-invariance is
+    // a separate check, in test_header_only_metis_parallel.cpp).
+    //
+    // Deliberately NOT under HAVE_METIS: it links nothing, so it stays pinned
+    // even in a build without the C library.
+    row.push_back(measure<Eigen::SupernodalLU<SparseMatrix<double>,
+                                              Eigen::HeaderOnlyMetisParallelOrdering<int>>>(
+        c.label, "SupernodalLU+HOMetisPar", Asym));
 
     for (const Record& r : row) {
       if (r.factored())

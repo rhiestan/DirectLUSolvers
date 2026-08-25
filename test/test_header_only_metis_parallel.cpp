@@ -14,13 +14,16 @@
 //   2. run-to-run reproducibility: repeated calls agree. Catches state carried
 //      over between calls (the sort of bug the missing InitRandom once was).
 //
-//   3. validity and quality: the result is a genuine permutation, and the fill
-//      it induces is in the same league as the exact path's. Bit-identity is
-//      gone, so "still a good ordering" has to be asserted rather than assumed
-//      -- a subtly broken parallel split could easily still be a permutation.
+//   3. validity: the result is a genuine permutation.
 //
-// The exact path is re-checked here too, so that the two entry points are known
-// to disagree only in the intended way.
+// Ordering QUALITY is not checked here. It used to be, as a ratio against the
+// exact path's fill, and that guard was dropped: a relative check cannot see
+// the two orderings degrading together, which is the failure mode most likely
+// to matter since they share nearly all their code. Fill for this ordering is
+// now pinned absolutely, per matrix, over the whole corpus, as the
+// SupernodalLU+HOMetisPar rows of test/baselines/testdata.baseline (see
+// test_regression.cpp) -- which is possible precisely because check 1 below
+// establishes the ordering is deterministic.
 
 #include <Eigen/SparseCore>
 
@@ -28,14 +31,12 @@
 #include <vector>
 
 #include "HeaderOnlyMetis.h"
-#include "SupernodalLU.h"
 #include "SupernodalLUExecutor.h"
 #include "testing/Check.h"
 #include "testing/MetisGraph.h"
 #include "testing/TestMatrices.h"
 
 using Eigen::SparseMatrix;
-using lu_testing::check;
 using lu_testing::checkTrue;
 using lu_testing::note;
 
@@ -82,7 +83,7 @@ bool isPermutation(const std::vector<int>& p) {
   return true;
 }
 
-// (1) + (2)
+// (1) + (2) + (3)
 void checkThreadInvariance() {
   for (const Case& c : cases()) {
     lu_testing::SymmetrizedGraph<int> g = lu_testing::buildSymmetrizedGraph<int>(c.A);
@@ -102,37 +103,10 @@ void checkThreadInvariance() {
   }
 }
 
-// (3): the parallel ordering must still be a good ordering. Compared against
-// the exact path through the same solver, so the metric is the one that
-// actually matters (factor size), not a proxy.
-void checkFillQuality() {
-  for (const Case& c : cases()) {
-    long long exactFill = -1, parallelFill = -1;
-    {
-      Eigen::SupernodalLU<SparseMatrix<double>, Eigen::HeaderOnlyMetisOrdering<int>> s;
-      s.compute(c.A);
-      if (s.info() == Eigen::Success) exactFill = s.nnzL() + s.nnzU();
-    }
-    {
-      Eigen::SupernodalLU<SparseMatrix<double>, Eigen::HeaderOnlyMetisParallelOrdering<int>> s;
-      s.compute(c.A);
-      if (s.info() == Eigen::Success) parallelFill = s.nnzL() + s.nnzU();
-    }
-    if (!checkTrue(exactFill > 0 && parallelFill > 0, c.label + ": both orderings factor")) continue;
-
-    const double ratio = static_cast<double>(parallelFill) / static_cast<double>(exactFill);
-    // Generous on purpose: this is a "did the ordering stay sane" guard, not a
-    // quality benchmark. A broken split shows up as a multiple, not a few
-    // percent.
-    check(ratio < 1.35, c.label + ": parallel fill / exact fill", ratio);
-  }
-}
-
 }  // namespace
 
 int main() {
   note("hardware concurrency: " + std::to_string(Eigen::supernodal_lu::StdThreadExecutor().concurrency()));
   checkThreadInvariance();
-  checkFillQuality();
   return lu_testing::summarize("test_header_only_metis_parallel");
 }
