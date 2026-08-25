@@ -64,9 +64,25 @@ void mmdOrder(Graph<IndexT, RealT>* graph, IndexT* order, IndexT lastvtx);
 // the separator are ordered at the end of the left & right nodes.
 //
 // Takes ownership of `graph` (matching FreeGraph(&graph) after splitting).
+// The work done at ONE node of the nested-dissection tree: bisect, number the
+// separator, split, and dispose of any child small enough to finish with MMD.
+// Children that still need bisecting come back in `graph[0]` (left) and
+// `graph[1]` (right); a null slot means that side was a leaf and is already
+// ordered.
+//
+// Factored out so the depth-first recursion below and the level-synchronous
+// frontier driver (NestedDissectionParallel.h) run byte-for-byte the same work
+// per node, and differ only in the order they visit nodes.
 template <typename IndexT, typename RealT>
-void mlevelNestedDissection(Ctrl<IndexT, RealT>& ctrl, std::unique_ptr<Graph<IndexT, RealT>> graph,
-                            IndexT* order, IndexT lastvtx) {
+struct NdChildren {
+  std::unique_ptr<Graph<IndexT, RealT>> graph[2];
+  IndexT lastvtx[2] = {0, 0};
+};
+
+template <typename IndexT, typename RealT>
+NdChildren<IndexT, RealT> bisectSplitAndOrder(Ctrl<IndexT, RealT>& ctrl,
+                                              std::unique_ptr<Graph<IndexT, RealT>> graph, IndexT* order,
+                                              IndexT lastvtx) {
   mlevelNodeBisectionMultiple(ctrl, graph.get());
 
   /* Order the nodes in the separator */
@@ -83,19 +99,37 @@ void mlevelNestedDissection(Ctrl<IndexT, RealT>& ctrl, std::unique_ptr<Graph<Ind
   /* Free the memory of the top level graph */
   graph.reset();
 
-  // Recurse on lgraph first, as its lastvtx depends on rgraph->nvtxs, which
-  // will not be defined once rgraph is moved-from below.
+  // lgraph's numbering depends on rgraph->nvtxs, so read it before either is
+  // moved from.
   const IndexT rgraphNvtxs = rgraph->nvtxs;
-  if (lgraph->nvtxs > IndexT(kMMDSwitch) && lgraph->nedges > 0) {
-    mlevelNestedDissection(ctrl, std::move(lgraph), order, lastvtx - rgraphNvtxs);
-  } else {
-    mmdOrder(lgraph.get(), order, lastvtx - rgraphNvtxs);
-  }
-  if (rgraph->nvtxs > IndexT(kMMDSwitch) && rgraph->nedges > 0) {
-    mlevelNestedDissection(ctrl, std::move(rgraph), order, lastvtx);
-  } else {
-    mmdOrder(rgraph.get(), order, lastvtx);
-  }
+
+  NdChildren<IndexT, RealT> children;
+  children.lastvtx[0] = lastvtx - rgraphNvtxs;
+  children.lastvtx[1] = lastvtx;
+
+  if (lgraph->nvtxs > IndexT(kMMDSwitch) && lgraph->nedges > 0)
+    children.graph[0] = std::move(lgraph);
+  else
+    mmdOrder(lgraph.get(), order, children.lastvtx[0]);
+
+  if (rgraph->nvtxs > IndexT(kMMDSwitch) && rgraph->nedges > 0)
+    children.graph[1] = std::move(rgraph);
+  else
+    mmdOrder(rgraph.get(), order, children.lastvtx[1]);
+
+  return children;
+}
+
+template <typename IndexT, typename RealT>
+void mlevelNestedDissection(Ctrl<IndexT, RealT>& ctrl, std::unique_ptr<Graph<IndexT, RealT>> graph,
+                            IndexT* order, IndexT lastvtx) {
+  NdChildren<IndexT, RealT> children = bisectSplitAndOrder(ctrl, std::move(graph), order, lastvtx);
+
+  // Depth-first, left before right: with one shared RNG stream the visit order
+  // IS part of the result, so this traversal is not interchangeable with the
+  // frontier driver's.
+  if (children.graph[0]) mlevelNestedDissection(ctrl, std::move(children.graph[0]), order, children.lastvtx[0]);
+  if (children.graph[1]) mlevelNestedDissection(ctrl, std::move(children.graph[1]), order, children.lastvtx[1]);
 }
 
 // This function performs multilevel node bisection (i.e., tri-section). It
@@ -314,9 +348,12 @@ void mmdOrder(Graph<IndexT, RealT>* graph, IndexT* order, IndexT lastvtx) {
 // (METIS_OK) on success; the reference's SIGERR/out-of-memory error paths
 // are not modeled since they are unreachable for well-formed input in this
 // port's scope.
-template <typename IndexT, typename RealT>
-int nodeND(IndexT nvtxs, const IndexT* xadj, const IndexT* adjncy, const IndexT* vwgt, IndexT* perm,
-          IndexT* iperm) {
+// `orderGraph(ctrl, graph, iperm, nnvtxs)` does the actual dissection; the
+// surrounding compress/uncompress bookkeeping is identical for every traversal
+// strategy, so it lives here once. See nodeND (exact) and nodeNDParallel.
+template <typename IndexT, typename RealT, typename OrderGraph>
+int nodeNDWithDriver(IndexT nvtxs, const IndexT* xadj, const IndexT* adjncy, const IndexT* vwgt,
+                     IndexT* perm, IndexT* iperm, OrderGraph&& orderGraph) {
   Ctrl<IndexT, RealT> ctrl;
 
   // Matches SetupCtrl's InitRandom(ctrl->seed) (options.c), which METIS_NodeND
@@ -328,7 +365,7 @@ int nodeND(IndexT nvtxs, const IndexT* xadj, const IndexT* adjncy, const IndexT*
   // the reference resets to on every call -- individual sub-functions tested
   // in isolation (which always seed explicitly before calling) never expose
   // this, only the full top-level entry point does.
-  randSeed<IndexT>(IndexT(4321));
+  randSeed<IndexT>(ctrl.rng, IndexT(4321));
 
   std::vector<IndexT> cptr, cind;
   std::unique_ptr<Graph<IndexT, RealT>> graph;
@@ -364,7 +401,7 @@ int nodeND(IndexT nvtxs, const IndexT* xadj, const IndexT* adjncy, const IndexT*
     nnvtxs = nvtxs;
   }
 
-  mlevelNestedDissection(ctrl, std::move(graph), iperm, nnvtxs);
+  orderGraph(ctrl, std::move(graph), iperm, nnvtxs);
 
   if (ctrl.compress) {
     /* Uncompress the ordering. perm[] is used as scratch here, matching the
@@ -382,6 +419,17 @@ int nodeND(IndexT nvtxs, const IndexT* xadj, const IndexT* adjncy, const IndexT*
   for (IndexT i = 0; i < nvtxs; i++) perm[iperm[i]] = i;
 
   return 1;  // METIS_OK
+}
+
+// The METIS-identical entry point: depth-first traversal drawing from the one
+// shared RNG stream the reference uses.
+template <typename IndexT, typename RealT>
+int nodeND(IndexT nvtxs, const IndexT* xadj, const IndexT* adjncy, const IndexT* vwgt, IndexT* perm,
+          IndexT* iperm) {
+  return nodeNDWithDriver<IndexT, RealT>(
+      nvtxs, xadj, adjncy, vwgt, perm, iperm,
+      [](Ctrl<IndexT, RealT>& ctrl, std::unique_ptr<Graph<IndexT, RealT>> graph, IndexT* order,
+         IndexT lastvtx) { mlevelNestedDissection(ctrl, std::move(graph), order, lastvtx); });
 }
 
 }  // namespace header_only_metis

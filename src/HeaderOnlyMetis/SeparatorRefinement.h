@@ -193,7 +193,7 @@ void fm2WayNodeRefine2Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
     IndexT nbnd = graph->nbnd;
 
     /* use the swaps array in place of the traditional perm array to save memory */
-    randArrayPermute<IndexT>(nbnd, swaps, nbnd, 1);
+    randArrayPermute<IndexT>(ctrl.rng, nbnd, swaps, nbnd, 1);
     for (IndexT ii = 0; ii < nbnd; ii++) {
       const IndexT i = bndind[static_cast<std::size_t>(swaps[static_cast<std::size_t>(ii)])];
       queues[0].insert(i, vwgt[static_cast<std::size_t>(i)] - rinfo[static_cast<std::size_t>(i)].edegrees[1]);
@@ -396,7 +396,7 @@ void fm2WayNodeRefine1Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
     IndexT nbnd = graph->nbnd;
 
     /* use the swaps array in place of the traditional perm array to save memory */
-    randArrayPermute<IndexT>(nbnd, swaps, nbnd, 1);
+    randArrayPermute<IndexT>(ctrl.rng, nbnd, swaps, nbnd, 1);
     for (IndexT ii = 0; ii < nbnd; ii++) {
       const IndexT i = bndind[static_cast<std::size_t>(swaps[static_cast<std::size_t>(ii)])];
       queue.insert(i, vwgt[static_cast<std::size_t>(i)] - rinfo[static_cast<std::size_t>(i)].edegrees[other]);
@@ -553,7 +553,7 @@ void fm2WayNodeBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
 
   const IndexT nbndInit = graph->nbnd;
   IndexT nbnd = nbndInit;
-  randArrayPermute<IndexT>(nbnd, perm, nbnd, 1);
+  randArrayPermute<IndexT>(ctrl.rng, nbnd, perm, nbnd, 1);
   for (IndexT ii = 0; ii < nbnd; ii++) {
     const IndexT i = bndind[static_cast<std::size_t>(perm[static_cast<std::size_t>(ii)])];
     queue.insert(i, vwgt[static_cast<std::size_t>(i)] - rinfo[static_cast<std::size_t>(i)].edegrees[other]);

@@ -36,6 +36,7 @@
 #include <Eigen/SparseCore>
 
 #include "HeaderOnlyMetis/NestedDissection.h"
+#include "HeaderOnlyMetis/NestedDissectionParallel.h"
 
 namespace Eigen {
 
@@ -170,6 +171,72 @@ class HeaderOnlyMetisOrdering {
  protected:
   IndexVector m_indexPtr;      // Pointer to the adjacency list of each row/column
   IndexVector m_innerIndices;  // Adjacency list
+};
+
+/** rief Parallel, deterministic nested-dissection ordering.
+ *
+ * Same interface as HeaderOnlyMetisOrdering, but the dissection tree is walked
+ * level by level and dispatched through an Executor, and each subtree seeds its
+ * own generator from its position in the tree.
+ *
+ * Its output is NOT the METIS ordering. It is a different, equally valid
+ * fill-reducing permutation -- deliberately so: the reference's result depends
+ * on the order a single shared random stream is consumed in, which a parallel
+ * traversal cannot reproduce (see HeaderOnlyMetis/NestedDissectionParallel.h).
+ * Use HeaderOnlyMetisOrdering when matching METIS matters; use this when
+ * ordering time does.
+ *
+ * It IS deterministic: the permutation depends only on the matrix, not on the
+ * executor, the thread count or the scheduling. Fill baselines recorded against
+ * it therefore stay meaningful, and a threaded run can be checked against a
+ * SerialExecutor run of the same class.
+ *
+ * 	param StorageIndex the matrix's index type (typically int).
+ * 	param Executor     anything with parallelFor/concurrency; defaults to
+ *                      serial. Eigen::supernodal_lu::StdThreadExecutor and the
+ *                      OpenMP/TBB backends all qualify.
+ */
+template <typename StorageIndex, typename Executor = header_only_metis::SerialExecutor>
+class HeaderOnlyMetisParallelOrdering : public HeaderOnlyMetisOrdering<StorageIndex> {
+ public:
+  typedef typename HeaderOnlyMetisOrdering<StorageIndex>::PermutationType PermutationType;
+  typedef typename HeaderOnlyMetisOrdering<StorageIndex>::IndexVector IndexVector;
+
+  HeaderOnlyMetisParallelOrdering() = default;
+  explicit HeaderOnlyMetisParallelOrdering(const Executor& exec) : m_exec(&exec) {}
+
+  /** The executor to dispatch through. Null means the built-in serial one. */
+  void setExecutor(const Executor& exec) { m_exec = &exec; }
+
+  template <typename MatrixType>
+  void operator()(const MatrixType& A, PermutationType& matperm) {
+    StorageIndex m = internal::convert_index<StorageIndex>(A.cols());
+    IndexVector perm(m), iperm(m);
+    this->get_symmetrized_graph(A);
+
+    if (m == 0) {
+      matperm.resize(0);
+      return;
+    }
+
+    const Executor* exec = m_exec;
+    if (exec != nullptr) {
+      header_only_metis::nodeNDParallel<StorageIndex, float>(m, this->m_indexPtr.data(),
+                                                             this->m_innerIndices.data(), /*vwgt=*/nullptr,
+                                                             perm.data(), iperm.data(), *exec);
+    } else {
+      const header_only_metis::SerialExecutor serial;
+      header_only_metis::nodeNDParallel<StorageIndex, float>(m, this->m_indexPtr.data(),
+                                                             this->m_innerIndices.data(), /*vwgt=*/nullptr,
+                                                             perm.data(), iperm.data(), serial);
+    }
+
+    matperm.resize(m);
+    for (StorageIndex j = 0; j < m; j++) matperm.indices()(iperm(j)) = j;
+  }
+
+ private:
+  const Executor* m_exec = nullptr;  // non-owning; the caller keeps the pool alive
 };
 
 }  // namespace Eigen

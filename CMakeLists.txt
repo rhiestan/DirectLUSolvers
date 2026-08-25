@@ -331,6 +331,10 @@ add_dlu_test(test_header_only_metis_internal SOURCE test/test_header_only_metis_
 # dependency" claim under test.
 add_dlu_test(test_header_only_metis_ordering SOURCE test/test_header_only_metis_ordering.cpp
              LABELS "quick;correctness;metis" LINK ${DLU_HEADER_ONLY_METIS_LINK})
+# Determinism gate for the parallel ordering. Deliberately links no METIS: its
+# oracle is its own serial run, not the C library.
+add_dlu_test(test_header_only_metis_parallel SOURCE test/test_header_only_metis_parallel.cpp
+             LABELS "quick;correctness;parallel")
 # Bit-identical parity with the reference depends on float arithmetic (the
 # ubfactor/balance comparisons in coarsening and FM refinement) producing the
 # EXACT same rounding as the reference build, not just an equally-valid one.
@@ -341,7 +345,7 @@ add_dlu_test(test_header_only_metis_ordering SOURCE test/test_header_only_metis_
 # algorithmic difference, that can flip a borderline float comparison and
 # cascade into a completely different (but still "valid") separator choice.
 foreach(dlu_metis_parity_target test_header_only_metis test_header_only_metis_internal
-                               test_header_only_metis_ordering)
+                               test_header_only_metis_ordering test_header_only_metis_parallel)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(${dlu_metis_parity_target} PRIVATE -ffp-contract=off)
   elseif(MSVC)

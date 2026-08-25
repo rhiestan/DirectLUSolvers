@@ -11,6 +11,7 @@
 #ifndef DIRECTLUSOLVERS_HEADER_ONLY_METIS_CTRL_H
 #define DIRECTLUSOLVERS_HEADER_ONLY_METIS_CTRL_H
 
+#include "Random.h"
 #include "Workspace.h"
 
 namespace header_only_metis {
@@ -54,12 +55,39 @@ struct Ctrl {
   RType rtype = RType::SEP1SIDED;  // options.c OMETIS default
   IndexT nseps = 1;  // options.c OMETIS default; ometis.c bumps this to 2 if compression achieves >1.5x
 
+  // GKlib's mt[]/mti, which live as file-scope statics in the C library.
+  // METIS reseeds this once per METIS_NodeND call and the whole recursion then
+  // draws from it; nodeND() does the same. Holding it here rather than in a
+  // global is what will let independent subtrees be given independent streams
+  // when the recursion is parallelized -- with one Ctrl it is exactly the
+  // single shared stream the reference uses.
+  RandomState rng;
+
   // Per-call scratch for the refinement/matching routines, standing in for
   // ctrl->mcore + iwspacemalloc. Lives here (rather than as locals at each
   // call site) purely so the buffers survive between calls; it carries no
   // algorithmic state, and nothing reads a value from it that the same call
   // did not first write.
   Workspace<IndexT> wspace;
+
+  // Copies the algorithm settings, leaving `rng` and `wspace` alone. Ctrl is
+  // move-only (Workspace owns unique_ptrs), and the parallel driver wants to
+  // reuse one Ctrl per worker thread across many tree nodes: the workspace
+  // should persist so its buffers stay warm, while the settings are refreshed
+  // from the caller's prototype and the RNG is reseeded per node.
+  void copySettingsFrom(const Ctrl& o) {
+    CoarsenTo = o.CoarsenTo;
+    maxvwgt = o.maxvwgt;
+    ctype = o.ctype;
+    no2hop = o.no2hop;
+    niter = o.niter;
+    ubfactor = o.ubfactor;
+    compress = o.compress;
+    pijbm[0] = o.pijbm[0];
+    pijbm[1] = o.pijbm[1];
+    rtype = o.rtype;
+    nseps = o.nseps;
+  }
 };
 
 }  // namespace header_only_metis

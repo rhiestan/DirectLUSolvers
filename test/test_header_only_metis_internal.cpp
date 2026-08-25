@@ -65,12 +65,13 @@ inline void irandArrayPermuteFine(idx_t n, idx_t* p, int flag) {
 void checkRandSequence(idx_t seed, int count) {
   const std::string name = "Random: rand() seed=" + std::to_string(seed);
   isrand(seed);
-  header_only_metis::randSeed<idx_t>(seed);
+  header_only_metis::RandomState rng;
+  header_only_metis::randSeed<idx_t>(rng, seed);
 
   bool allMatch = true;
   for (int i = 0; i < count; ++i) {
     const idx_t ref = irand();
-    const idx_t port = header_only_metis::randNext<idx_t>();
+    const idx_t port = header_only_metis::randNext<idx_t>(rng);
     if (ref != port) {
       allMatch = false;
       break;
@@ -83,13 +84,14 @@ void checkRandInRange(idx_t seed, idx_t max, int count) {
   const std::string name =
       "Random: randInRange() seed=" + std::to_string(seed) + " max=" + std::to_string(max);
   isrand(seed);
-  header_only_metis::randSeed<idx_t>(seed);
+  header_only_metis::RandomState rng;
+  header_only_metis::randSeed<idx_t>(rng, seed);
 
   bool allMatch = true;
   bool allInRange = true;
   for (int i = 0; i < count; ++i) {
     const idx_t ref = irandInRange(max);
-    const idx_t port = header_only_metis::randInRange<idx_t>(max);
+    const idx_t port = header_only_metis::randInRange<idx_t>(rng, max);
     if (ref != port) allMatch = false;
     if (port < 0 || port >= max) allInRange = false;
   }
@@ -107,8 +109,9 @@ void checkArrayPermute(idx_t seed, idx_t n, idx_t nshuffles) {
   isrand(seed);
   irandArrayPermute(n, ref.data(), nshuffles, 1);
 
-  header_only_metis::randSeed<idx_t>(seed);
-  header_only_metis::randArrayPermute<idx_t>(n, port.data(), nshuffles, 1);
+  header_only_metis::RandomState rng;
+  header_only_metis::randSeed<idx_t>(rng, seed);
+  header_only_metis::randArrayPermute<idx_t>(rng, n, port.data(), nshuffles, 1);
 
   checkTrue(ref == port, name);
 }
@@ -123,8 +126,9 @@ void checkArrayPermuteFine(idx_t seed, idx_t n) {
   isrand(seed);
   irandArrayPermuteFine(n, ref.data(), 1);
 
-  header_only_metis::randSeed<idx_t>(seed);
-  header_only_metis::randArrayPermuteFine<idx_t>(n, port.data(), 1);
+  header_only_metis::RandomState rng;
+  header_only_metis::randSeed<idx_t>(rng, seed);
+  header_only_metis::randArrayPermuteFine<idx_t>(rng, n, port.data(), 1);
 
   checkTrue(ref == port, name);
 }
@@ -588,7 +592,9 @@ void checkMatch(const std::string& name, bool useSHEM, idx_t nvtxs, std::vector<
   portCtrl.CoarsenTo = coarsenTo;
   portCtrl.maxvwgt = maxvwgt;
   portCtrl.no2hop = no2hop;
-  header_only_metis::randSeed<idx_t>(seed);
+  // The port draws from the Ctrl it is handed, so seed THAT -- these module
+  // tests pair it with isrand() on the reference side.
+  header_only_metis::randSeed<idx_t>(portCtrl.rng, seed);
   const idx_t portCnvtxs = useSHEM ? header_only_metis::matchSHEM(portCtrl, &portGraph)
                                    : header_only_metis::matchRM(portCtrl, &portGraph);
   auto* portCoarse = portGraph.coarser.get();
@@ -736,7 +742,9 @@ void checkCoarsenGraphDriver(const std::string& name, bool useSHEM, idx_t nvtxs,
   portCtrl.CoarsenTo = coarsenTo;
   portCtrl.ctype = useSHEM ? header_only_metis::CType::SHEM : header_only_metis::CType::RM;
   portCtrl.no2hop = false;
-  header_only_metis::randSeed<idx_t>(seed);
+  // The port draws from the Ctrl it is handed, so seed THAT -- these module
+  // tests pair it with isrand() on the reference side.
+  header_only_metis::randSeed<idx_t>(portCtrl.rng, seed);
   auto* portCoarsest = header_only_metis::coarsenGraph(portCtrl, &portGraph);
 
   int portLevels = 0;
@@ -929,7 +937,9 @@ void checkSepRefine(const std::string& name, idx_t nvtxs, std::vector<idx_t> xad
 
   header_only_metis::Ctrl<idx_t, real_t> portCtrl;
   portCtrl.compress = compress;
-  header_only_metis::randSeed<idx_t>(seed);
+  // The port draws from the Ctrl it is handed, so seed THAT -- these module
+  // tests pair it with isrand() on the reference side.
+  header_only_metis::randSeed<idx_t>(portCtrl.rng, seed);
   if (useBalance) header_only_metis::fm2WayNodeBalance(portCtrl, &portGraph);
   if (use2Sided)
     header_only_metis::fm2WayNodeRefine2Sided(portCtrl, &portGraph, idx_t(4));
@@ -998,7 +1008,9 @@ void checkInitSeparator(const std::string& name, idx_t nvtxs, std::vector<idx_t>
 
   header_only_metis::Ctrl<idx_t, real_t> portCtrl;
   portCtrl.compress = compress;
-  header_only_metis::randSeed<idx_t>(seed);
+  // The port draws from the Ctrl it is handed, so seed THAT -- these module
+  // tests pair it with isrand() on the reference side.
+  header_only_metis::randSeed<idx_t>(portCtrl.rng, seed);
   header_only_metis::initSeparator(portCtrl, &portGraph, niparts);
 
   const std::vector<idx_t> refWhere(metis_bridge_graph_where(refGraph),

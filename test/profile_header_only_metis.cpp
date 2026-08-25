@@ -29,6 +29,8 @@
 #include <vector>
 
 #include "HeaderOnlyMetis/NestedDissection.h"
+#include "HeaderOnlyMetis/NestedDissectionParallel.h"
+#include "SupernodalLUExecutor.h"
 #include "testing/MatrixMarket.h"
 #include "testing/MetisGraph.h"
 #include "testing/TestData.h"
@@ -79,13 +81,15 @@ struct Graph {
 struct Timing {
   double portMs = 0.0;
   double refMs = 0.0;
+  double parMs = 0.0;   // parallel path; 0 when not requested
   bool identical = true;
 };
 
-Timing profileOne(const Graph& g, int reps, bool wantPort, bool wantRef) {
+Timing profileOne(const Graph& g, int reps, bool wantPort, bool wantRef, int threads) {
   Timing t;
   t.portMs = 1e300;
   t.refMs = 1e300;
+  t.parMs = 1e300;
 
   std::vector<int> permPort(g.n), ipermPort(g.n);
   std::vector<int> permRef(g.n), ipermRef(g.n);
@@ -116,6 +120,20 @@ Timing profileOne(const Graph& g, int reps, bool wantPort, bool wantRef) {
 #ifdef HAVE_METIS
   t.identical = (!wantPort || !wantRef) || (permPort == permRef && ipermPort == ipermRef);
 #endif
+
+  if (threads > 0) {
+    const Eigen::supernodal_lu::StdThreadExecutor exec(static_cast<unsigned>(threads));
+    std::vector<int> p(g.n), ip(g.n);
+    for (int r = 0; r < reps; ++r) {
+      DLU_ITT_TASK("parallel");
+      const auto t0 = Clock::now();
+      header_only_metis::nodeNDParallel<int, float>(g.n, g.xadj.data(), g.adjncy.data(), nullptr, p.data(),
+                                                    ip.data(), exec);
+      t.parMs = std::min(t.parMs, ms(t0, Clock::now()));
+    }
+  } else {
+    t.parMs = 0.0;
+  }
   return t;
 }
 
@@ -160,6 +178,7 @@ int main(int argc, char** argv) {
   std::size_t maxN = 300000;
   std::string only;
   bool syntheticOnly = false;
+  int threads = 0;   // >0 also times the parallel path
   bool wantPort = true, wantRef = true;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -167,6 +186,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-n" && i + 1 < argc) maxN = static_cast<std::size_t>(std::atoll(argv[++i]));
     else if (a == "--only" && i + 1 < argc) only = argv[++i];
     else if (a == "--synthetic") syntheticOnly = true;
+    else if (a == "--threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
     else if (a == "--side" && i + 1 < argc) {
       const std::string sd = argv[++i];
       if (sd == "port") wantRef = false;
@@ -180,20 +200,33 @@ int main(int argc, char** argv) {
   }
 
   const std::vector<Graph> graphs = buildGraphs(maxN, syntheticOnly);
-  std::printf("%-18s %9s %11s %10s %10s %8s %s\n", "matrix", "n", "nnz", "port_ms", "ref_ms", "ratio", "identical");
+  if (threads > 0)
+    std::printf("%-18s %9s %11s %10s %10s %10s %9s\n", "matrix", "n", "nnz", "exact_ms", "par_ms", "ref_ms",
+                "speedup");
+  else
+    std::printf("%-18s %9s %11s %10s %10s %8s %s\n", "matrix", "n", "nnz", "port_ms", "ref_ms", "ratio", "identical");
 
-  double portTotal = 0.0, refTotal = 0.0;
+  double portTotal = 0.0, refTotal = 0.0, parTotal = 0.0;
   bool allIdentical = true;
   for (const Graph& g : graphs) {
     if (!only.empty() && g.label.find(only) == std::string::npos) continue;
-    const Timing t = profileOne(g, reps, wantPort, wantRef);
+    const Timing t = profileOne(g, reps, wantPort, wantRef, threads);
     portTotal += t.portMs;
     refTotal += t.refMs;
+    parTotal += t.parMs;
     allIdentical = allIdentical && t.identical;
-    std::printf("%-18s %9d %11zu %10.2f %10.2f %8.2fx %s\n", g.label.c_str(), g.n, g.adjncy.size(), t.portMs,
-                t.refMs, t.refMs > 0 ? t.portMs / t.refMs : 0.0, t.identical ? "yes" : "NO");
+    if (threads > 0)
+      std::printf("%-18s %9d %11zu %10.2f %10.2f %10.2f %8.2fx\n", g.label.c_str(), g.n, g.adjncy.size(),
+                  t.portMs, t.parMs, t.refMs, t.parMs > 0 ? t.portMs / t.parMs : 0.0);
+    else
+      std::printf("%-18s %9d %11zu %10.2f %10.2f %8.2fx %s\n", g.label.c_str(), g.n, g.adjncy.size(), t.portMs,
+                  t.refMs, t.refMs > 0 ? t.portMs / t.refMs : 0.0, t.identical ? "yes" : "NO");
   }
-  std::printf("%-18s %9s %11s %10.2f %10.2f %8.2fx %s\n", "TOTAL", "", "", portTotal, refTotal,
-              refTotal > 0 ? portTotal / refTotal : 0.0, allIdentical ? "yes" : "NO");
+  if (threads > 0)
+    std::printf("%-18s %9s %11s %10.2f %10.2f %10.2f %8.2fx\n", "TOTAL", "", "", portTotal, parTotal, refTotal,
+                parTotal > 0 ? portTotal / parTotal : 0.0);
+  else
+    std::printf("%-18s %9s %11s %10.2f %10.2f %8.2fx %s\n", "TOTAL", "", "", portTotal, refTotal,
+                refTotal > 0 ? portTotal / refTotal : 0.0, allIdentical ? "yes" : "NO");
   return allIdentical ? 0 : 1;
 }

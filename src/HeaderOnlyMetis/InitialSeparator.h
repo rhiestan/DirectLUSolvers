@@ -159,7 +159,7 @@ void bnd2WayBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, cons
   PQueue<IndexT, IndexT> queue(static_cast<std::size_t>(nvtxs));
 
   IndexT nbnd = graph->nbnd;
-  randArrayPermute<IndexT>(nbnd, perm, nbnd / 5, 1);
+  randArrayPermute<IndexT>(ctrl.rng, nbnd, perm, nbnd / 5, 1);
   for (IndexT ii = 0; ii < nbnd; ii++) {
     const IndexT i = perm[static_cast<std::size_t>(ii)];
     if (where[static_cast<std::size_t>(bndind[static_cast<std::size_t>(i)])] == from &&
@@ -253,7 +253,7 @@ void general2WayBalance(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, 
 
   PQueue<IndexT, IndexT> queue(static_cast<std::size_t>(nvtxs));
 
-  randArrayPermute<IndexT>(nvtxs, perm, nvtxs / 5, 1);
+  randArrayPermute<IndexT>(ctrl.rng, nvtxs, perm, nvtxs / 5, 1);
   for (IndexT ii = 0; ii < nvtxs; ii++) {
     const IndexT i = perm[static_cast<std::size_t>(ii)];
     if (where[static_cast<std::size_t>(i)] == from && vwgt[static_cast<std::size_t>(i)] <= mindiff)
@@ -366,7 +366,7 @@ void fm2WayCutRefine(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
     IndexT mindiff = std::abs(tpwgts[0] - pwgts[0]);
 
     IndexT nbnd = graph->nbnd;
-    randArrayPermute<IndexT>(nbnd, perm, nbnd, 1);
+    randArrayPermute<IndexT>(ctrl.rng, nbnd, perm, nbnd, 1);
     for (IndexT ii = 0; ii < nbnd; ii++) {
       const IndexT i = perm[static_cast<std::size_t>(ii)];
       queues[static_cast<std::size_t>(where[static_cast<std::size_t>(bndind[static_cast<std::size_t>(i)])])].insert(
@@ -500,7 +500,7 @@ void randomBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, con
     std::fill(where.begin(), where.end(), IndexT(1));
 
     if (inbfs > 0) {
-      randArrayPermute<IndexT>(nvtxs, perm, nvtxs / 2, 1);
+      randArrayPermute<IndexT>(ctrl.rng, nvtxs, perm, nvtxs / 2, 1);
       IndexT pwgts[2] = {0, graph->tvwgt};
 
       for (IndexT ii = 0; ii < nvtxs; ii++) {
@@ -561,7 +561,7 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
 
     IndexT pwgts[2] = {0, graph->tvwgt};
 
-    queue[0] = randInRange<IndexT>(nvtxs);
+    queue[0] = randInRange<IndexT>(ctrl.rng, nvtxs);
     touched[static_cast<std::size_t>(queue[0])] = 1;
     IndexT first = 0, last = 1;
     IndexT nleft = nvtxs - 1;
@@ -572,7 +572,7 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
       if (first == last) { /* Empty. Disconnected graph! */
         if (nleft == 0 || drain) break;
 
-        IndexT k = randInRange<IndexT>(nleft);
+        IndexT k = randInRange<IndexT>(ctrl.rng, nleft);
         IndexT i = 0;
         for (; i < nvtxs; i++) {
           if (touched[static_cast<std::size_t>(i)] == 0) {
@@ -613,8 +613,8 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
     }
 
     /* Check to see if we hit any bad limiting cases */
-    if (pwgts[1] == 0) where[static_cast<std::size_t>(randInRange<IndexT>(nvtxs))] = 1;
-    if (pwgts[0] == 0) where[static_cast<std::size_t>(randInRange<IndexT>(nvtxs))] = 0;
+    if (pwgts[1] == 0) where[static_cast<std::size_t>(randInRange<IndexT>(ctrl.rng, nvtxs))] = 1;
+    if (pwgts[0] == 0) where[static_cast<std::size_t>(randInRange<IndexT>(ctrl.rng, nvtxs))] = 0;
 
     /* Do some partition refinement */
     compute2WayPartitionParams(graph);

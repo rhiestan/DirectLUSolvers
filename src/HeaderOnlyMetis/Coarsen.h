@@ -308,7 +308,7 @@ IndexT matchRM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
 
   /* Determine a "random" traversal order that is biased towards low-degree
      vertices */
-  randArrayPermute<IndexT>(nvtxs, tperm, nvtxs / 8, 1);
+  randArrayPermute<IndexT>(ctrl.rng, nvtxs, tperm, nvtxs / 8, 1);
 
   const IndexT avgdegree = static_cast<IndexT>(4.0 * static_cast<double>(xadj[static_cast<std::size_t>(nvtxs)] / nvtxs));
   for (IndexT i = 0; i < nvtxs; i++) {
@@ -408,7 +408,7 @@ IndexT matchSHEM(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
   IndexT* const degrees = ctrl.wspace.take(static_cast<std::size_t>(nvtxs));
   std::size_t nunmatched = 0;
 
-  randArrayPermute<IndexT>(nvtxs, tperm, nvtxs / 8, 1);
+  randArrayPermute<IndexT>(ctrl.rng, nvtxs, tperm, nvtxs / 8, 1);
 
   const IndexT avgdegree = static_cast<IndexT>(4.0 * static_cast<double>(xadj[static_cast<std::size_t>(nvtxs)] / nvtxs));
   for (IndexT i = 0; i < nvtxs; i++) {
