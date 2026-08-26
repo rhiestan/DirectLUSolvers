@@ -141,6 +141,7 @@ solver.factorize(A2);
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
 | `test/bench_parallel.cpp` | Thread-count scaling sweep with per-phase timing (analyze / factor / solve), per mechanism. See [Parallel scaling](doc/Parallelism.md#parallel-scaling-measured). |
 | `test/bench_ceiling.cpp` | What the *machine* can deliver, via independent concurrent factorizations — the upper bound any scheduler could reach. See [The machine ceiling](doc/Parallelism.md#the-machine-ceiling). |
+| `test/bench_btf.cpp` | Block triangular form on against off, the one comparison no other benchmark makes — every other runs the shipping configuration, where BTF is simply on. See [Does the block triangular form pay?](doc/Testing.md#does-the-block-triangular-form-pay). |
 | `test/bench_solvers.cpp` | Per-matrix solver/**ordering** shootout: warm-up, best-of-N, per-phase timing, against `Eigen::SparseLU` and optionally MKL PARDISO. See [Choosing a configuration for one matrix](doc/Testing.md#choosing-a-configuration-for-one-matrix). |
 | `test/profile_driver.cpp` | Per-phase driver for a profiler (not a test, not built by default). See [Profiling](doc/Testing.md#profiling-where-the-time-actually-goes). |
 | `test/test_pointblock_lu.cpp` | `PointBlockLU` correctness: orderings and their permutation conventions, unsymmetric patterns, the replay path against fresh factorizations, degenerate sizes, structural singularity. |

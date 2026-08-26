@@ -227,6 +227,55 @@ both factors, PARDISO's `IPARM(18)` counts it once, so those columns are compara
 an offset of `n`. The exit code counts only *our* solvers failing `resid < 1e-6` — the
 benchmark is not a bug report against Eigen or MKL.
 
+## Does the block triangular form pay?
+
+`bench_btf` runs `LeftRightLU` twice per matrix — `setBlockTriangularForm(true)` and `(false)` —
+with everything else held fixed, so every difference in a row is BTF's doing. No other benchmark
+here can make that comparison: they all run the shipping configuration, where BTF is simply on.
+
+```sh
+./build/bench_btf                     # testdata + SuiteSparse corpora
+./build/bench_btf --quick             # three synthetic matrices, nothing to download
+./build/bench_btf --reps 15 ted_B     # one matrix, tighter estimate
+```
+
+Measured 2026-08-26 over 44 matrices, best of 3 after a warm-up. The summary separates three
+groups, because their answers have nothing to do with each other:
+
+| group | n | speedup (median) | fill | what it means |
+|---|---:|---|---|---|
+| irreducible (1 block) | 14 | 0.99x / 1.00x | 1.000x | BTF found nothing and cost one `O(n + nnz)` sweep. Every symmetric-pattern matrix is here. |
+| reducible, fill unchanged | 7 / 8 | 0.94x / 0.97x | 1.000x | The matrix split but the split bought no fill. **This group pays.** |
+| reducible, fill reduced | 23 / 22 | **1.24x / 1.57x** | 0.75x / 0.72x | What BTF is for. |
+
+(AMD / COLAMD.) Read the **median row** — 0.99x under AMD, 1.06x under COLAMD — alongside the
+corpus total of 1.10x / 1.30x. They disagree because the win is concentrated, not broad: under
+AMD 14 matrices gain 5% or more, 20 are unchanged within ±5%, and the total is dominated by
+whichever matrix is slowest (`Pajek/foldoc` alone is most of it, which is why the total moves
+several points between runs while the medians do not). The big movers are
+`TSOPF_RS_b9_c6` 4.0x / 8.1x, `raefsky5` 3.8x / 5.8x, `raefsky6` 4.0x / 5.1x, `SmaGri` 8.4x / 4.4x
+and `bayer05` 2.8x / 2.4x.
+
+**Where BTF costs, the cost is entirely in `analyzePattern`.** Ordering many small blocks
+separately is more expensive than ordering one large graph, and `factorize` and `solve` are
+untouched — confirmed at 15 repetitions, where the noise is well below the effect:
+
+| matrix | blocks | analyze off→on | factor off→on | total |
+|---|---:|---|---|---|
+| `Bindel/ted_B_unscaled` | 4245 | 10.13 → **11.69** ms | 3.52 → 3.56 ms | 0.89x |
+| `tomography` | 37 | 3.72 → **4.24** ms | 3.47 → 3.65 ms | 0.90x |
+| `CPM/cz1268` | 2 | 1.80 → **2.00** ms | 0.92 → 0.92 ms | 0.93x |
+
+Worst confirmed case is ~15% of the symbolic phase and ~11% of a cold factor+solve — and
+`analyzePattern` is exactly the phase a refactorization workflow skips, so in a Newton loop with
+a fixed pattern it amortizes to nothing. Three repetitions is too few to trust the per-group
+*extremes* (a single row's min swung 0.68x-1.91x between runs at `--reps 3`); the medians are
+stable, and anything you intend to quote should be re-measured with `--reps 15` on that matrix.
+
+The benchmark deliberately never fails: a residual that got worse is information, not a verdict.
+Whether a solve is acceptable is [`test_suitesparse`](#the-suitesparse-corpus)'s judgement, and
+whether the fill moved is [`test_regression`](#fill-regression-baselines)'s.
+
 ## Profiling: where the time actually goes
 
 `test/profile_driver.cpp` exists so a profiler sees `analyzePattern` / `factorize`

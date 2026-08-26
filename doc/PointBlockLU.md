@@ -25,27 +25,33 @@ for (/* each Newton step */) {
 matrices". Symmetrizing an unsymmetric pattern can cost enormous fill, and avoiding that is
 what this solver buys; but a scalar column algorithm runs at roughly a fifth of the throughput
 of a supernodal one, so once the factor densifies the fill advantage is spent and
-`LeftRightLU` wins. Measured single-threaded, best of 5, COLAMD ordering, `bench_solvers`
-(PointBlockLU timed on its **replay** — the call the target workload actually makes; its
-`analyze` column is paid once):
+`LeftRightLU` wins. Measured 2026-08-26, single-threaded, best of 5, COLAMD ordering,
+`bench_solvers` (PointBlockLU timed on its **replay** — the call the target workload actually
+makes; its `analyze` column is paid once):
 
 | matrix | n | PointBlockLU fill / replay+solve | LeftRightLU fill / factor+solve | `Eigen::SparseLU` |
 |---|---:|---:|---:|---:|
-| `setfos` | 1015 | **4,080** / **0.03 ms** | 116,786 / 2.06 ms | 4,080 / 0.13 ms |
-| `bayer05` | 3268 | **77,462** / **1.25 ms** | 456,036 / 13.41 ms | 126,396 / 4.96 ms |
-| `gemat11` | 4929 | **79,614** / **1.52 ms** | 131,156 / 3.32 ms | 86,476 / 3.92 ms |
-| `tomography` | 500 | **46,540** / **2.39 ms** | 180,154 / 4.52 ms | 91,650 / 5.18 ms |
-| `sherman1` | 1000 | 32,916 / 0.84 ms | 40,884 / 0.84 ms | 31,900 / 1.05 ms |
-| `laoss_3` | 4180 | 731,852 / 44.0 ms | 1,210,476 / **24.9 ms** | 731,852 / 30.2 ms |
-| `YaleB_10NN` | 2414 | 1,232,024 / 258.1 ms | 1,638,482 / **80.2 ms** | 1,226,238 / 110.7 ms |
-| `setfos_2` | 3048 | 1,935,546 / 452.8 ms | 2,360,714 / **100.7 ms** | 1,935,897 / 106.0 ms |
+| `setfos` | 1015 | **4,080** / **0.03 ms** | 116,602 / 1.77 ms | 4,080 / 0.14 ms |
+| `bayer05` | 3268 | 77,462 / **1.22 ms** | **58,036** / 4.43 ms | 126,396 / 5.28 ms |
+| `gemat11` | 4929 | **79,614** / **1.45 ms** | 121,294 / 3.19 ms | 86,476 / 4.44 ms |
+| `tomography` | 500 | **46,540** / **1.94 ms** | 164,836 / 4.56 ms | 91,650 / 5.52 ms |
+| `sherman1` | 1000 | **32,916** / **0.66 ms** | 40,884 / 0.88 ms | 31,900 / 1.11 ms |
+| `laoss_3` | 4180 | 731,852 / 33.1 ms | 1,210,476 / **24.6 ms** | 731,852 / 33.0 ms |
+| `YaleB_10NN` | 2414 | 1,232,024 / 217.3 ms | 1,638,482 / **83.9 ms** | 1,226,238 / 112.5 ms |
+| `setfos_2` | 3048 | 1,935,546 / 358.7 ms | 2,349,388 / **104.4 ms** | 1,935,897 / 112.7 ms |
+
+`bayer05` is the one row where `LeftRightLU` carries *less* fill than `PointBlockLU`: it is
+reducible, so [block triangular form](LeftRightLU.md#whats-different-from-supernodallu) leaves
+it 2461 blocks whose largest is 97 columns, and there is almost nothing left to fill in. It is
+still the slower of the two here — a supernodal solver has more per-block overhead than a
+scalar one has arithmetic on blocks that small.
 
 **The crossover sits near 100k stored scalars in the factor.** Below it `PointBlockLU` is the
 fastest solver in this project — on `setfos`, `gemat11`, `sherman1`, `tomography` and
 `bayer05` it beats `Eigen::SparseLU` and MKL PARDISO outright. Above it, use `LeftRightLU`.
 
 It is often more *accurate* too, because it never perturbs a pivot: on `gemat11` its solve
-error is 8.9e-13 against `LeftRightLU`'s 4.3e-08, on `tomography` 6.8e-14 against 7.1e-09,
+error is 8.9e-13 against `LeftRightLU`'s 4.3e-08, on `tomography` 6.8e-14 against 7.2e-09,
 and on the near-singular `bayer05` 1.1e-03 against `Eigen::SparseLU`'s 8.4e+00.
 
 Equilibration iterates to convergence rather than a fixed sweep count, which matters at this

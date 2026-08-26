@@ -418,6 +418,15 @@ add_dlu_test(bench_parallel SOURCE test/bench_parallel.cpp
 add_dlu_test(bench_ceiling SOURCE test/bench_ceiling.cpp
              ARGS --quick LABELS "benchmark;parallel")
 
+# Block triangular form on vs off, the one comparison no other benchmark can
+# make: every other one runs the shipping configuration, where BTF is simply on.
+# --quick uses three synthetic matrices -- a fully reducible upwind grid, an
+# irreducible Laplacian, and a partly reducible random pattern -- so CTest needs
+# nothing downloaded. The group that PAYS for BTF (reducible but no fill change)
+# has no synthetic stand-in; run the binary bare to see it.
+add_dlu_test(bench_btf SOURCE test/bench_btf.cpp
+             ARGS --quick --reps 1 LABELS "benchmark")
+
 # Per-matrix solver/ordering shootout with warm-up and per-phase timing. Picks up
 # METIS and PARDISO rows when those switches are on; --quick keeps CTest to two
 # synthetic matrices, so run the binary bare (or with matrix paths) for the real

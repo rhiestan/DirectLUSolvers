@@ -204,7 +204,7 @@ Practical notes:
 
 ## Performance notes (honest summary)
 
-Measured 2026-08-22 with `DirectLUSolvers/test/compare_testdata.cpp`, single-threaded
+Measured 2026-08-26 with `DirectLUSolvers/test/compare_testdata.cpp`, single-threaded
 (`SerialExecutor`) — the numbers below do **not** exercise the barrier-free dynamic
 scheduler's headline advantage, which requires a parallel executor (see
 [Parallel scaling](Parallelism.md#parallel-scaling-measured) for the threaded numbers).
@@ -212,21 +212,23 @@ scheduler's headline advantage, which requires a parallel executor (see
 - On **symmetric-pattern** matrices from this project's real-world `testdata/` set,
   `LeftRightLU` tracks `SupernodalLU`'s factor+solve time closely or beats it modestly (both
   reuse the same analysis pipeline and static-pivoting numeric design — only in-block pivoting
-  and scheduling differ): e.g. dendrimer 9.8ms vs 14.7ms, laoss_3 17.5ms vs 33.1ms. Same story
-  on the large 3D FEM matrices — laoss_1 (251k rows) 2.7s vs SupernodalLU's 3.0s, laoss_2 (100k
-  rows) 0.74s vs 0.82s — both well ahead of `Eigen::SparseLU` there (see the [SupernodalLU
+  and scheduling differ): e.g. dendrimer 9.7ms vs 13.8ms, laoss_3 17.4ms vs 25.9ms. Same story
+  on the large 3D FEM matrices — laoss_1 (251k rows) 2.9s vs SupernodalLU's 3.3s, laoss_2 (100k
+  rows) 0.79s vs 0.87s — both well ahead of `Eigen::SparseLU` there (see the [SupernodalLU
   performance notes](SupernodalLU.md#performance-notes-honest-summary) for the SparseLU/PARDISO
   comparison).
 - On **unsymmetric-pattern** matrices the two diverge sharply, because `SupernodalLU` must
   be handed a pre-symmetrized matrix and `LeftRightLU` symmetrizes internally *after* matching
-  (see [Unsymmetric nonzero patterns](#unsymmetric-nonzero-patterns)): gemat11 **9.1ms vs
-  1415ms**, bayer05 **22.8ms vs 317ms**, setfos_2 229ms vs 291ms. gemat11 and bayer05 are also
-  where `SupernodalLU` loses accuracy outright (bayer05 err 1.6e+00 vs `LeftRightLU`'s
-  5.3e-03), so this is not only a speed difference.
+  (see [Unsymmetric nonzero patterns](#unsymmetric-nonzero-patterns)): gemat11 **10.7ms vs
+  1440ms**, bayer05 **8.1ms vs 290ms**, setfos_2 254ms vs 304ms. gemat11 and bayer05 are also
+  where `SupernodalLU` loses accuracy outright (bayer05 err 1.7e+00 vs `LeftRightLU`'s
+  6.3e-04), so this is not only a speed difference. bayer05 is the one row where the block
+  triangular form does the work rather than the symmetrization point: it is reducible into 2461
+  blocks, which is worth a further 2.8x on top (22.8ms before BTF existed).
 - One measured, mechanistic difference: on a couple of already well-conditioned matrices
   (tomography, YaleB_10NN) `LeftRightLU` lands on a visibly looser — but still safely
-  small — residual than `SupernodalLU` (tomography resid 3.2e-12 vs 2.6e-16; YaleB 1.2e-13 vs
-  2.0e-16; both far under the 1e-6 `solveFailureThreshold()`). This is the documented
+  small — residual than `SupernodalLU` (tomography resid 4.3e-12 vs 2.6e-16; YaleB 1.2e-13 vs
+  1.8e-16; both far under the 1e-6 `solveFailureThreshold()`). This is the documented
   **`setRefineOnlyIfPerturbed`** default at work: `LeftRightLU` skips refinement entirely when
   `replacedPivots()==0`, while `SupernodalLU`'s default BiCGStab refinement always runs at least
   one matvec check (and polishes further) even on an already-accurate direct solve. Not a bug —
@@ -308,4 +310,8 @@ BTF on and off, which is what makes the "free when it cannot help" claim testabl
 than rhetorical. Also covered: fully reducible input (zero fill), dense off-diagonal
 coupling, complex adjoint solves, refactorization against a reused block structure,
 structural singularity, and BTF correctly switching itself off when matching is off.
+
+Whether BTF actually pays on a given matrix is a separate question from whether it is correct,
+and `bench_btf` answers it by running the solver both ways — see
+[Does the block triangular form pay?](Testing.md#does-the-block-triangular-form-pay).
 
