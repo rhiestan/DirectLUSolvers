@@ -131,9 +131,10 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
 
    - `conditionEstimate()` — Hager-Higham estimate of `kappa_1(A) = ||A||_1 ||A^-1||_1`,
      computed from the factors already in hand. `||A^-1||_1` is never formed: Hager's
-     algorithm needs only products `A^-1 v` and `A^-H v`, so the whole thing costs **4-10
-     triangular solves**, once, cached until the next `factorize()`. `conditionEstimateSolves()`
-     reports what it actually spent.
+     algorithm needs only products `A^-1 v` and `A^-H v`, so the whole thing costs **4-5
+     triangular solves** — measured over this project's corpus, against an algorithmic ceiling
+     of 10 — once, cached until the next `factorize()`. `conditionEstimateSolves()` reports
+     what it actually spent.
    - `componentwiseBackwardError(b, x)` — Oettli-Prager,
      `max_i |b - Ax|_i / (|A||x| + |b|)_i`. Unlike the condition number this is **exact, not
      an estimate**, and costs one O(nnz) pass. Near machine epsilon means the solver did
@@ -156,6 +157,11 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
    the true error walks from 5e-16 to 72. The forward-error column is the only one that tells
    them apart, and the solver is behaving impeccably throughout: the backward error never
    leaves machine epsilon.
+
+   On this project's own benchmark matrices the estimate puts numbers on things the
+   documentation could previously only call "near-singular": `bayer05` reports
+   `kappa = 8.9e+26`, `bcsstm13` (the singular mass matrix) `1.7e+10`, `setfos_2` `1.2e+10`,
+   against `1.1e+02` for a 3D Laplacian and `3.0` for an upwind grid.
 
    `setErrorBounds(true)` wires this into `solve()` itself — it then fills
    `lastBackwardError()`/`lastForwardError()`/`lastCorrectDigits()` and downgrades `info()` to

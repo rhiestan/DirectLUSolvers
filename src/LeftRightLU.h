@@ -433,8 +433,9 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 eturns a Hager-Higham estimate of kappa_1(A) = ||A||_1 ||A^{-1}||_1,
     *  computed from the existing factors and cached until the next factorize().
     *
-    *  Costs about 4-10 triangular solves the FIRST time it is called after a
-    *  factorization and nothing thereafter. It is a lower bound (see the header),
+    *  Costs 4-5 triangular solves the FIRST time it is called after a
+    *  factorization (measured across this project's corpus; 10 is the
+    *  algorithm's ceiling) and nothing thereafter. It is a lower bound (see the header),
     *  and it describes the operator this factorization inverts -- which under
     *  static pivoting is a perturbed A, so read it together with
     *  replacedPivots(). Returns infinity if the factorization is singular. */
