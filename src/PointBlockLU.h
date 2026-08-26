@@ -80,7 +80,7 @@
 //      1.00x on setfos_2, 1.02x on YaleB_10NN, 1.01x on tomography, 1.25x on
 //      setfos, and reaches only 3.3x on bayer05. A 2-D Laplacian control scores
 //      just 1.4x, so this is not a quirk of the target matrices: it is the same
-//      fact the README records for the supernodal solvers, where level/DAG
+//      fact doc/Parallelism.md records for the supernodal solvers, where level/DAG
 //      parallelism alone never exceeded 1.79x and all the real scaling came from
 //      chunking INSIDE dense panels. This solver has no dense panels to chunk --
 //      having none is the point of it.
@@ -91,7 +91,7 @@
 //
 // If you need threads on a matrix in this class, the useful lever is not this
 // solver: it is LeftRightLU, whose supernodal panels are coarse enough to
-// schedule (see the README's parallel scaling section). Reach for it when the
+// schedule (see doc/Parallelism.md's parallel scaling section). Reach for it when the
 // factor is dense enough that the crossover above has been passed anyway.
 //
 // REFACTORIZATION IS THE POINT. analyzePattern() chooses the ordering; the

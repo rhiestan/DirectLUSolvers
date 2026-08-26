@@ -388,9 +388,17 @@ void testUnsymmetricPattern() {
 }
 
 // Padding the pattern with explicit structural zeros must be unnecessary: the
-// solver's own symmetrization has to produce the same factor structure and the
-// same answer as feeding it a pre-symmetrized matrix, while doing strictly less
-// work per pass over the values.
+// solver's own symmetrization has to produce the same answer as feeding it a
+// pre-symmetrized matrix, at no more fill and strictly less work per pass over
+// the values.
+//
+// Fill EQUALITY is not the contract, and asserting it would be wrong: padding
+// symmetrizes before the matching row permutation, so the solver then
+// symmetrizes a second time and eliminates a strictly larger graph. It also
+// destroys reducibility -- an upwind operator is fully triangular after
+// matching, and its padded form is irreducible -- so with BTF the padded input
+// can cost dramatically more. Measured on gemat11 the gap reaches 102x. The
+// direction is what matters: padding never helps.
 void testNoPreSymmetrizationNeeded() {
   const SparseMatrix<double> A = upwind2d(25, 25);
   const SparseMatrix<double> Apadded = lu_testing::symmetrizePattern(A);
@@ -405,15 +413,17 @@ void testNoPreSymmetrizationNeeded() {
 
   check(raw.info() == Eigen::Success && (A * xr - b).norm() / b.norm() < 1e-8,
         "raw unsymmetric pattern solves", (A * xr - b).norm() / b.norm());
-  check(raw.nnzL() == padded.nnzL() && raw.nnzU() == padded.nnzU(),
-        "raw and pre-symmetrized inputs give identical fill",
-        double(raw.nnzL() - padded.nnzL()));
+  check(raw.nnzL() <= padded.nnzL() && raw.nnzU() <= padded.nnzU(),
+        "pre-symmetrizing the input never reduces fill",
+        double(padded.nnzL() - raw.nnzL()));
   check((xr - xp).norm() / xp.norm() < 1e-10, "raw and pre-symmetrized answers agree",
         (xr - xp).norm() / xp.norm());
-  std::printf("        A nnz=%lld padded nnz=%lld (padding is %.0f%% dead weight); nnzL=%lld\n",
+  std::printf("        A nnz=%lld padded nnz=%lld (padding is %.0f%% dead weight)\n",
               (long long)A.nonZeros(), (long long)Apadded.nonZeros(),
-              100.0 * double(Apadded.nonZeros() - A.nonZeros()) / double(Apadded.nonZeros()),
-              (long long)raw.nnzL());
+              100.0 * double(Apadded.nonZeros() - A.nonZeros()) / double(Apadded.nonZeros()));
+  std::printf("        nnzL raw=%lld (%lld BTF blocks) padded=%lld (%lld BTF blocks)\n",
+              (long long)raw.nnzL(), (long long)raw.btfBlockCount(), (long long)padded.nnzL(),
+              (long long)padded.btfBlockCount());
 }
 
 // Ordering functors disagree on whether they return the permutation or its
@@ -431,6 +441,15 @@ void testOrderingConventions() {
   Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>> amd;
   Eigen::LeftRightLU<SparseMatrix<double>, Eigen::COLAMDOrdering<int>> colamd;
   Eigen::LeftRightLU<SparseMatrix<double>, Eigen::NaturalOrdering<int>> natural;
+  // BTF off ON PURPOSE. An upwind discretization is fully triangular after
+  // matching, so with BTF on every block is a singleton, there is no graph left
+  // to order, and all three orderings tie at zero fill -- which would make this
+  // test vacuous exactly where it is meant to bite. What is being pinned here
+  // is the OrderingConvention trait (see the comment above), and that needs a
+  // matrix the ordering actually gets to order.
+  amd.setBlockTriangularForm(false);
+  colamd.setBlockTriangularForm(false);
+  natural.setBlockTriangularForm(false);
   amd.compute(A);
   colamd.compute(A);
   natural.compute(A);

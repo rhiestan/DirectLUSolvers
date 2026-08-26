@@ -49,11 +49,12 @@
 // true residual is unaffected and refinement cleans up the rest).
 //
 // Pipeline (mirrors Eigen's analyzePattern / factorize split):
-//   analyzePattern : matching -> ordering -> elimination tree -> postorder ->
-//                    supernode detection -> symbolic block factorization ->
-//                    assembly-DAG consumer lists
+//   analyzePattern : matching -> block triangular form -> per-block ordering ->
+//                    elimination tree -> postorder -> supernode detection ->
+//                    symbolic block factorization -> assembly-DAG consumer lists
 //   factorize      : scatter values -> left-right-looking dynamic factorization
-//   solve          : block forward (L) and backward (U) substitution + refinement
+//   solve          : BTF block back-substitution, each block a forward (L) and
+//                    backward (U) substitution + refinement
 //
 // This Source Code Form is licensed under the Mozilla Public License v.2.0,
 // matching the surrounding Eigen code it integrates with.
@@ -75,6 +76,7 @@
 #include <mutex>
 #include <vector>
 
+#include "LeftRightLUBlockTriangular.h"
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLUMatching.h"
@@ -252,6 +254,57 @@ class LeftRightLUTransposeView
  *  - Unsymmetric patterns are also where structural singularity actually
  *    happens (an empty column, or one whose rows are all claimed elsewhere).
  *    matchingIsPerfect() reports it right after analyzePattern().
+ *
+ * \section lrlu_btf Block triangular form
+ *
+ * Many unsymmetric matrices -- circuit, chemical-process, economic and web
+ * graphs especially -- are *reducible*: a symmetric permutation puts them in
+ * block upper triangular form. Only the diagonal blocks then need factoring.
+ * analyzePattern() finds that form (Dulmage-Mendelsohn: the maximum transversal
+ * it already computes, followed by strongly connected components -- see
+ * LeftRightLUBlockTriangular.h) and factors each diagonal block independently,
+ * with its own fill-reducing ordering, elimination tree and supernodes. The
+ * off-diagonal blocks are never eliminated: they are applied once each during a
+ * block back-substitution, so they generate no fill and contribute exactly.
+ *
+ * On by default, and self-cancelling when it cannot help: an irreducible matrix
+ * yields one block and takes exactly the path it would have taken anyway, for
+ * the cost of one O(n + nnz) sweep -- 5-100x cheaper than the matching that
+ * precedes it. A structurally symmetric pattern is always irreducible in this
+ * sense (its SCCs are just connected components), so PDE and FEM systems pay
+ * only that sweep. setBlockTriangularForm(false) disables it; btfBlockCount()
+ * and largestBtfBlock() report what was found.
+ *
+ * The gain where it does apply is not proportional to the block sizes, because
+ * fill is superlinear in them. Measured on this project's corpus: Simon/raefsky5
+ * and Simon/raefsky6 reduce to blocks of size 1 -- fully triangular after
+ * matching, so the "factorization" is exact and free -- and SNAP/wiki-RfA
+ * (largest block 24.9% of n) and Mallya/lhr10c (34.3%) shrink by far more than
+ * those fractions suggest.
+ *
+ * Two consequences worth knowing:
+ *
+ *  - Pivoting is confined to a diagonal block. Without BTF, partial pivoting on
+ *    a column could legally take a row from an earlier block, which would
+ *    destroy the structure; BTF forbids it, so the pivot pool is genuinely
+ *    smaller. In practice this is a net stability gain -- far fewer operations
+ *    means far less accumulated rounding, and the off-diagonal blocks are used
+ *    exactly -- but it is a real constraint, not a free lunch.
+ *  - Singularity is localized. A is singular exactly when some diagonal block
+ *    is, which is a much more useful diagnostic than a column index.
+ *  - Fill is confined to the diagonal blocks, but that is a structural bound,
+ *    not a monotone guarantee: each block gets its own ordering, and a
+ *    fill-reducing ordering is a heuristic, so a matrix that barely splits can
+ *    come out marginally worse than it would under one global ordering. On this
+ *    project's corpus the worst case is +1.3% (Bai/rw5151 under COLAMD, which
+ *    splits into 6 blocks with the largest still 99.9% of n) against reductions
+ *    of 100x and more where the matrix genuinely reduces.
+ *
+ * BTF needs the zero-free diagonal a maximum transversal provides, so it is
+ * skipped when setMatching(false) removes it. matrixL()/matrixU() then expose
+ * the BLOCK-DIAGONAL factors, whose product is not A -- determinant(),
+ * logAbsDeterminant() and solve() account for the off-diagonal blocks, direct
+ * use of the factor accessors does not.
  */
 template <typename MatrixType_, typename OrderingType_ = AMDOrdering<typename MatrixType_::StorageIndex>,
           typename Executor_ = supernodal_lu::SerialExecutor>
@@ -434,13 +487,52 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
    *  structurally present. 1 = already symmetric, so symmetrizing added nothing;
    *  0 = no nonzero has a mirror, so the symbolic pattern carries twice the
    *  off-diagonal entries A does. Measured after the matching permutation, since
-   *  that is the pattern fill is actually computed from. Valid after
-   *  analyzePattern(). */
+   *  that is the pattern fill is actually computed from, and BEFORE the block
+   *  triangular form sets the off-diagonal blocks aside -- so it describes the
+   *  input, not the reduced problem. How much BTF removed is btfBlockCount() /
+   *  largestBtfBlock(). Valid after analyzePattern(). */
   RealScalar patternSymmetry() const { return m_patternSymmetry; }
 
   /** True when patternSymmetry() is exactly 1 -- symmetrizing was a no-op and
    *  the fill is the same as an equivalent symmetric-pattern matrix's. */
   bool structurallySymmetric() const { return m_structurallySymmetric; }
+
+  /** Permute to block upper triangular form and factor only the diagonal blocks
+   *  (see \ref lrlu_btf). On by default. Costs one O(n + nnz) sweep on a matrix
+   *  that turns out to be irreducible, which is every structurally symmetric
+   *  one; saves an unbounded amount on a reducible one. Requires matching() --
+   *  BTF's block structure is only well defined on a zero-free diagonal -- and
+   *  is silently skipped without it. Set before analyzePattern(). */
+  void setBlockTriangularForm(bool on) { m_btfEnabled = on; }
+  bool blockTriangularForm() const { return m_btfEnabled; }
+
+  /** Number of diagonal blocks found by the block triangular form. 1 means the
+   *  matrix is irreducible and BTF bought nothing; 0 before analyzePattern().
+   *  Equal to n exactly when the matched matrix is fully triangular, in which
+   *  case the solve is pure substitution. */
+  Index btfBlockCount() const {
+    return m_btfBlockPtr.empty() ? Index(0) : static_cast<Index>(m_btfBlockPtr.size()) - 1;
+  }
+
+  /** Size of the largest diagonal block -- the one that actually sets the cost,
+   *  since fill is superlinear in it. Equals n() when irreducible. */
+  Index largestBtfBlock() const {
+    Index largest = 0;
+    for (std::size_t k = 1; k < m_btfBlockPtr.size(); ++k)
+      largest = numext::maxi(largest, static_cast<Index>(m_btfBlockPtr[k] - m_btfBlockPtr[k - 1]));
+    return largest;
+  }
+
+  /** Block boundaries in the internal (post-ordering) numbering: block k spans
+   *  internal indices [btfBlockPointers()[k], btfBlockPointers()[k+1]). Size
+   *  btfBlockCount()+1. Exposed for diagnostics -- to locate WHICH block is
+   *  singular, intersect it with rowsPermutation()/colsPermutation(). */
+  const std::vector<StorageIndex>& btfBlockPointers() const { return m_btfBlockPtr; }
+
+  /** Number of nonzeros in the off-diagonal BTF blocks: entries of A that are
+   *  never eliminated, only applied once each during the block
+   *  back-substitution. 0 when BTF is inactive. */
+  Index btfOffDiagonalNonzeros() const { return static_cast<Index>(m_offDiagValue.size()); }
 
   /** In-block pivoting strategy (PARDISO restricted/complete pivoting). Default
    *  Complete (row + column interchanges confined to each diagonal block). */
@@ -655,6 +747,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_maxBlockSize = 128;
     m_maxFactorNonzeros = 0;  // fail-fast fill guard off by default
     m_equilibrate = true;
+    m_btfEnabled = true;
     m_matchingMethod = supernodal_lu::MatchingMethod::Transversal;
     m_pivoting = left_right_lu::Pivoting::Complete;
     m_intraParallel = true;
@@ -675,8 +768,38 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   // numbering (buildSymmetrizedPattern), and then relabelled into whichever
   // internal numbering the pipeline currently holds (relabelAdjacency) -- the
   // numbering changes when the postorder is folded in, but the graph does not.
-  void buildSymmetrizedPattern(const MatrixType& matrix);
+  //
+  // `blockOf` restricts the pattern to the BTF diagonal blocks: an entry (i, j)
+  // whose endpoints are in different blocks is dropped, because that entry is
+  // never eliminated (see \ref lrlu_btf) and including it would connect the
+  // blocks in the elimination graph and reintroduce exactly the fill BTF
+  // exists to avoid. Empty means "one block": no filtering.
+  void buildSymmetrizedPattern(const MatrixType& matrix, const std::vector<StorageIndex>& blockOf);
   void relabelAdjacency(std::vector<std::vector<StorageIndex>>& adjacency) const;
+
+  // Read a fill-reducing ordering functor's result as the DIRECT map
+  // `direct[i] = new position of i`, which is what the pipeline needs.
+  //
+  // AMDOrdering and MetisOrdering return that mapping as the INVERSE in
+  // indices(): perm.indices()(k) is the original column placed at new position
+  // k, so it must be inverted here, not copied. Getting this backwards
+  // eliminates the top separators FIRST and inflates fill enormously on
+  // strongly directional matrices (measured: 250-300x on 3D FEM), while being
+  // nearly invisible on near-symmetric orderings and leaving the residual at
+  // machine precision either way -- a mistake that hides from every check
+  // except fill. COLAMDOrdering (and anything else whose OrderingConvention
+  // says returnsInverse=false) already hands back the direct map; inverting
+  // that would be the same mistake in the other direction. An empty
+  // permutation is NaturalOrdering's identity.
+  static void readOrdering(const PermutationType& perm, StorageIndex m,
+                           std::vector<StorageIndex>& direct);
+
+  // Fill m_toInternal by ordering each BTF diagonal block on its own. Block k
+  // keeps the internal index range [blockPtr[k], blockPtr[k+1]) it was given by
+  // the block triangular form, so the blocks stay contiguous and in topological
+  // order; the ordering only permutes within them.
+  void orderWithinBlocks(const MatrixType& B, const std::vector<StorageIndex>& btfPosition,
+                         const std::vector<StorageIndex>& blockPtr);
   void computeEliminationTree(const std::vector<std::vector<StorageIndex>>& adjacency,
                               std::vector<StorageIndex>& parent) const;
   void computePostorder(const std::vector<StorageIndex>& parent, std::vector<StorageIndex>& postorder) const;
@@ -822,14 +945,46 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
   template <typename ApplyA>
   void recordSolveStatus(const DenseMatrix& rhs, const DenseMatrix& solution, ApplyA applyA) const;
+  // Each of these sweeps the supernode range [sBegin, sEnd), which is one BTF
+  // diagonal block (the whole factor when there is only one). Supernodes never
+  // straddle a block boundary: a block boundary is a mandatory structural break
+  // in the elimination tree, because the restricted pattern has no edge across
+  // it, and computeSupernodePartition breaks a supernode wherever
+  // parent[j-1] != j.
   template <typename Dest>
-  void applyInverseL(Dest& y) const;
+  void applyInverseL(Dest& y, StorageIndex sBegin, StorageIndex sEnd) const;
   template <typename Dest>
-  void applyInverseU(Dest& y) const;
+  void applyInverseU(Dest& y, StorageIndex sBegin, StorageIndex sEnd) const;
   template <bool Conjugate, typename Dest>
-  void applyInverseLTransposed(Dest& y) const;
+  void applyInverseLTransposed(Dest& y, StorageIndex sBegin, StorageIndex sEnd) const;
   template <bool Conjugate, typename Dest>
-  void applyInverseUTransposed(Dest& y) const;
+  void applyInverseUTransposed(Dest& y, StorageIndex sBegin, StorageIndex sEnd) const;
+
+  template <typename Dest>
+  void applyInverseL(Dest& y) const {
+    applyInverseL(y, 0, static_cast<StorageIndex>(m_supernodes.size()));
+  }
+  template <typename Dest>
+  void applyInverseU(Dest& y) const {
+    applyInverseU(y, 0, static_cast<StorageIndex>(m_supernodes.size()));
+  }
+
+  // BTF block back-substitution. With A permuted to block upper triangular,
+  // A y = r is solved one block at a time from the last block backwards:
+  // solve the diagonal block, then subtract that block's contribution from the
+  // right-hand sides of all the earlier blocks. With a single block this is
+  // exactly L^-1 then U^-1 over the whole factor.
+  // True when the block triangular form actually split the matrix. Derived from
+  // the boundaries rather than stored, so it cannot disagree with them: an
+  // inactive BTF leaves the single block {0, n}.
+  bool btfActive() const { return m_btfBlockPtr.size() > 2; }
+
+  template <typename Dest>
+  void applyInverseBlocks(Dest& y) const;
+  // The transpose is block LOWER triangular, so the same sweep runs forwards,
+  // gathering each block's already-solved predecessors before solving it.
+  template <bool Conjugate, typename Dest>
+  void applyInverseBlocksTransposed(Dest& y) const;
   template <bool Conjugate>
   void solveTriangularTransposed(const DenseMatrix& rhs, DenseMatrix& solution) const;
   template <typename ApplyA, typename ApplyPrec>
@@ -869,6 +1024,21 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   std::vector<std::vector<StorageIndex>> m_rowPivot;
   std::vector<std::vector<StorageIndex>> m_colPivot;
   Scalar m_factorizationSign;  // sign(matching) * prod sign(in-block row & col pivots)
+
+  // --- block triangular form -----------------------------------------------
+  // m_btfBlockPtr holds nblocks+1 boundaries in the INTERNAL numbering, and is
+  // always populated after analyzePattern -- {0, n} when BTF is off or the
+  // matrix is irreducible -- so the solve can run one uniform block loop.
+  // m_btfSupernodePtr is the same partition expressed in supernode ids.
+  std::vector<StorageIndex> m_btfBlockPtr;
+  std::vector<StorageIndex> m_btfSupernodePtr;
+  std::vector<StorageIndex> m_btfBlockOfInternal;  // internal index -> block id
+  // The off-diagonal blocks: CSC over INTERNAL columns, scaled exactly as the
+  // factor is. These entries are never eliminated, so they carry no fill and
+  // are applied once per solve. Empty unless BTF found more than one block.
+  std::vector<StorageIndex> m_offDiagStart;  // n+1, filled by analyzePattern
+  std::vector<StorageIndex> m_offDiagRow;    // filled by factorize
+  std::vector<Scalar> m_offDiagValue;
 
   std::vector<Supernode> m_supernodes;
   std::vector<RowBlock> m_rowBlocks;
@@ -913,6 +1083,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   Index m_maxBlockSize;
   Index m_maxFactorNonzeros;  // fail-fast fill guard (0 = off)
   bool m_equilibrate;
+  bool m_btfEnabled;
   supernodal_lu::MatchingMethod m_matchingMethod;
   // MC64's dual scaling (original numbering), empty unless MC64 ran.
   std::vector<RealScalar> m_mc64RowScale, m_mc64ColScale;
@@ -929,10 +1100,14 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 // `matrix` in ITS OWN numbering, as a flat CSR in m_patternStart/m_patternIndex.
 // Row order within a node's list is not maintained -- relabelAdjacency does not
 // need it -- but each list is duplicate-free, which it does need.
+//
+// `blockOf` (empty = no BTF) keeps only the entries inside a diagonal block,
+// which is exactly the set of entries the numeric phase eliminates.
 template <typename MatrixType, typename OrderingType, typename Executor>
 void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetrizedPattern(
-    const MatrixType& matrix) {
+    const MatrixType& matrix, const std::vector<StorageIndex>& blockOf) {
   const StorageIndex n = m_size;
+  const bool restrict = !blockOf.empty();
   m_patternStart.assign(static_cast<std::size_t>(n) + 1, 0);
   if (n == 0) {
     m_patternIndex.clear();
@@ -1005,6 +1180,30 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetrizedPattern(
     m_patternSymmetry = RealScalar(1);  // diagonal-only: trivially symmetric
     m_structurallySymmetric = true;
   }
+
+  // Pass 4 (BTF only): drop the edges that cross a diagonal block. They are
+  // deliberately absent from the elimination graph -- keeping them would
+  // reconnect the blocks and reintroduce exactly the fill BTF exists to avoid.
+  //
+  // This runs AFTER the statistics above rather than as a filter inside passes
+  // 1-3, so patternSymmetry() keeps describing the INPUT's pattern. That is
+  // what a caller wants to know (and what the fill-guard message explains fill
+  // with); how much of it BTF then set aside is reported separately by
+  // btfBlockCount() and largestBtfBlock().
+  if (!restrict) return;
+  std::size_t keep = 0;
+  for (StorageIndex j = 0; j < n; ++j) {
+    const std::size_t begin = m_patternStart[static_cast<std::size_t>(j)];
+    const std::size_t end = m_patternStart[static_cast<std::size_t>(j) + 1];
+    m_patternStart[static_cast<std::size_t>(j)] = keep;
+    for (std::size_t k = begin; k < end; ++k) {
+      const StorageIndex v = m_patternIndex[k];
+      if (blockOf[static_cast<std::size_t>(v)] != blockOf[static_cast<std::size_t>(j)]) continue;
+      m_patternIndex[keep++] = v;
+    }
+  }
+  m_patternStart[static_cast<std::size_t>(n)] = keep;
+  m_patternIndex.resize(keep);
 }
 
 // Relabel the once-built symmetrized pattern into the current m_toInternal
@@ -1287,6 +1486,72 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::computeSupernodeLevels() {
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
+void LeftRightLU<MatrixType, OrderingType, Executor>::readOrdering(const PermutationType& perm,
+                                                                   StorageIndex m,
+                                                                   std::vector<StorageIndex>& direct) {
+  direct.resize(static_cast<std::size_t>(m));
+  if (perm.size() == 0) {
+    for (StorageIndex i = 0; i < m; ++i) direct[static_cast<std::size_t>(i)] = i;  // NaturalOrdering
+  } else if (left_right_lu::OrderingConvention<OrderingType>::returnsInverse) {
+    for (StorageIndex i = 0; i < m; ++i) direct[static_cast<std::size_t>(perm.indices()(i))] = i;
+  } else {
+    for (StorageIndex i = 0; i < m; ++i) direct[static_cast<std::size_t>(i)] = perm.indices()(i);
+  }
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+void LeftRightLU<MatrixType, OrderingType, Executor>::orderWithinBlocks(
+    const MatrixType& B, const std::vector<StorageIndex>& btfPosition,
+    const std::vector<StorageIndex>& blockPtr) {
+  const StorageIndex n = m_size;
+  m_toInternal.assign(static_cast<std::size_t>(n), 0);
+
+  // Walk each block in position order: columnAt inverts btfPosition.
+  std::vector<StorageIndex> columnAt(static_cast<std::size_t>(n));
+  for (StorageIndex j = 0; j < n; ++j) columnAt[static_cast<std::size_t>(btfPosition[j])] = j;
+
+  const StorageIndex nblocks = static_cast<StorageIndex>(blockPtr.size()) - 1;
+  std::vector<StorageIndex> localDirect;
+  std::vector<Triplet<Scalar, StorageIndex>> trips;
+  MatrixType blockMatrix;
+  PermutationType blockPerm;
+
+  for (StorageIndex k = 0; k < nblocks; ++k) {
+    const StorageIndex first = blockPtr[static_cast<std::size_t>(k)];
+    const StorageIndex last = blockPtr[static_cast<std::size_t>(k) + 1];
+    const StorageIndex size = last - first;
+
+    // A singleton needs no ordering, and on a strongly reducible matrix it is
+    // the overwhelmingly common case (SNAP/as-caida: 31,198 blocks, largest 95).
+    // Handing tens of thousands of 1x1 matrices to the ordering functor would
+    // cost more than the rest of analyzePattern put together.
+    if (size == 1) {
+      m_toInternal[static_cast<std::size_t>(columnAt[static_cast<std::size_t>(first)])] = first;
+      continue;
+    }
+
+    trips.clear();
+    for (StorageIndex p = first; p < last; ++p) {
+      const StorageIndex j = columnAt[static_cast<std::size_t>(p)];
+      for (typename MatrixType::InnerIterator it(B, j); it; ++it) {
+        const StorageIndex q = btfPosition[static_cast<std::size_t>(it.index())];
+        if (q < first || q >= last) continue;  // off-diagonal block: not eliminated
+        trips.emplace_back(q - first, p - first, it.value());
+      }
+    }
+    blockMatrix.resize(size, size);
+    blockMatrix.setFromTriplets(trips.begin(), trips.end());
+    blockMatrix.makeCompressed();
+
+    m_orderingFunctor(blockMatrix, blockPerm);
+    readOrdering(blockPerm, size, localDirect);
+    for (StorageIndex c = 0; c < size; ++c)
+      m_toInternal[static_cast<std::size_t>(columnAt[static_cast<std::size_t>(first + c)])] =
+          first + localDirect[static_cast<std::size_t>(c)];
+  }
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
 void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const MatrixType& matrix) {
   eigen_assert(matrix.rows() == matrix.cols() && "LeftRightLU requires a square matrix");
   m_size = static_cast<StorageIndex>(matrix.rows());
@@ -1324,38 +1589,56 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   const MatrixType& B =
       m_matchingMethod != supernodal_lu::MatchingMethod::None ? matched : matrix;
 
+  // 0.5) BLOCK TRIANGULAR FORM. The matching above is phase 1 of the
+  //    Dulmage-Mendelsohn decomposition; this is phase 2 (strongly connected
+  //    components, see LeftRightLUBlockTriangular.h). It hands back a
+  //    block-contiguous position for every column, in an order that makes B
+  //    block UPPER triangular. Only the diagonal blocks are eliminated.
+  //
+  //    Skipped without matching: the block structure is only well defined on a
+  //    zero-free diagonal. Irreducible matrices fall through to exactly the
+  //    single-block path below, having paid one O(n + nnz) sweep.
+  std::vector<StorageIndex> btfPosition;
+  std::vector<StorageIndex> blockOfB;  // B's numbering -> block id; empty = one block
+  StorageIndex nblocks = 1;
+  const bool btfWanted =
+      m_btfEnabled && n > 0 && m_matchingMethod != supernodal_lu::MatchingMethod::None;
+  if (btfWanted) nblocks = left_right_lu::blockTriangularOrder(B, btfPosition, m_btfBlockPtr);
+  const bool btf = btfWanted && nblocks > 1;
+  if (!btf) {
+    nblocks = 1;
+    m_btfBlockPtr.assign(2, 0);
+    m_btfBlockPtr[1] = n;
+    btfPosition.clear();
+  }
+
   // 1) fill-reducing ordering. AMD/METIS order the pattern of B + B^T, which is
   //    exactly the graph this factorization eliminates -- so they remain the
-  //    right choice on an unsymmetric pattern too (see the class docs).
-  PermutationType orderingPerm;
-  m_orderingFunctor(B, orderingPerm);
-  m_toInternal.resize(n);
-  if (orderingPerm.size() == 0) {
-    // NaturalOrdering: identity, reported as an empty permutation.
-    for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = i;
-  } else if (left_right_lu::OrderingConvention<OrderingType>::returnsInverse) {
-    // m_toInternal[i] must be the INTERNAL (elimination) index of original column
-    // i -- i.e. the fill-reducing "new index of i" (separators eliminated last).
-    // AMDOrdering and MetisOrdering return that mapping as the INVERSE in
-    // indices(): orderingPerm.indices()(k) is the original column placed at new
-    // position k. So it must be inverted here, not copied directly. Getting this
-    // backwards eliminates the top separators FIRST and inflates fill enormously
-    // on strongly directional matrices (e.g. 3D FEM: 250-300x more fill), while
-    // being nearly invisible on near-symmetric orderings and leaving the residual
-    // at machine precision either way -- so it is a mistake that hides from every
-    // check except fill.
-    for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
+  //    right choice on an unsymmetric pattern too (see the class docs). Under
+  //    BTF each diagonal block is ordered on its own: the blocks are separate
+  //    elimination problems, and the ordering has strictly more freedom on the
+  //    smaller graphs.
+  if (btf) {
+    orderWithinBlocks(B, btfPosition, m_btfBlockPtr);
+    std::vector<StorageIndex> blockOfPosition(static_cast<std::size_t>(n), 0);
+    for (StorageIndex k = 0; k < nblocks; ++k)
+      for (StorageIndex p = m_btfBlockPtr[static_cast<std::size_t>(k)];
+           p < m_btfBlockPtr[static_cast<std::size_t>(k) + 1]; ++p)
+        blockOfPosition[static_cast<std::size_t>(p)] = k;
+    blockOfB.resize(static_cast<std::size_t>(n));
+    for (StorageIndex j = 0; j < n; ++j)
+      blockOfB[static_cast<std::size_t>(j)] =
+          blockOfPosition[static_cast<std::size_t>(btfPosition[static_cast<std::size_t>(j)])];
   } else {
-    // COLAMDOrdering (and anything else marked returnsInverse=false) already
-    // hands back the direct new-index-of-i mapping; inverting it here would be
-    // the exact same fill mistake in the other direction.
-    for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = orderingPerm.indices()(i);
+    PermutationType orderingPerm;
+    m_orderingFunctor(B, orderingPerm);
+    readOrdering(orderingPerm, n, m_toInternal);
   }
 
   // 2) elimination tree of the ordered, symmetrized (B + B^T) pattern. The
   //    pattern itself is numbering-independent, so it is built once here and
   //    only relabelled below.
-  buildSymmetrizedPattern(B);
+  buildSymmetrizedPattern(B, blockOfB);
   std::vector<std::vector<StorageIndex>> adjacency;
   relabelAdjacency(adjacency);
   std::vector<StorageIndex> parent;
@@ -1397,6 +1680,57 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   for (StorageIndex i = 0; i < n; ++i) {
     m_permutation.indices()(i) = m_toInternal[i];
     m_rowPermutation.indices()(i) = m_rowToInternal[i];
+  }
+
+  // 8) BTF bookkeeping in the FINAL internal numbering.
+  //
+  //    The block boundaries computed in step 0.5 survive steps 1-4 untouched,
+  //    which is what lets the solve address a block as a plain index range.
+  //    Step 1 permutes only within a block by construction; step 3's postorder
+  //    is a permutation of the elimination FOREST, and no tree spans two blocks
+  //    (the restricted pattern has no edge across a boundary), so the postorder
+  //    visits every root of block k -- all of which have smaller indices than
+  //    any root of block k+1 -- before any root of block k+1, and each subtree
+  //    it emits stays inside its own block.
+  m_btfBlockOfInternal.assign(static_cast<std::size_t>(n), 0);
+  for (StorageIndex k = 0; k < nblocks; ++k)
+    for (StorageIndex p = m_btfBlockPtr[static_cast<std::size_t>(k)];
+         p < m_btfBlockPtr[static_cast<std::size_t>(k) + 1]; ++p)
+      m_btfBlockOfInternal[static_cast<std::size_t>(p)] = k;
+#ifndef NDEBUG
+  for (StorageIndex j = 0; j < n; ++j)
+    eigen_assert(!btf || m_btfBlockOfInternal[m_toInternal[j]] == blockOfB[j]);
+#endif
+
+  // Supernodes never straddle a block boundary (a boundary is a mandatory
+  // structural break in computeSupernodePartition), so the same partition
+  // expressed in supernode ids is just a lookup at each boundary column.
+  m_btfSupernodePtr.assign(static_cast<std::size_t>(nblocks) + 1, 0);
+  for (StorageIndex k = 0; k < nblocks; ++k) {
+    const StorageIndex firstColumn = m_btfBlockPtr[static_cast<std::size_t>(k)];
+    m_btfSupernodePtr[static_cast<std::size_t>(k)] =
+        (firstColumn < n) ? m_supernodeOfColumn[static_cast<std::size_t>(firstColumn)]
+                          : static_cast<StorageIndex>(m_supernodes.size());
+  }
+  m_btfSupernodePtr[static_cast<std::size_t>(nblocks)] = static_cast<StorageIndex>(m_supernodes.size());
+
+  // Off-diagonal blocks: count per internal column now (pure pattern), fill the
+  // rows and values in factorize, where the scaling is known.
+  m_offDiagStart.assign(static_cast<std::size_t>(n) + 1, 0);
+  m_offDiagRow.clear();
+  m_offDiagValue.clear();
+  if (btf) {
+    for (StorageIndex j = 0; j < n; ++j) {
+      const StorageIndex jj = m_toInternal[j];
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+        const StorageIndex ii = m_rowToInternal[static_cast<StorageIndex>(it.index())];
+        if (m_btfBlockOfInternal[static_cast<std::size_t>(ii)] !=
+            m_btfBlockOfInternal[static_cast<std::size_t>(jj)])
+          ++m_offDiagStart[static_cast<std::size_t>(jj) + 1];
+      }
+    }
+    for (StorageIndex jj = 0; jj < n; ++jj)
+      m_offDiagStart[static_cast<std::size_t>(jj) + 1] += m_offDiagStart[static_cast<std::size_t>(jj)];
   }
 
   m_analysisDone = true;
@@ -1847,7 +2181,18 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
   m_rowPivot.assign(supernodeNbr, std::vector<StorageIndex>());
   m_colPivot.assign(supernodeNbr, std::vector<StorageIndex>());
 
-  // 2) scatter the (permuted, scaled) values of A into the panels.
+  // 2) scatter the (permuted, scaled) values of A into the panels. Entries that
+  //    cross a BTF block boundary are NOT part of any panel -- they are never
+  //    eliminated -- and are peeled off into the off-diagonal CSC instead, for
+  //    the block back-substitution to apply once per solve.
+  const bool btf = btfActive();
+  if (btf) {
+    m_offDiagRow.resize(static_cast<std::size_t>(m_offDiagStart[static_cast<std::size_t>(m_size)]));
+    m_offDiagValue.resize(m_offDiagRow.size());
+  }
+  std::vector<StorageIndex> offCursor;
+  if (btf) offCursor.assign(m_offDiagStart.begin(), m_offDiagStart.end() - 1);
+
   for (StorageIndex j = 0; j < m_size; ++j) {
     const StorageIndex jj = m_toInternal[j];
     const StorageIndex columnSupernode = m_supernodeOfColumn[jj];
@@ -1859,7 +2204,12 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
       const StorageIndex origRow = static_cast<StorageIndex>(it.index());
       const StorageIndex ii = m_rowToInternal[origRow];
       const Scalar value = it.value() * m_rowScale[origRow] * m_colScale[j];
-      if (m_supernodeOfColumn[ii] == columnSupernode) {
+      if (btf && m_btfBlockOfInternal[static_cast<std::size_t>(ii)] !=
+                     m_btfBlockOfInternal[static_cast<std::size_t>(jj)]) {
+        const std::size_t slot = static_cast<std::size_t>(offCursor[static_cast<std::size_t>(jj)]++);
+        m_offDiagRow[slot] = ii;
+        m_offDiagValue[slot] = value;
+      } else if (m_supernodeOfColumn[ii] == columnSupernode) {
         const std::size_t col = static_cast<std::size_t>(jj) - csFirst;
         const std::size_t row = static_cast<std::size_t>(ii) - csFirst;
         m_lStorage[m_lOffset[columnSupernode] + col * csStride + row] += value;
@@ -2164,9 +2514,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBa
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
-void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) const {
-  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y, StorageIndex sBegin,
+                                                                    StorageIndex sEnd) const {
+  for (StorageIndex s = sBegin; s < sEnd; ++s) {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
@@ -2188,9 +2538,10 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseL(Dest& y) con
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
-void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseU(Dest& y) const {
-  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-  for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseU(Dest& y, StorageIndex sBegin,
+                                                                    StorageIndex sEnd) const {
+  for (StorageIndex s = sEnd; s > sBegin;) {
+    --s;
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
@@ -2209,7 +2560,35 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseU(Dest& y) con
       DenseMatrix tmp = head;
       for (StorageIndex k = 0; k < w; ++k) head.row(cpiv[k]) = tmp.row(k);
     }
-    if (s == 0) break;
+  }
+}
+
+// BTF block back-substitution, in the internal numbering. The matrix is block
+// UPPER triangular there, so blocks are solved from the last backwards, and
+// each solved block is immediately substituted out of the earlier blocks'
+// right-hand sides. The off-diagonal entries are used exactly once and are
+// never modified, which is why they neither fill nor accumulate rounding.
+//
+// With one block this is exactly L^-1 followed by U^-1 over the whole factor,
+// and the entry loop below runs zero times.
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename Dest>
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseBlocks(Dest& y) const {
+  const StorageIndex nblocks = static_cast<StorageIndex>(m_btfSupernodePtr.size()) - 1;
+  for (StorageIndex k = nblocks; k > 0;) {
+    --k;
+    const StorageIndex sBegin = m_btfSupernodePtr[static_cast<std::size_t>(k)];
+    const StorageIndex sEnd = m_btfSupernodePtr[static_cast<std::size_t>(k) + 1];
+    applyInverseL(y, sBegin, sEnd);
+    applyInverseU(y, sBegin, sEnd);
+    if (m_offDiagValue.empty()) continue;
+    for (StorageIndex jj = m_btfBlockPtr[static_cast<std::size_t>(k)];
+         jj < m_btfBlockPtr[static_cast<std::size_t>(k) + 1]; ++jj) {
+      for (StorageIndex p = m_offDiagStart[static_cast<std::size_t>(jj)];
+           p < m_offDiagStart[static_cast<std::size_t>(jj) + 1]; ++p)
+        y.row(m_offDiagRow[static_cast<std::size_t>(p)]) -=
+            m_offDiagValue[static_cast<std::size_t>(p)] * y.row(jj);
+    }
   }
 }
 
@@ -2220,8 +2599,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::solveTriangular(const Dens
   const Index nrhs = rhs.cols();
   DenseMatrix y(n, nrhs);
   for (StorageIndex i = 0; i < n; ++i) y.row(m_rowToInternal[i]) = m_rowScale[i] * rhs.row(i);
-  applyInverseL(y);
-  applyInverseU(y);
+  applyInverseBlocks(y);
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_colScale[i] * y.row(m_toInternal[i]);
 }
 
@@ -2275,9 +2653,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::LeftRightLUMatrixUReturnTy
 // leading row operation here (inverse of the trailing scatter in applyInverseU).
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Dest>
-void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseUTransposed(Dest& y) const {
-  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseUTransposed(Dest& y, StorageIndex sBegin,
+                                                                              StorageIndex sEnd) const {
+  for (StorageIndex s = sBegin; s < sEnd; ++s) {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
@@ -2309,9 +2687,10 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseUTransposed(De
 // applied (inverse) at the end (mirror of applyInverseL's leading gather).
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Dest>
-void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(Dest& y) const {
-  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-  for (StorageIndex s = supernodeNbr - 1; s >= 0; --s) {
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(Dest& y, StorageIndex sBegin,
+                                                                              StorageIndex sEnd) const {
+  for (StorageIndex s = sEnd; s > sBegin;) {
+    --s;
     const Supernode& sn = m_supernodes[s];
     const StorageIndex w = sn.width();
     auto head = y.middleRows(sn.firstColumn, w);
@@ -2335,7 +2714,33 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseLTransposed(De
       DenseMatrix tmp = head;
       for (StorageIndex k = 0; k < w; ++k) head.row(piv[k]) = tmp.row(k);
     }
-    if (s == 0) break;
+  }
+}
+
+// The transpose of a block upper triangular matrix is block LOWER triangular,
+// so the block sweep runs FORWARDS here: block k gathers the contributions of
+// the blocks before it -- all already solved -- and then solves its own
+// diagonal block. Each off-diagonal entry is read transposed (conjugated for
+// the adjoint) from the same column-major storage, so no transpose is formed.
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <bool Conjugate, typename Dest>
+void LeftRightLU<MatrixType, OrderingType, Executor>::applyInverseBlocksTransposed(Dest& y) const {
+  const StorageIndex nblocks = static_cast<StorageIndex>(m_btfSupernodePtr.size()) - 1;
+  for (StorageIndex k = 0; k < nblocks; ++k) {
+    if (!m_offDiagValue.empty()) {
+      for (StorageIndex jj = m_btfBlockPtr[static_cast<std::size_t>(k)];
+           jj < m_btfBlockPtr[static_cast<std::size_t>(k) + 1]; ++jj) {
+        for (StorageIndex p = m_offDiagStart[static_cast<std::size_t>(jj)];
+             p < m_offDiagStart[static_cast<std::size_t>(jj) + 1]; ++p) {
+          const Scalar a = m_offDiagValue[static_cast<std::size_t>(p)];
+          y.row(jj) -= (Conjugate ? numext::conj(a) : a) * y.row(m_offDiagRow[static_cast<std::size_t>(p)]);
+        }
+      }
+    }
+    const StorageIndex sBegin = m_btfSupernodePtr[static_cast<std::size_t>(k)];
+    const StorageIndex sEnd = m_btfSupernodePtr[static_cast<std::size_t>(k) + 1];
+    applyInverseUTransposed<Conjugate>(y, sBegin, sEnd);
+    applyInverseLTransposed<Conjugate>(y, sBegin, sEnd);
   }
 }
 
@@ -2348,8 +2753,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::solveTriangularTransposed(
   const Index nrhs = rhs.cols();
   DenseMatrix y(n, nrhs);
   for (StorageIndex i = 0; i < n; ++i) y.row(m_toInternal[i]) = m_colScale[i] * rhs.row(i);
-  applyInverseUTransposed<Conjugate>(y);
-  applyInverseLTransposed<Conjugate>(y);
+  applyInverseBlocksTransposed<Conjugate>(y);
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_rowScale[i] * y.row(m_rowToInternal[i]);
 }
 

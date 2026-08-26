@@ -34,7 +34,7 @@
 //
 // COST. O(n) shortest-path searches, each O(nnz log n) worst case, versus the
 // transversal's near-linear greedy pass. It is therefore OFF BY DEFAULT and
-// selected with setMatchingMethod(MatchingMethod::MC64); see the README.
+// selected with setMatchingMethod(MatchingMethod::MC64); see doc/SupernodalLU.md.
 //
 // This Source Code Form is licensed under the Mozilla Public License v.2.0.
 

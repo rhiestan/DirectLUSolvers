@@ -324,7 +324,7 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
    *  `Transversal` (default) is the cheap magnitude-greedy transversal. It is
    *  NOT guaranteed to improve on the un-permuted diagonal, and on this
    *  project's SuiteSparse corpus it makes four otherwise-solvable matrices
-   *  unsolvable -- see the README.
+   *  unsolvable -- see doc/SupernodalLU.md.
    *
    *  `MC64` is the exact maximum-product assignment (Duff & Koster), which by
    *  construction can never choose a worse diagonal than any other permutation,

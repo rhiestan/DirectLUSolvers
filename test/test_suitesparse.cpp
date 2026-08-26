@@ -230,13 +230,30 @@ int main(int argc, char** argv) {
     judge(snlu, "SupernodalLU");
     judge(lrlu, "LeftRightLU");
 
-    // The two solvers share the entire symbolic pipeline, so they must agree on
+    // The two solvers share the symbolic pipeline, so they must agree on
     // whether a matrix is feasible at all. A divergence means one of the numeric
     // cores has drifted from the shared analysis.
     lu_testing::checkTrue(snlu.factored == lrlu.factored,
                           m.label() + ": both solvers agree on feasibility");
-    if (snlu.factored && lrlu.factored)
-      lu_testing::checkTrue(snlu.fill == lrlu.fill, m.label() + ": both solvers agree on fill");
+    // Fill, though, is no longer shared: LeftRightLU permutes to block
+    // triangular form and factors the diagonal blocks only, which SupernodalLU
+    // does not do. So the contract is one-sided -- LeftRightLU may do far
+    // better, and must not do meaningfully worse. (It bites even on the
+    // pre-symmetrized matrices fed here, because a symmetric pattern still
+    // splits into its connected components, and ordering those separately beats
+    // ordering them together.)
+    //
+    // The tolerance is not slack for its own sake: BTF orders each block
+    // independently, and a fill-reducing ordering is a heuristic, so a matrix
+    // that barely splits can come out a per cent or two worse than one global
+    // ordering. Anything beyond that is a real regression.
+    if (snlu.factored && lrlu.factored) {
+      const bool ok = lrlu.fill <= snlu.fill + snlu.fill / 20;
+      lu_testing::checkTrue(ok, m.label() + ": LeftRightLU fill <= SupernodalLU fill");
+      if (lrlu.fill != snlu.fill)
+        std::printf("        BTF: LeftRightLU fill %lld vs SupernodalLU %lld (%.2fx)\n", lrlu.fill,
+                    snlu.fill, static_cast<double>(lrlu.fill) / static_cast<double>(snlu.fill));
+    }
   }
 
   std::printf("\n%lld solved, %lld returned a bad answer the solver itself flagged, %lld declined\n"

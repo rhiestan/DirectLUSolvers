@@ -69,7 +69,7 @@ inline const std::vector<BenchmarkMatrix>& benchmarkMatrices() {
       // only 10 of 3049 entries lack their transpose. The one matrix here with a
       // CHAIN elimination tree, which is why it is worth keeping: AMD amalgamates
       // that chain into 9 dense blocks (43x fill), while METIS keeps it sparse
-      // (2.7x). See the amalgamation note in README.md.
+      // (2.7x). See the amalgamation note in doc/SupernodalLU.md.
       {"setfos", "setfos/spmatrix.mtx", Tier::Small, "near-tridiagonal; chain elimination tree"},
       // setfos's opposite, and the corpus's stress case for a symmetric-pattern
       // solver: 7.8% dense, and only 44% of entries have their transpose, so

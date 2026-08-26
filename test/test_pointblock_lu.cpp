@@ -103,6 +103,13 @@ void testUnsymmetricPattern() {
 
   Eigen::PointBlockLU<SpMat, Eigen::COLAMDOrdering<int>> pb;
   Eigen::LeftRightLU<SpMat, Eigen::COLAMDOrdering<int>> lr;
+  // LeftRightLU's BTF is disabled here to keep the comparison about the one
+  // thing this test is measuring: the cost of symmetrizing the pattern. An
+  // upwind operator is fully triangular after matching, so with BTF on
+  // LeftRightLU reduces this matrix to singleton blocks and wins by ~4x --
+  // a real result, but one that says nothing about symmetrization, and it
+  // would go away the moment PointBlockLU grew a BTF of its own.
+  lr.setBlockTriangularForm(false);
   pb.compute(upwind);
   lr.compute(upwind);
   const double pbFill = double(pb.nnzL() + pb.nnzU());
