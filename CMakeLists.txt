@@ -290,6 +290,10 @@ endfunction()
 add_dlu_test(test_supernodal_lu SOURCE test/test_supernodal_lu.cpp LABELS "quick;correctness")
 add_dlu_test(test_leftright_lu  SOURCE test/test_leftright_lu.cpp  LABELS "quick;correctness")
 add_dlu_test(test_btf           SOURCE test/test_btf.cpp           LABELS "quick;correctness")
+# Condition estimation / error bounds. Dependency-free: every matrix is either
+# generated or has a closed-form condition number to check the estimate against.
+add_dlu_test(test_condition_estimate SOURCE test/test_condition_estimate.cpp
+                                                                  LABELS "quick;correctness")
 add_dlu_test(test_pointblock_lu SOURCE test/test_pointblock_lu.cpp LABELS "quick;correctness")
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 

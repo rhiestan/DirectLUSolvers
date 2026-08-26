@@ -73,10 +73,12 @@
 #include <cstdio>
 #include <deque>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <vector>
 
 #include "LeftRightLUBlockTriangular.h"
+#include "LeftRightLUConditionEstimate.h"
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLUMatching.h"
@@ -419,6 +421,81 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   /** The relative residual ||b - A x|| / ||b|| measured by the last solve(). */
   RealScalar solveResidual() const { return m_lastSolveRelativeResidual; }
 
+  // --- condition estimation & error bounds ----------------------------------
+  //
+  // A residual says the answer solves a NEARBY system; it does not say how far
+  // that answer is from the solution of the system you asked about. These are
+  // what close the gap, and none of them runs unless you ask: solve() is
+  // byte-for-byte the same work it was before, and the accessors below cost
+  // what they cost only when called. See LeftRightLUConditionEstimate.h.
+
+  /** 
+eturns a Hager-Higham estimate of kappa_1(A) = ||A||_1 ||A^{-1}||_1,
+    *  computed from the existing factors and cached until the next factorize().
+    *
+    *  Costs about 4-10 triangular solves the FIRST time it is called after a
+    *  factorization and nothing thereafter. It is a lower bound (see the header),
+    *  and it describes the operator this factorization inverts -- which under
+    *  static pivoting is a perturbed A, so read it together with
+    *  replacedPivots(). Returns infinity if the factorization is singular. */
+  RealScalar conditionEstimate() const;
+
+  /** Triangular solves spent on the cached condition estimate, 0 if never asked. */
+  Index conditionEstimateSolves() const { return m_conditionSolves; }
+
+  /** 
+eturns the Oettli-Prager componentwise relative backward error of  x
+    *  as a solution of A x =  b -- EXACT, not an estimate, and O(nnz).
+    *
+    *  Near machine epsilon means the solver was backward stable on this system
+    *  and no method could have done better in this precision; any inaccuracy
+    *  left in x belongs to the matrix, not to the solver. */
+  template <typename RhsT, typename SolT>
+  RealScalar componentwiseBackwardError(const RhsT& b, const SolT& x) const {
+    return left_right_lu::componentwiseBackwardError(m_originalMatrix, b, x);
+  }
+
+  /** 
+eturns kappa * omega, clamped to 1: a first-order bound on
+    *  ||x - x_exact|| / ||x_exact||. Meaningless once it approaches 1, which is
+    *  exactly the case where it is telling you not to trust the answer. */
+  template <typename RhsT, typename SolT>
+  RealScalar estimatedForwardError(const RhsT& b, const SolT& x) const {
+    return left_right_lu::estimateForwardError(conditionEstimate(),
+                                               componentwiseBackwardError(b, x));
+  }
+
+  /** 
+eturns how many decimal digits of  x the forward-error estimate
+    *  supports, floored at 0 -- the "13 digits or 2 digits?" question a bare
+    *  residual cannot answer. */
+  template <typename RhsT, typename SolT>
+  int estimatedCorrectDigits(const RhsT& b, const SolT& x) const {
+    return digitsFromForwardError(estimatedForwardError(b, x));
+  }
+
+  /** Compute the error bounds inside every solve() and let info() act on them.
+    *  OFF by default, deliberately: it adds a condition estimate (once per
+    *  factorization) and an O(nnz) backward error (once per solve) to a path
+    *  whose cost is otherwise exactly the factor solve.
+    *
+    *  With it on, solve() fills lastBackwardError()/lastForwardError() and
+    *  downgrades info() to NumericalIssue when the forward-error estimate
+    *  reaches 1 -- i.e. when NO digit of the answer is supported -- even though
+    *  the residual check passed. That combination is the signature of an
+    *  ill-conditioned system: a backward-stable answer that is still wrong. */
+  void setErrorBounds(bool on) { m_errorBounds = on; }
+  bool errorBounds() const { return m_errorBounds; }
+
+  /** Backward/forward error of the last solve(). NaN unless errorBounds() was on. */
+  RealScalar lastBackwardError() const { return m_lastBackwardError; }
+  RealScalar lastForwardError() const { return m_lastForwardError; }
+
+  /** Correct digits supported for the last solve(), -1 unless errorBounds() was on. */
+  int lastCorrectDigits() const {
+    return (numext::isfinite)(m_lastForwardError) ? digitsFromForwardError(m_lastForwardError) : -1;
+  }
+
   /** Amalgamation (relaxed supernodes): merge fundamental supernodes into larger
    *  dense panels for better BLAS-3 efficiency at the cost of bounded fill.
    *  (1,0) recovers the pure fundamental-supernode partition. See SupernodalLU. */
@@ -737,6 +814,12 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_thresholdIsAuto = true;
     m_replacedPivots = 0;
     m_maxRefinementIterations = 5;
+    m_conditionValid = false;
+    m_conditionEstimate = NumTraits<RealScalar>::quiet_NaN();
+    m_conditionSolves = 0;
+    m_errorBounds = false;
+    m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
+    m_lastForwardError = NumTraits<RealScalar>::quiet_NaN();
     m_refinementTolerance = NumTraits<RealScalar>::epsilon();
     m_refinementMethod = left_right_lu::Refinement::BiCGStab;
     m_refineOnlyIfPerturbed = true;
@@ -945,6 +1028,22 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
   template <typename ApplyA>
   void recordSolveStatus(const DenseMatrix& rhs, const DenseMatrix& solution, ApplyA applyA) const;
+  // Only ever called when errorBounds() is on -- this is the whole reason the
+  // default solve path is unchanged.
+  void recordErrorBounds(const DenseMatrix& rhs, const DenseMatrix& solution) const;
+
+  /** Decimal digits supported by a forward-error estimate, floored at 0 and
+    *  capped at the scalar type's own precision: claiming 20 digits of a double
+    *  because the estimate underflowed would be worse than claiming none. */
+  static int digitsFromForwardError(const RealScalar& ferr) {
+    if (!(numext::isfinite)(ferr)) return 0;
+    const int cap = std::numeric_limits<RealScalar>::digits10;
+    if (!(ferr > RealScalar(0))) return cap;
+    using std::log10;
+    const RealScalar d = -log10(ferr);
+    if (!(d > RealScalar(0))) return 0;
+    return (d >= RealScalar(cap)) ? cap : static_cast<int>(d);
+  }
   // Each of these sweeps the supernode range [sBegin, sEnd), which is one BTF
   // diagonal block (the whole factor when there is only one). Supernodes never
   // straddle a block boundary: a block boundary is a mandatory structural break
@@ -1069,6 +1168,14 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   mutable std::string m_lastError;
   RealScalar m_solveFailureThreshold;
   mutable RealScalar m_lastSolveRelativeResidual;
+  // Condition estimation. m_conditionValid rather than a NaN sentinel because
+  // infinity is a legitimate cached answer (a singular factorization).
+  mutable bool m_conditionValid;
+  mutable RealScalar m_conditionEstimate;
+  mutable Index m_conditionSolves;
+  bool m_errorBounds;
+  mutable RealScalar m_lastBackwardError;
+  mutable RealScalar m_lastForwardError;
   RealScalar m_staticPivotThreshold;
   bool m_thresholdIsAuto;
   Index m_replacedPivots;
@@ -2115,6 +2222,10 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
   m_replacedPivots = 0;
   m_factorized = false;
   m_info = Success;
+  // New values mean a new operator: the cached condition estimate describes the
+  // factorization, not the pattern, so it cannot survive a refactorization.
+  m_conditionValid = false;
+  m_conditionSolves = 0;
 
   // Fail-fast fill guard: abort BEFORE allocating the factor arenas if the
   // symbolic structure predicts a factor larger than the configured limit. This
@@ -2509,6 +2620,14 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBa
     m_lastRefinementIterations = 0;
 
   recordSolveStatus(rhs, solution, applyA);
+  if (m_errorBounds) {
+    recordErrorBounds(rhs, solution);
+  } else {
+    // Stale bounds from an earlier solve() that DID compute them would be worse
+    // than none: NaN is what lastCorrectDigits() reads as "not measured".
+    m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
+    m_lastForwardError = NumTraits<RealScalar>::quiet_NaN();
+  }
   x = solution;
 }
 
@@ -2623,6 +2742,86 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::recordSolveStatus(const De
     m_lastError =
         "LeftRightLU: solve produced a large residual (see solveResidual()); the matrix is "
         "likely too ill-conditioned for this factorization.";
+  }
+}
+
+// ===========================================================================
+//  Condition estimation and error bounds
+// ===========================================================================
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+typename LeftRightLU<MatrixType, OrderingType, Executor>::RealScalar
+LeftRightLU<MatrixType, OrderingType, Executor>::conditionEstimate() const {
+  if (m_conditionValid) return m_conditionEstimate;
+  m_conditionValid = true;
+  m_conditionSolves = 0;
+
+  // Order matters: a default-constructed solver also has m_size == 0, and
+  // answering "0" for it would read as a perfectly conditioned matrix rather
+  // than as "there is no factorization to ask about".
+  if (!m_factorized) {
+    m_conditionEstimate = NumTraits<RealScalar>::infinity();
+    return m_conditionEstimate;
+  }
+  if (m_size == 0) {
+    m_conditionEstimate = RealScalar(0);
+    return m_conditionEstimate;
+  }
+
+  const RealScalar anorm = left_right_lu::oneNorm(m_originalMatrix);
+  if (!(anorm > RealScalar(0))) {
+    // A zero matrix has no finite condition number, and saying "0" here would
+    // read as perfectly conditioned.
+    m_conditionEstimate = NumTraits<RealScalar>::infinity();
+    return m_conditionEstimate;
+  }
+
+  // The operator handed to Hager's algorithm is the solver's own A^{-1}: the
+  // scaled, permuted, BTF-blocked triangular solve, WITHOUT refinement. That is
+  // deliberate -- refinement would make the operator nonlinear, and the estimate
+  // is meant to describe the factors the caller is about to apply.
+  typedef Matrix<Scalar, Dynamic, 1> Vector;
+  DenseMatrix in(m_size, 1), out(m_size, 1);
+  const RealScalar invNorm = left_right_lu::oneNormEstimate<Scalar>(
+      Index(m_size),
+      [&](const Vector& v, Vector& r) {
+        in.col(0) = v;
+        solveTriangular(in, out);
+        r = out.col(0);
+      },
+      [&](const Vector& v, Vector& r) {
+        in.col(0) = v;
+        // Conjugate transpose for complex scalars: Hager's sign vector is
+        // v/|v|, which pairs with A^H, not A^T.
+        this->template solveTriangularTransposed<NumTraits<Scalar>::IsComplex>(in, out);
+        r = out.col(0);
+      },
+      &m_conditionSolves);
+
+  m_conditionEstimate = (numext::isfinite)(invNorm)
+                            ? anorm * invNorm
+                            : NumTraits<RealScalar>::infinity();
+  return m_conditionEstimate;
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+void LeftRightLU<MatrixType, OrderingType, Executor>::recordErrorBounds(
+    const DenseMatrix& rhs, const DenseMatrix& solution) const {
+  m_lastBackwardError =
+      left_right_lu::componentwiseBackwardError(m_originalMatrix, rhs, solution);
+  m_lastForwardError =
+      left_right_lu::estimateForwardError(conditionEstimate(), m_lastBackwardError);
+
+  // The case this exists to catch: the residual check passed -- the answer IS
+  // the exact solution of a nearby system -- and yet the conditioning leaves no
+  // digit of it standing. A residual alone cannot tell those apart, which is
+  // the whole point of computing a forward error.
+  if (m_info == Success && !(m_lastForwardError < RealScalar(1))) {
+    m_info = NumericalIssue;
+    m_lastError =
+        "LeftRightLU: the solve is backward stable (see lastBackwardError()) but the estimated "
+        "condition number (see conditionEstimate()) leaves no correct digits in the answer -- "
+        "the system is too ill-conditioned to be solved usefully in this precision.";
   }
 }
 
@@ -2781,6 +2980,11 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(con
     m_lastRefinementIterations = 0;
 
   recordSolveStatus(rhs, solution, applyA);
+  // Error bounds are NOT computed for a transposed solve: kappa_1(A^T) is not
+  // kappa_1(A), and reporting the wrong one would be worse than reporting none.
+  // NaN is what lastCorrectDigits() reads as "not measured".
+  m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
+  m_lastForwardError = NumTraits<RealScalar>::quiet_NaN();
   x = solution;
 }
 

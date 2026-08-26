@@ -123,6 +123,54 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
    **block-diagonal** factors, whose product is not `A` — `solve()`, `determinant()` and
    `logAbsDeterminant()` account for the off-diagonal blocks, direct factor access does not.
 
+6. **Condition estimation and error bounds** (`src/LeftRightLUConditionEstimate.h`). A
+   residual answers "does this x solve *a* system near the one I asked about?" and nothing
+   else. It cannot distinguish an answer good to 13 digits from one good to none, because
+   both have the same tiny residual on a matrix that is merely ill-conditioned. Two
+   quantities close that gap, and **neither runs unless you ask for it**:
+
+   - `conditionEstimate()` — Hager-Higham estimate of `kappa_1(A) = ||A||_1 ||A^-1||_1`,
+     computed from the factors already in hand. `||A^-1||_1` is never formed: Hager's
+     algorithm needs only products `A^-1 v` and `A^-H v`, so the whole thing costs **4-10
+     triangular solves**, once, cached until the next `factorize()`. `conditionEstimateSolves()`
+     reports what it actually spent.
+   - `componentwiseBackwardError(b, x)` — Oettli-Prager,
+     `max_i |b - Ax|_i / (|A||x| + |b|)_i`. Unlike the condition number this is **exact, not
+     an estimate**, and costs one O(nnz) pass. Near machine epsilon means the solver did
+     everything a backward-stable method could; whatever inaccuracy remains belongs to the
+     matrix.
+
+   Their product bounds the forward error, which is what `estimatedForwardError(b, x)` and
+   `estimatedCorrectDigits(b, x)` report. Measured on an upper bidiagonal matrix with a
+   superdiagonal of -1.7, where `n` dials the conditioning and nothing else changes:
+
+   | n | kappa | backward error | forward bound | digits | **true error** | **residual** |
+   |---|---|---|---|---:|---|---|
+   | 8 | 2.7e+02 | 1.3e-16 | 3.6e-14 | 13 | 4.8e-16 | 3.2e-16 |
+   | 40 | 6.4e+09 | 1.5e-16 | 9.2e-07 | 6 | 4.0e-08 | 3.5e-16 |
+   | 60 | 2.6e+14 | 1.4e-16 | 3.7e-02 | 1 | 1.5e-03 | 3.3e-16 |
+   | 80 | 1.1e+19 | 1.6e-16 | 1.0 | 0 | 7.2e+01 | 1.6e-14 |
+
+   Read the last two columns together. The **residual is pinned at ~1e-16 in every row**, so
+   a caller with only `info()` and `solveResidual()` sees four identical successes — while
+   the true error walks from 5e-16 to 72. The forward-error column is the only one that tells
+   them apart, and the solver is behaving impeccably throughout: the backward error never
+   leaves machine epsilon.
+
+   `setErrorBounds(true)` wires this into `solve()` itself — it then fills
+   `lastBackwardError()`/`lastForwardError()`/`lastCorrectDigits()` and downgrades `info()` to
+   `NumericalIssue` when the estimate leaves *no* digit standing, which is the n=80 row above.
+   It is **off by default** so the ordinary solve path is exactly the work it always was.
+
+   Three caveats, none cosmetic. The condition estimate is a **lower bound** (Hager maximises
+   over a subset of the unit ball) — usually exact on this project's test matrices, and
+   documented as almost always within a factor of 3, but it errs towards calling a matrix
+   *better* conditioned than it is. It describes **the operator this factorization inverts**,
+   which under static pivoting is a perturbed `A` — a perturbation regularises, so read it
+   next to `replacedPivots()`. And the forward bound is **first order**, hence meaningless as
+   it approaches 1; it is clamped there, which reads as "no digits are guaranteed" rather than
+   a claim about the size of the error.
+
 **Excluded by design** (project scope): NUMA-aware data placement, out-of-core
 factorization, MPI, and the symmetric-indefinite Bunch-Kaufman `LDLᵀ` path (this solver
 implements the unsymmetric LU path only). Bit-reproducibility across thread
@@ -273,6 +321,18 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
   sweep); `btfBlockPointers()` gives the block boundaries in the internal numbering, which
   is how you locate *which* block is singular; `btfOffDiagonalNonzeros()` counts the entries
   that are applied during the solve but never eliminated.
+- **`setErrorBounds(bool on)`** (default **off**) — compute the condition estimate and the
+  componentwise backward error inside every `solve()`, and let `info()` act on them (see item
+  6 above). Off by default because the default solve path is otherwise exactly the factor
+  solve and nothing else. The accessors `conditionEstimate()`,
+  `componentwiseBackwardError(b, x)`, `estimatedForwardError(b, x)` and
+  `estimatedCorrectDigits(b, x)` work regardless of this switch — it only controls whether
+  `solve()` computes them for you and records them in `lastBackwardError()` /
+  `lastForwardError()` / `lastCorrectDigits()`.
+- Error bounds are **not** computed for `transpose()`/`adjoint()` solves: `kappa_1(A^T)` is
+  `kappa_inf(A)`, not `kappa_1(A)`, and reporting the wrong one would be worse than reporting
+  none. Those solves leave the recorded values NaN and `lastCorrectDigits()` at `-1` rather
+  than letting an earlier solve's numbers stand in.
 - `levelCount()`/`widestLevel()` are **diagnostics only** — the scheduler does not use
   levels to schedule (there are no level barriers).
 
@@ -310,6 +370,18 @@ BTF on and off, which is what makes the "free when it cannot help" claim testabl
 than rhetorical. Also covered: fully reducible input (zero fill), dense off-diagonal
 coupling, complex adjoint solves, refactorization against a reused block structure,
 structural singularity, and BTF correctly switching itself off when matching is off.
+
+`test/test_condition_estimate.cpp` covers the error bounds in three layers: the estimator
+against matrices whose exact `kappa_1` is known in closed form (an upper bidiagonal with a
+superdiagonal of -2 has `kappa_1 = 3(2^n - 1)`, so the conditioning is dialled purely by `n`)
+and against a dense inverse on real matrices; the backward error against its defining
+properties, including invariance under row scaling, which is what distinguishes it from a
+normwise residual; and the contract itself -- that a default `solve()` spends **zero**
+estimator solves, that enabling the bounds leaves the solution bit-identical, and that the
+digit count tracks conditioning while the residual does not. The `-2` and `-1.7` bidiagonals
+are both there on purpose: with `-2` every operation is exact in binary floating point, so
+the backward error is identically zero and no amount of conditioning costs a digit -- correct,
+and useless as a test of the bound.
 
 Whether BTF actually pays on a given matrix is a separate question from whether it is correct,
 and `bench_btf` answers it by running the solver both ways — see

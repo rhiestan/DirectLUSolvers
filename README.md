@@ -110,6 +110,7 @@ solver.factorize(A2);
 | `src/LeftRightLU.h` | The [PARDISO-style sibling solver](doc/LeftRightLU.md). Reuses the shared support/matching/executor headers; self-contained otherwise. |
 | `src/LeftRightLU` | Umbrella header for `LeftRightLU`, `#include <LeftRightLU>`. |
 | `src/LeftRightLUBlockTriangular.h` | Block triangular form: strongly connected components of the matched matrix, the second half of the Dulmage–Mendelsohn decomposition (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
+| `src/LeftRightLUConditionEstimate.h` | Hager-Higham 1-norm condition estimation and the Oettli-Prager componentwise backward error — what lets a caller tell a 13-digit answer from a 2-digit one (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
 | `src/PointBlockLU.h` | The [unsymmetric-pattern solver](doc/PointBlockLU.md) with refactorization replay. |
 | `src/PointBlockLU` | Umbrella header for `PointBlockLU`, `#include <PointBlockLU>`. |
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
@@ -128,6 +129,7 @@ solver.factorize(A2);
 | `test/test_supernodal_lu.cpp` | Correctness tests (dependency-free — only needs Eigen). |
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
 | `test/test_btf.cpp` | Block triangular form: the decomposition on graphs whose block structure is known by construction, and the solver with BTF on against BTF off. See [LeftRightLU testing](doc/LeftRightLU.md#testing). |
+| `test/test_condition_estimate.cpp` | Condition estimation and error bounds: the estimator against closed-form and dense references, the backward error against its defining properties, and the promise that a default solve pays nothing for either. |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_mc64.cpp` | MC64 optimality against a brute-force oracle, the dual-scaling property, and integration through both solvers. |
