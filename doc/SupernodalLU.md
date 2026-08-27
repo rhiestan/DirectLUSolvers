@@ -1,6 +1,6 @@
 # SupernodalLU
 
-*[← DirectLUSolvers](../README.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md) · [Parallelism](Parallelism.md) · [Testing](Testing.md)*
+*[← DirectLUSolvers](../README.md) · [RobustLU](RobustLU.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md) · [Parallelism](Parallelism.md) · [Testing](Testing.md)*
 
 A header-only, supernodal sparse **direct LU** solver for [Eigen](https://eigen.tuxfamily.org),
 built as a template in the style of `Eigen::SparseLU`, but using the algorithmic design of

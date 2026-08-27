@@ -1,6 +1,6 @@
 # LeftRightLU — PARDISO-style sibling solver
 
-*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md) · [Parallelism](Parallelism.md) · [Testing](Testing.md)*
+*[← DirectLUSolvers](../README.md) · [RobustLU](RobustLU.md) · [SupernodalLU](SupernodalLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md) · [Parallelism](Parallelism.md) · [Testing](Testing.md)*
 
 `Eigen::LeftRightLU` (`src/LeftRightLU.h`, `#include <LeftRightLU>`) is a second sparse
 direct LU solver in this project with the **same `Eigen::SparseLU`-compatible interface**

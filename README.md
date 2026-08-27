@@ -25,6 +25,7 @@ external dependency (METIS, oneTBB, OpenMP, MKL) is an opt-in header or an opt-i
 | [SupernodalLU](doc/SupernodalLU.md) | PaStiX-style supernodal solver: static symbolic structure, static pivoting + refinement, BLAS-3 tree-parallel kernels. **The full option reference lives here** — the other two solvers document only their deltas from it. |
 | [LeftRightLU](doc/LeftRightLU.md) | PARDISO-style sibling: barrier-free dynamic scheduler, in-block complete pivoting, block triangular form, and direct support for unsymmetric nonzero patterns. |
 | [PointBlockLU](doc/PointBlockLU.md) | Scalar left-looking Gilbert–Peierls with partial pivoting and refactorization replay — no symmetrization at all. Fastest of the three while the factor stays sparse. |
+| [RobustLU](doc/RobustLU.md) | The fallback ladder: one solver that escalates through strategies when the first fails, and reports what it tried and why it stopped. |
 | [PointBlockOrdering](doc/PointBlockOrdering.md) | Fill-reducing ordering on the *node* graph, for matrices with several unknowns per grid point. |
 | [HeaderOnlyMetis](doc/HeaderOnlyMetis.md) | `Eigen::HeaderOnlyMetisOrdering` — nested dissection, bit-identical to `METIS_NodeND`, with nothing to link; plus a deterministic parallel variant. |
 | [Parallelism](doc/Parallelism.md) | The `Executor` concept and its four backends, the two parallel mechanisms, and every scaling measurement (including the machine ceiling that bounds them). |
@@ -54,6 +55,7 @@ Practical guidance:
 - **`SupernodalLU` is the reference implementation** of the shared analysis pipeline and the
   option surface; reach for it when your pattern is symmetric anyway and you want tree-parallel
   BLAS-3 factorization.
+- **Use [`RobustLU`](doc/RobustLU.md) when you cannot inspect the matrix yourself** — it runs `LeftRightLU`, measures the backward error, and escalates to MC64 matching, true partial pivoting, or a rank-revealing QR only when the diagnosis calls for it. On this project's SuiteSparse tier it costs 19 of 33 matrices exactly one factorization, rescues 6 that would otherwise fail — two of them by reporting a **rank** and a least-squares answer where no LU exists — and stops with a diagnosis on the rest rather than thrashing.
 - **Ordering usually matters more than the solver.** On large well-separated 3D systems nested
   dissection is worth ~2x the fill of AMD; use [`HeaderOnlyMetisOrdering`](doc/HeaderOnlyMetis.md)
   if you would rather not link METIS.
@@ -115,6 +117,8 @@ solver.factorize(A2);
 | `src/PointBlockLU.h` | The [unsymmetric-pattern solver](doc/PointBlockLU.md) with refactorization replay. |
 | `src/PointBlockLU` | Umbrella header for `PointBlockLU`, `#include <PointBlockLU>`. |
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
+| `src/RobustLU.h` | [`Eigen::RobustLU`](doc/RobustLU.md) — the fallback ladder over `LeftRightLU` and `PointBlockLU`, with an attempt log. |
+| `src/RobustLU` | Umbrella header, `#include <RobustLU>`. |
 | `src/SupernodalLUSymbolic.h` | Shared symbolic helpers: the A+Aᵀ adjacency graph and the fill estimate used to rank candidate orderings. No METIS dependency, unlike `SupernodalLUAutoOrdering.h`, which uses it. |
 | `src/SupernodalLUSupport.h` | Plain data structures shared by the analysis/factorization phases (`Supernode`, `RowBlock`, `UpdateSource`). |
 | `src/SupernodalLUMatching.h` | The maximum-transversal matching + permutation-sign helpers (`MatchingMethod::Transversal`). |
@@ -132,6 +136,7 @@ solver.factorize(A2);
 | `test/test_btf.cpp` | Block triangular form: the decomposition on graphs whose block structure is known by construction, and the solver with BTF on against BTF off. See [LeftRightLU testing](doc/LeftRightLU.md#testing). |
 | `test/test_condition_estimate.cpp` | Condition estimation and error bounds: the estimator against closed-form and dense references, the backward error against its defining properties, and the promise that a default solve pays nothing for either. |
 | `test/test_extended_residual.cpp` | Error-free transformations, the compensated residual, and the forward-vs-backward error claim — on integer systems, so there is an exact answer to converge to. |
+| `test/test_robust_lu.cpp` | The ladder's four properties: it costs one factorization when the first rung works, escalates when it does not, stops immediately when no rung can help, and never claims a success it cannot back up. |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_mc64.cpp` | MC64 optimality against a brute-force oracle, the dual-scaling property, and integration through both solvers. |

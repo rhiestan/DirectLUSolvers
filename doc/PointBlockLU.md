@@ -1,6 +1,6 @@
 # PointBlockLU — unsymmetric-pattern solver for sparse factors
 
-*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockOrdering](PointBlockOrdering.md) · [Testing](Testing.md)*
+*[← DirectLUSolvers](../README.md) · [RobustLU](RobustLU.md) · [SupernodalLU](SupernodalLU.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockOrdering](PointBlockOrdering.md) · [Testing](Testing.md)*
 
 `Eigen::PointBlockLU` (`src/PointBlockLU.h`, `#include <PointBlockLU>`) is the third solver
 here, and the only one that does **not** symmetrize the pattern. It factors `A` as it is —
