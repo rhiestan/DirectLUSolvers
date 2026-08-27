@@ -294,6 +294,17 @@ add_dlu_test(test_btf           SOURCE test/test_btf.cpp           LABELS "quick
 # generated or has a closed-form condition number to check the estimate against.
 add_dlu_test(test_condition_estimate SOURCE test/test_condition_estimate.cpp
                                                                   LABELS "quick;correctness")
+# Extended-precision (double-double) residuals in refinement. Compensated
+# arithmetic is algebraically trivial -- -ffast-math would let the compiler
+# cancel the correction terms and silently turn this into the plain residual --
+# so the target pins strict FP rather than trusting the ambient flags.
+add_dlu_test(test_extended_residual SOURCE test/test_extended_residual.cpp
+                                                                  LABELS "quick;correctness")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(test_extended_residual PRIVATE -ffp-contract=off)
+elseif(MSVC)
+  target_compile_options(test_extended_residual PRIVATE /fp:strict)
+endif()
 add_dlu_test(test_pointblock_lu SOURCE test/test_pointblock_lu.cpp LABELS "quick;correctness")
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 

@@ -111,6 +111,7 @@ solver.factorize(A2);
 | `src/LeftRightLU` | Umbrella header for `LeftRightLU`, `#include <LeftRightLU>`. |
 | `src/LeftRightLUBlockTriangular.h` | Block triangular form: strongly connected components of the matched matrix, the second half of the Dulmage–Mendelsohn decomposition (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
 | `src/LeftRightLUConditionEstimate.h` | Hager-Higham 1-norm condition estimation and the Oettli-Prager componentwise backward error — what lets a caller tell a 13-digit answer from a 2-digit one (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
+| `src/LeftRightLUExtendedResidual.h` | Double-double (compensated) residuals for iterative refinement — what turns refinement's small *backward* error into a small *forward* one. Portable software arithmetic, not `long double`. Eigen only. |
 | `src/PointBlockLU.h` | The [unsymmetric-pattern solver](doc/PointBlockLU.md) with refactorization replay. |
 | `src/PointBlockLU` | Umbrella header for `PointBlockLU`, `#include <PointBlockLU>`. |
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
@@ -130,6 +131,7 @@ solver.factorize(A2);
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
 | `test/test_btf.cpp` | Block triangular form: the decomposition on graphs whose block structure is known by construction, and the solver with BTF on against BTF off. See [LeftRightLU testing](doc/LeftRightLU.md#testing). |
 | `test/test_condition_estimate.cpp` | Condition estimation and error bounds: the estimator against closed-form and dense references, the backward error against its defining properties, and the promise that a default solve pays nothing for either. |
+| `test/test_extended_residual.cpp` | Error-free transformations, the compensated residual, and the forward-vs-backward error claim — on integer systems, so there is an exact answer to converge to. |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_mc64.cpp` | MC64 optimality against a brute-force oracle, the dual-scaling property, and integration through both solvers. |

@@ -177,6 +177,57 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
    it approaches 1; it is clamped there, which reads as "no digits are guaranteed" rather than
    a claim about the size of the error.
 
+7. **Extended-precision residuals in refinement** (`src/LeftRightLUExtendedResidual.h`).
+   Refinement's ceiling is the precision of `r = b - Ax`, and the consequence is sharper than
+   it sounds: with `r` in working precision, refinement drives the **backward** error to
+   `O(eps)` and stops — the forward error settles at about `kappa(A) * eps` and no number of
+   further steps moves it, because `r` is already dominated by the rounding in forming it.
+   Computing `r` in doubled precision drives the **forward** error to `O(eps)` too (Skeel
+   1980; the basis of LAPACK's `xGESVXX`).
+
+   `setExtendedPrecisionResidual(true)`, off by default. Measured on an integer matrix with
+   an integer solution — so `b = A x` is exact and there is a real answer to converge to —
+   with six refinement steps and only the residual precision differing:
+
+   | kappa | no refinement | working-precision residual | **extended residual** |
+   |---|---|---|---|
+   | 3.2e+07 | 2.1e-10 | 2.1e-10 | **0** |
+   | 6.4e+09 | 2.2e-08 | 2.2e-08 | **0** |
+   | 1.3e+12 | 2.3e-06 | 2.3e-06 | **0** |
+   | 2.6e+14 | 7.2e-04 | 7.2e-04 | **0** |
+
+   **`long double` is deliberately not used.** On MSVC — and therefore on every Windows
+   toolchain targeting it — it is a 64-bit alias of `double` (measured on this project's own
+   toolchain: 8 bytes, 53 mantissa bits), so code written against it would silently do nothing
+   on Windows while working on Linux. What runs instead is **double-double** arithmetic built
+   from error-free transformations (`twoSum`, `twoProduct`), which is pure software and
+   behaves identically everywhere, including for `float` and complex scalars.
+
+   Three things worth knowing before turning it on:
+
+   - **It changes the stopping rule, and has to.** The usual test — stop once
+     `||r|| <= eps*||b||` — is *already satisfied* after a backward-stable direct solve, so it
+     would exit before applying a single correction. With extended residuals,
+     `Refinement::IterativeRefinement` instead watches the correction: keep going while
+     `||dx||/||x||` is still halving, stop at `eps`. That is what LAPACK's `xGERFSX` does, for
+     the same reason. Under `BiCGStab` the Krylov recurrence updates its residual from
+     previous ones, which extended precision cannot reach — so the same stationary loop runs
+     afterwards as a polish, and the flag means one thing under either method.
+   - **It costs O(nnz) per refinement step**, against the correction solve's O(fill).
+     Measured on this project's matrices: 1-13% of one triangular solve with hardware FMA,
+     2-25% without it. On x86-64 that means building with `-mfma` or `-march=native`; the
+     baseline target has no FMA and falls back to Dekker splitting, which is about 2x slower
+     but computes exactly the same thing.
+   - **`-ffast-math` / `/fp:fast` silently disable it.** Error-free transformations are
+     algebraically trivial — their correction terms *are* zero in exact arithmetic — so a
+     compiler allowed to reason about floating point as real arithmetic deletes them, and the
+     extended residual quietly becomes the plain one. The `test_extended_residual` target pins
+     strict FP for exactly this reason.
+
+   It pairs with item 6: `estimatedForwardError()` is what says whether extended precision can
+   help at all. Past `kappa * eps ~ 1` nothing recovers the answer, and the estimate is what
+   tells you which regime you are in.
+
 **Excluded by design** (project scope): NUMA-aware data placement, out-of-core
 factorization, MPI, and the symmetric-indefinite Bunch-Kaufman `LDLᵀ` path (this solver
 implements the unsymmetric LU path only). Bit-reproducibility across thread
@@ -335,6 +386,11 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
   `estimatedCorrectDigits(b, x)` work regardless of this switch — it only controls whether
   `solve()` computes them for you and records them in `lastBackwardError()` /
   `lastForwardError()` / `lastCorrectDigits()`.
+- **`setExtendedPrecisionResidual(bool on)`** (default **off**) — form refinement's residual
+  in double-double arithmetic, which is what converts refinement's guarantee from a small
+  backward error into a small forward one (see item 7 above). Off by default: it costs O(nnz)
+  per refinement step, and buys nothing when refinement does not run at all — which by default
+  is whenever no static pivot was perturbed.
 - Error bounds are **not** computed for `transpose()`/`adjoint()` solves: `kappa_1(A^T)` is
   `kappa_inf(A)`, not `kappa_1(A)`, and reporting the wrong one would be worse than reporting
   none. Those solves leave the recorded values NaN and `lastCorrectDigits()` at `-1` rather
@@ -388,6 +444,15 @@ digit count tracks conditioning while the residual does not. The `-2` and `-1.7`
 are both there on purpose: with `-2` every operation is exact in binary floating point, so
 the backward error is identically zero and no amount of conditioning costs a digit -- correct,
 and useless as a test of the bound.
+
+`test/test_extended_residual.cpp` covers the error-free transformations against their
+defining property (`p + e` reproduces `a*b` exactly, including where the product needs more
+than 53 bits), the residual routine, and the forward-vs-backward claim itself. Its matrices
+are integer-valued on purpose, and that is the subtle part: if `b` is formed as a
+floating-point product `A*xTrue`, then `xTrue` is *not* the exact solution of the stored
+system — `b` carries its own rounding, worth roughly `kappa*eps` of forward error, and no
+residual precision can see past it. An experiment built that way shows the feature doing
+nothing at all, for reasons that have nothing to do with the feature.
 
 Whether BTF actually pays on a given matrix is a separate question from whether it is correct,
 and `bench_btf` answers it by running the solver both ways — see

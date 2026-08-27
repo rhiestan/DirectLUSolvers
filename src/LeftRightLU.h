@@ -79,6 +79,7 @@
 
 #include "LeftRightLUBlockTriangular.h"
 #include "LeftRightLUConditionEstimate.h"
+#include "LeftRightLUExtendedResidual.h"
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLUMatching.h"
@@ -475,6 +476,38 @@ eturns how many decimal digits of  x the forward-error estimate
     return digitsFromForwardError(estimatedForwardError(b, x));
   }
 
+  /** Form refinement's residual r = b - A x in DOUBLE-DOUBLE arithmetic rather
+    *  than working precision. OFF by default.
+    *
+    *  This is the knob that decides what refinement can achieve at all. With a
+    *  working-precision residual, refinement drives the BACKWARD error to O(eps)
+    *  and the forward error stalls at about kappa(A) * eps -- more steps do not
+    *  help, because r is already dominated by the rounding in forming it. With
+    *  an extended-precision residual, the FORWARD error goes to O(eps) too, as
+    *  long as kappa(A) * eps stays comfortably below 1 (Skeel 1980; the basis of
+    *  LAPACK's xGESVXX). Past that point nothing recovers the answer, and
+    *  estimatedForwardError() is what says which regime you are in.
+    *
+    *  The theory is about stationary refinement, and that is where the work
+    *  happens: Refinement::IterativeRefinement switches to a forward-error
+    *  stopping rule (watch the correction, not the residual) when this is on,
+    *  because the usual rule stops before applying a single correction -- the
+    *  residual is ALREADY at machine precision after a backward-stable direct
+    *  solve. Under BiCGStab the Krylov recurrence updates its residual from
+    *  previous ones, which extended precision cannot reach, so the same
+    *  stationary loop runs afterwards as a polish. Either way the flag means one
+    *  thing: a forward error at machine precision rather than a backward one.
+    *
+    *  Cost is O(nnz) per refinement step against the correction solve's O(fill).
+    *  It buys nothing when refinement does not run at all, which by default is
+    *  whenever no static pivot was perturbed (see setRefineOnlyIfPerturbed).
+    *
+    *  \warning Compiling with -ffast-math or /fp:fast silently disables the
+    *  effect: those flags let the compiler cancel the compensation terms
+    *  algebraically. See LeftRightLUExtendedResidual.h. */
+  void setExtendedPrecisionResidual(bool on) { m_extendedResidual = on; }
+  bool extendedPrecisionResidual() const { return m_extendedResidual; }
+
   /** Compute the error bounds inside every solve() and let info() act on them.
     *  OFF by default, deliberately: it adds a condition estimate (once per
     *  factorization) and an O(nnz) backward error (once per solve) to a path
@@ -819,6 +852,7 @@ eturns how many decimal digits of  x the forward-error estimate
     m_conditionEstimate = NumTraits<RealScalar>::quiet_NaN();
     m_conditionSolves = 0;
     m_errorBounds = false;
+    m_extendedResidual = false;
     m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
     m_lastForwardError = NumTraits<RealScalar>::quiet_NaN();
     m_refinementTolerance = NumTraits<RealScalar>::epsilon();
@@ -1087,12 +1121,19 @@ eturns how many decimal digits of  x the forward-error estimate
   void applyInverseBlocksTransposed(Dest& y) const;
   template <bool Conjugate>
   void solveTriangularTransposed(const DenseMatrix& rhs, DenseMatrix& solution) const;
-  template <typename ApplyA, typename ApplyPrec>
+  // FormResidual computes r = b - Op(x) for whichever operator this solve is
+  // running (A, A^T or A^H), in working or extended precision as configured.
+  // Passed in rather than derived here because only the call site knows which
+  // operator it is, and getting that wrong would be invisible in the residual.
+  template <typename ApplyA, typename ApplyPrec, typename FormResidual>
   void refineSolution(const DenseMatrix& rhs, DenseMatrix& solution, ApplyA applyA,
-                      ApplyPrec applyPrec) const;
-  template <typename ApplyA, typename ApplyPrec>
-  Index bicgstabColumn(ApplyA applyA, ApplyPrec applyPrec, const DenseMatrix& b,
-                       DenseMatrix& x) const;
+                      ApplyPrec applyPrec, FormResidual formResidual) const;
+  template <typename ApplyPrec, typename FormResidual>
+  void refineExtended(const DenseMatrix& rhs, DenseMatrix& solution, ApplyPrec applyPrec,
+                      FormResidual formResidual) const;
+  template <typename ApplyA, typename ApplyPrec, typename FormResidual>
+  Index bicgstabColumn(ApplyA applyA, ApplyPrec applyPrec, FormResidual formResidual,
+                       const DenseMatrix& b, DenseMatrix& x) const;
 
   // state ---------------------------------------------------------------------
   StorageIndex m_size;
@@ -1175,6 +1216,7 @@ eturns how many decimal digits of  x the forward-error estimate
   mutable RealScalar m_conditionEstimate;
   mutable Index m_conditionSolves;
   bool m_errorBounds;
+  bool m_extendedResidual;
   mutable RealScalar m_lastBackwardError;
   mutable RealScalar m_lastForwardError;
   RealScalar m_staticPivotThreshold;
@@ -2613,10 +2655,17 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBa
   solveTriangular(rhs, solution);
 
   auto applyA = [this](const DenseMatrix& in, DenseMatrix& out) { out.noalias() = m_originalMatrix * in; };
+  auto formResidual = [this](const DenseMatrix& b2, const DenseMatrix& x2, DenseMatrix& r) {
+    if (m_extendedResidual)
+      left_right_lu::residualExtended(m_originalMatrix, b2, x2, r);
+    else
+      r.noalias() = b2 - m_originalMatrix * x2;
+  };
   // PARDISO IPARM(8)=0: refine only if the factorization perturbed a pivot.
   if (!(m_refineOnlyIfPerturbed && m_replacedPivots == 0))
     refineSolution(rhs, solution, applyA,
-                   [this](const DenseMatrix& in, DenseMatrix& out) { solveTriangular(in, out); });
+                   [this](const DenseMatrix& in, DenseMatrix& out) { solveTriangular(in, out); },
+                   formResidual);
   else
     m_lastRefinementIterations = 0;
 
@@ -2973,10 +3022,21 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(con
     else
       out.noalias() = m_originalMatrix.transpose() * in;
   };
+  auto formResidual = [this](const DenseMatrix& b2, const DenseMatrix& x2, DenseMatrix& r) {
+    if (m_extendedResidual) {
+      left_right_lu::residualExtendedTransposed<Conjugate>(m_originalMatrix, b2, x2, r);
+    } else if (Conjugate) {
+      r.noalias() = b2 - m_originalMatrix.adjoint() * x2;
+    } else {
+      r.noalias() = b2 - m_originalMatrix.transpose() * x2;
+    }
+  };
   if (!(m_refineOnlyIfPerturbed && m_replacedPivots == 0))
-    refineSolution(rhs, solution, applyA, [this](const DenseMatrix& in, DenseMatrix& out) {
-      this->template solveTriangularTransposed<Conjugate>(in, out);
-    });
+    refineSolution(rhs, solution, applyA,
+                   [this](const DenseMatrix& in, DenseMatrix& out) {
+                     this->template solveTriangularTransposed<Conjugate>(in, out);
+                   },
+                   formResidual);
   else
     m_lastRefinementIterations = 0;
 
@@ -2994,11 +3054,12 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(con
 // ===========================================================================
 
 template <typename MatrixType, typename OrderingType, typename Executor>
-template <typename ApplyA, typename ApplyPrec>
+template <typename ApplyA, typename ApplyPrec, typename FormResidual>
 void LeftRightLU<MatrixType, OrderingType, Executor>::refineSolution(const DenseMatrix& rhs,
                                                                      DenseMatrix& solution,
                                                                      ApplyA applyA,
-                                                                     ApplyPrec applyPrec) const {
+                                                                     ApplyPrec applyPrec,
+                                                                     FormResidual formResidual) const {
   m_lastRefinementIterations = 0;
   const RealScalar rhsNorm = rhs.norm();
   if (m_maxRefinementIterations <= 0 || rhsNorm == RealScalar(0) ||
@@ -3008,14 +3069,21 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::refineSolution(const Dense
   const Index n = rhs.rows();
   const Index nrhs = rhs.cols();
 
+  if (m_extendedResidual && m_refinementMethod == left_right_lu::Refinement::IterativeRefinement) {
+    refineExtended(rhs, solution, applyPrec, formResidual);
+    return;
+  }
+
   if (m_refinementMethod == left_right_lu::Refinement::IterativeRefinement) {
     DenseMatrix best = solution;
     RealScalar bestNorm = NumTraits<RealScalar>::highest();
     RealScalar prevNorm = NumTraits<RealScalar>::highest();
-    DenseMatrix product(n, nrhs), correction(n, nrhs);
+    DenseMatrix residual(n, nrhs), correction(n, nrhs);
     for (Index it = 0;; ++it) {
-      applyA(solution, product);
-      const DenseMatrix residual = rhs - product;
+      // The one place extended precision changes anything: everything below --
+      // the correction solve, the update, the stopping tests -- stays in working
+      // precision, exactly as before.
+      formResidual(rhs, solution, residual);
       const RealScalar resNorm = residual.norm();
       if (resNorm < bestNorm) {
         bestNorm = resNorm;
@@ -3037,24 +3105,88 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::refineSolution(const Dense
   for (Index c = 0; c < nrhs; ++c) {
     bcol.col(0) = rhs.col(c);
     xcol.col(0) = solution.col(c);
-    const Index iters = bicgstabColumn(applyA, applyPrec, bcol, xcol);
+    const Index iters = bicgstabColumn(applyA, applyPrec, formResidual, bcol, xcol);
     solution.col(c) = xcol.col(0);
     m_lastRefinementIterations = numext::maxi(m_lastRefinementIterations, iters);
   }
+
+  // BiCGStab's own residual comes from its recurrence, not from b - Ax, so
+  // extended precision cannot reach it there. Polishing afterwards is what makes
+  // setExtendedPrecisionResidual mean the same thing whichever method is
+  // selected: a forward error at machine precision, not merely a backward one.
+  if (m_extendedResidual) refineExtended(rhs, solution, applyPrec, formResidual);
+}
+
+// The forward-error refinement loop, shared by the stationary path and by the
+// BiCGStab polish above.
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <typename ApplyPrec, typename FormResidual>
+void LeftRightLU<MatrixType, OrderingType, Executor>::refineExtended(
+    const DenseMatrix& rhs, DenseMatrix& solution, ApplyPrec applyPrec,
+    FormResidual formResidual) const {
+
+    // Extended residuals need a DIFFERENT stopping rule, and this is the whole
+    // reason they are not simply a drop-in accuracy improvement.
+    //
+    // The working-precision loop below stops when ||r|| <= eps*||b||. After a
+    // direct solve that is already true -- the factorization is backward stable
+    // -- so it stops before applying a single correction. That is correct when
+    // the goal is a small BACKWARD error, and useless when the goal is a small
+    // FORWARD one: on an ill-conditioned matrix the answer can be wrong in every
+    // digit while its residual sits at machine precision.
+    //
+    // So this loop watches the CORRECTION instead: keep going while ||dx||/||x||
+    // is still shrinking meaningfully, stop once it reaches eps (the solution has
+    // converged) or stops halving (no further progress is available). That is the
+    // criterion LAPACK's xGERFSX uses for the same reason.
+  const Index n = rhs.rows();
+  const Index nrhs = rhs.cols();
+  DenseMatrix residual(n, nrhs), correction(n, nrhs);
+    DenseMatrix best = solution;
+    RealScalar bestResidual = NumTraits<RealScalar>::highest();
+    RealScalar previousRatio = NumTraits<RealScalar>::highest();
+    for (Index it = 0; it < m_maxRefinementIterations; ++it) {
+      formResidual(rhs, solution, residual);
+      const RealScalar resNorm = residual.norm();
+      if (resNorm < bestResidual) {
+        bestResidual = resNorm;
+        best = solution;
+      }
+      applyPrec(residual, correction);
+      const RealScalar xNorm = solution.norm();
+      const RealScalar ratio =
+          (xNorm > RealScalar(0)) ? correction.norm() / xNorm : correction.norm();
+      solution += correction;
+      ++m_lastRefinementIterations;
+      if (!(numext::isfinite)(ratio)) break;
+      if (ratio <= NumTraits<RealScalar>::epsilon()) break;
+      if (it > 0 && ratio > previousRatio / RealScalar(2)) break;
+      previousRatio = ratio;
+    }
+    // Keep the refined solution: unlike the backward-error loop, the last
+    // iterate here is the most accurate one even when its residual is not the
+    // smallest -- that mismatch IS the forward/backward distinction.
+    formResidual(rhs, solution, residual);
+    if (!solution.allFinite()) solution = best;
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
-template <typename ApplyA, typename ApplyPrec>
+template <typename ApplyA, typename ApplyPrec, typename FormResidual>
 Index LeftRightLU<MatrixType, OrderingType, Executor>::bicgstabColumn(ApplyA applyA, ApplyPrec applyPrec,
+                                                                      FormResidual formResidual,
                                                                       const DenseMatrix& b,
                                                                       DenseMatrix& x) const {
   const Index n = b.rows();
   const RealScalar bnorm = b.col(0).norm();
   const RealScalar threshold = m_refinementTolerance * bnorm;
 
-  DenseMatrix tmp(n, 1);
-  applyA(x, tmp);
-  DenseMatrix r = b - tmp;
+  // Only the INITIAL residual benefits from extended precision here: every
+  // later one comes from the Krylov recurrence r = s - omega*t, which is an
+  // accumulation over previous residuals and not a fresh b - Ax. refineSolution
+  // therefore follows BiCGStab with a stationary extended pass when the flag is
+  // on -- see refineExtended.
+  DenseMatrix r(n, 1);
+  formResidual(b, x, r);
   DenseMatrix best = x;
   RealScalar bestNorm = r.col(0).norm();
   if (bestNorm <= threshold) return 0;
