@@ -173,7 +173,7 @@ class HeaderOnlyMetisOrdering {
   IndexVector m_innerIndices;  // Adjacency list
 };
 
-/** rief Parallel, deterministic nested-dissection ordering.
+/** \brief Parallel, deterministic nested-dissection ordering.
  *
  * Same interface as HeaderOnlyMetisOrdering, but the dissection tree is walked
  * level by level and dispatched through an Executor, and each subtree seeds its
@@ -191,8 +191,8 @@ class HeaderOnlyMetisOrdering {
  * it therefore stay meaningful, and a threaded run can be checked against a
  * SerialExecutor run of the same class.
  *
- * 	param StorageIndex the matrix's index type (typically int).
- * 	param Executor     anything with parallelFor/concurrency; defaults to
+ * \tparam StorageIndex the matrix's index type (typically int).
+ * \tparam Executor     anything with parallelFor/concurrency; defaults to
  *                      serial. Eigen::supernodal_lu::StdThreadExecutor and the
  *                      OpenMP/TBB backends all qualify.
  */
