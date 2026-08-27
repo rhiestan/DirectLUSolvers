@@ -2656,10 +2656,18 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBa
 
   auto applyA = [this](const DenseMatrix& in, DenseMatrix& out) { out.noalias() = m_originalMatrix * in; };
   auto formResidual = [this](const DenseMatrix& b2, const DenseMatrix& x2, DenseMatrix& r) {
-    if (m_extendedResidual)
+    if (m_extendedResidual) {
       left_right_lu::residualExtended(m_originalMatrix, b2, x2, r);
-    else
-      r.noalias() = b2 - m_originalMatrix * x2;
+    } else {
+      // Product first, subtraction second -- deliberately NOT the fused
+      // `r = b2 - A*x2`, which Eigen evaluates in a different order and which
+      // therefore rounds differently. That is a legitimate alternative, but it
+      // is not what this path computed before extended residuals existed, and on
+      // a knife-edge matrix it moves the answer: Mallya/lhr10c under COLAMD went
+      // 1.6e-04 -> 2.1e-03 on the fused form, which test_regression caught.
+      r.noalias() = m_originalMatrix * x2;
+      r = b2 - r;
+    }
   };
   // PARDISO IPARM(8)=0: refine only if the factorization perturbed a pivot.
   if (!(m_refineOnlyIfPerturbed && m_replacedPivots == 0))
@@ -3025,10 +3033,13 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(con
   auto formResidual = [this](const DenseMatrix& b2, const DenseMatrix& x2, DenseMatrix& r) {
     if (m_extendedResidual) {
       left_right_lu::residualExtendedTransposed<Conjugate>(m_originalMatrix, b2, x2, r);
-    } else if (Conjugate) {
-      r.noalias() = b2 - m_originalMatrix.adjoint() * x2;
     } else {
-      r.noalias() = b2 - m_originalMatrix.transpose() * x2;
+      // Same ordering discipline as the non-transposed path above.
+      if (Conjugate)
+        r.noalias() = m_originalMatrix.adjoint() * x2;
+      else
+        r.noalias() = m_originalMatrix.transpose() * x2;
+      r = b2 - r;
     }
   };
   if (!(m_refineOnlyIfPerturbed && m_replacedPivots == 0))
