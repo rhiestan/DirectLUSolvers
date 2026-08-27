@@ -150,6 +150,19 @@ target_compile_definitions(dlu_test_common INTERFACE
                            "DLU_MATRIX_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/test/matrices\""
                            "DLU_BASELINE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/test/baselines/testdata.baseline\"")
 
+# Warnings are enabled here rather than on the DirectLUSolvers interface target
+# on purpose: this is where OUR code is compiled, and putting them on the
+# header-only library would impose our warning policy on every downstream
+# consumer of it, which is not ours to decide.
+#
+# Third-party include directories are marked SYSTEM (see dlu_metis, dlu_pardiso)
+# so what is left is actionable. As of writing the tree builds clean under these
+# flags with clang; MSVC is deliberately left at its default level rather than
+# /W4, which is dominated by warnings about the standard library and Eigen.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(dlu_test_common INTERFACE -Wall -Wextra)
+endif()
+
 if(MSVC)
   # /bigobj: the heavily templated solver headers overflow the default object
   # section limit in debug configurations.
@@ -176,7 +189,11 @@ if(DLU_WITH_METIS)
                         "Set -DDLU_METIS_DIR=<install prefix>.")
   endif()
   add_library(dlu_metis INTERFACE)
-  target_include_directories(dlu_metis INTERFACE "${DLU_METIS_INCLUDE_DIR}")
+  # SYSTEM: metis.h redefines INT32_MIN/MAX and INT64_MIN/MAX, which is 4
+  # warnings per translation unit that includes it and nothing we can fix in a
+  # header we do not own. Marking it system keeps -Wall -Wextra pointed at our
+  # own code, which is the only place a warning is actionable.
+  target_include_directories(dlu_metis SYSTEM INTERFACE "${DLU_METIS_INCLUDE_DIR}")
   target_link_libraries(dlu_metis INTERFACE "${DLU_METIS_LIBRARY}")
   if(DLU_GKLIB_LIBRARY)
     target_link_libraries(dlu_metis INTERFACE "${DLU_GKLIB_LIBRARY}")
@@ -196,7 +213,7 @@ if(DLU_WITH_PARDISO)
                         "Set -DDLU_MKL_DIR=<mkl root>.")
   endif()
   add_library(dlu_pardiso INTERFACE)
-  target_include_directories(dlu_pardiso INTERFACE "${DLU_MKL_INCLUDE_DIR}")
+  target_include_directories(dlu_pardiso SYSTEM INTERFACE "${DLU_MKL_INCLUDE_DIR}")
   target_link_libraries(dlu_pardiso INTERFACE "${DLU_MKL_RT_LIBRARY}")
   target_compile_definitions(dlu_pardiso INTERFACE HAVE_PARDISO)
   message(STATUS "MKL PARDISO: ${DLU_MKL_RT_LIBRARY}")
@@ -384,7 +401,7 @@ if(DLU_WITH_METIS)
   # METIS's own CMake build to define idx_t/real_t: pulling it in directly
   # here (instead of resolving metis.h via dlu_metis's already-installed,
   # already-configured copy) fails with "unknown type name 'idx_t'".
-  target_include_directories(test_header_only_metis_internal PRIVATE
+  target_include_directories(test_header_only_metis_internal SYSTEM PRIVATE
                              "${CMAKE_CURRENT_SOURCE_DIR}/../METIS/libmetis")
 endif()
 

@@ -17,11 +17,29 @@
 // declarations would get C++ name mangling while the actual compiled
 // metis.lib symbols (compiled as plain C) do not, producing "undefined
 // symbol" at link time for names that visibly exist in the archive.
+#if defined(_MSC_VER) && !defined(__clang__)
+// GKlib's gk_externs.h declares its longjmp buffers with __thread, which is a
+// GCC/clang spelling MSVC does not accept -- it wants __declspec(thread) for the
+// same thing. Guarded against clang-cl, which defines _MSC_VER but understands
+// __thread perfectly well and must keep using it.
+//
+// These are declarations only; the definitions live in the GKlib binary this
+// links against, so the spelling has to parse but never has to allocate.
+#define __thread __declspec(thread)
+#endif
+
 extern "C" {
 #include "metislib.h"
 }
 
 extern "C" {
+
+// GKlib's allocators take their diagnostic message as `char *` rather than
+// `const char *`, so handing them a string literal is a const-correctness
+// violation (-Wwritable-strings) even though GKlib only ever prints it. Routing
+// the literals through one helper keeps the cast in a single place where the
+// reason for it is written down, instead of five silent ones.
+static char* gkMsg(const char* text) { return const_cast<char*>(text); }
 
 // Returns 1 if compression succeeded (matching CompressGraph returning
 // non-NULL) and writes the result graph_t* to *outGraph; 0 otherwise
@@ -58,15 +76,15 @@ graph_t* metis_bridge_MakeGraph(idx_t nvtxs, idx_t* xadj, idx_t* adjncy, idx_t* 
   graph->nvtxs = nvtxs;
   graph->ncon = 1;
   graph->nedges = nedges;
-  graph->xadj = imalloc(nvtxs + 1, "bridge: xadj");
+  graph->xadj = imalloc(nvtxs + 1, gkMsg("bridge: xadj"));
   icopy(nvtxs + 1, xadj, graph->xadj);
-  graph->vwgt = imalloc(nvtxs, "bridge: vwgt");
+  graph->vwgt = imalloc(nvtxs, gkMsg("bridge: vwgt"));
   icopy(nvtxs, vwgt, graph->vwgt);
-  graph->adjncy = imalloc(nedges > 0 ? nedges : 1, "bridge: adjncy");
+  graph->adjncy = imalloc(nedges > 0 ? nedges : 1, gkMsg("bridge: adjncy"));
   icopy(nedges, adjncy, graph->adjncy);
-  graph->adjwgt = imalloc(nedges > 0 ? nedges : 1, "bridge: adjwgt");
+  graph->adjwgt = imalloc(nedges > 0 ? nedges : 1, gkMsg("bridge: adjwgt"));
   icopy(nedges, adjwgt, graph->adjwgt);
-  graph->cmap = imalloc(nvtxs, "bridge: cmap");
+  graph->cmap = imalloc(nvtxs, gkMsg("bridge: cmap"));
   SetupGraph_tvwgt(graph);
   SetupGraph_label(graph);
   return graph;

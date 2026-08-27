@@ -638,7 +638,6 @@ void growBisection(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph, const
 // separator out of it. It uses the node-based separator refinement for it.
 template <typename IndexT, typename RealT>
 void constructSeparator(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* graph) {
-  const IndexT nvtxs = graph->nvtxs;
   const std::vector<IndexT>& xadj = graph->xadj;
   const IndexT nbnd = graph->nbnd;
   const std::vector<IndexT>& bndind = graph->bndind;

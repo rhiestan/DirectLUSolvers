@@ -1,6 +1,7 @@
 # CMake build trees
 build/
 build-*/
+build_*/
 cmake-build-*/
 
 # CMake / IDE artifacts

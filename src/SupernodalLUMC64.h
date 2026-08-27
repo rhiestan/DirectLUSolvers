@@ -82,8 +82,6 @@ bool mc64Matching(const MatrixType& A,
   colScale.assign(static_cast<std::size_t>(n), RealScalar(1));
   if (n == 0) return true;
 
-  const RealScalar kInf = std::numeric_limits<RealScalar>::infinity();
-
   // --- build the cost graph, column by column ------------------------------
   // c_ij = log(colmax_j) - log|a_ij| >= 0. Structural zeros (which pattern
   // symmetrization introduces in quantity) carry no information and are dropped;
