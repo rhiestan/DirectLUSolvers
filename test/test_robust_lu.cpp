@@ -314,6 +314,54 @@ void testHealthyMatrixNeverReachesTheRung() {
   checkTrue(!s.isLeastSquares(), "nor is the answer mislabelled as least squares");
 }
 
+void testDenseRowReporting() {
+  std::printf("  dense rows are detected and costed, not acted on\n");
+  // A matrix with a handful of genuinely dense rows -- the textbook case step 6
+  // was written about. The point of this test is the number it produces: AMD
+  // already orders dense vertices last, so the penalty is ~1, and reporting that
+  // honestly is more useful than building a bordered factorization to chase it.
+  const int n = 400;
+  std::vector<Triplet<double>> t;
+  for (int j = 0; j < n; ++j) {
+    t.emplace_back(j, j, 8.0);
+    if (j > 0) t.emplace_back(j - 1, j, -1.0);
+    if (j + 1 < n) t.emplace_back(j + 1, j, -1.0);
+  }
+  for (int j = 0; j < n; ++j) {  // three dense rows/columns
+    for (int d = 0; d < 3; ++d) {
+      if (j == d) continue;
+      t.emplace_back(d, j, 0.5);
+      t.emplace_back(j, d, 0.5);
+    }
+  }
+  SpMat A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+
+  Eigen::LeftRightLU<SpMat> s;
+  s.analyzePattern(A);
+  checkTrue(s.info() == Eigen::Success, "the matrix analyses");
+  checkTrue(s.denseRowCount() >= 3, "the dense rows are detected");
+  checkTrue(s.maxDegree() > s.denseRowThreshold(), "and exceed AMD's threshold");
+  const double penalty = s.denseRowFillPenalty(A);
+  checkTrue(std::isfinite(penalty) && penalty >= 1.0, "the penalty is a finite ratio >= 1");
+  std::printf("        %lld dense rows, maxdeg %lld, threshold %lld, penalty %.2fx\n",
+              (long long)s.denseRowCount(), (long long)s.maxDegree(),
+              (long long)s.denseRowThreshold(), penalty);
+
+  // A matrix with nothing dense must say so rather than report a number that
+  // invites action where none is available.
+  Eigen::LeftRightLU<SpMat> clean;
+  const SpMat L = lu_testing::laplacian2d(30, 30);
+  clean.analyzePattern(L);
+  checkTrue(clean.denseRowCount() == 0, "a Laplacian has no dense rows");
+  checkTrue(clean.denseRowFillPenalty(L) == 1.0, "and its penalty is exactly 1");
+
+  // Caching: the second call must not repeat the symbolic analysis.
+  const double again = s.denseRowFillPenalty(A);
+  checkTrue(again == penalty, "the penalty is cached");
+}
+
 // ---------------------------------------------------------------------------
 //  The corpus: outcomes measured BEFORE the ladder was written
 // ---------------------------------------------------------------------------
@@ -419,6 +467,7 @@ int main() {
   testRankRevealingOnAnInconsistentSystem();
   testRankRevealingFillGuard();
   testHealthyMatrixNeverReachesTheRung();
+  testDenseRowReporting();
   testCorpus();
 
   return lu_testing::summarize("RobustLU");

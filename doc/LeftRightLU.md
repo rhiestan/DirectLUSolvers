@@ -391,6 +391,13 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
   backward error into a small forward one (see item 7 above). Off by default: it costs O(nnz)
   per refinement step, and buys nothing when refinement does not run at all — which by default
   is whenever no static pivot was perturbed.
+- **`denseRowCount()`**, **`denseRowThreshold()`**, **`maxDegree()`** (free, from the symbolic
+  analysis) and **`denseRowFillPenalty(A)`** (one extra symbolic pass, cached) — how many vertices
+  AMD will treat as dense, and what they are actually costing. The penalty's denominator includes
+  the `k²` Schur term a bordered factorization would have to pay, so it does not flatter itself:
+  on the corpus matrices with a handful of very dense rows it reads **1.00**, because AMD already
+  orders them last. See [RobustLU](RobustLU.md) for what to do about a larger value — usually a
+  different ordering.
 - Error bounds are **not** computed for `transpose()`/`adjoint()` solves: `kappa_1(A^T)` is
   `kappa_inf(A)`, not `kappa_1(A)`, and reporting the wrong one would be worse than reporting
   none. Those solves leave the recorded values NaN and `lastCorrectDigits()` at `-1` rather

@@ -430,8 +430,7 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   // byte-for-byte the same work it was before, and the accessors below cost
   // what they cost only when called. See LeftRightLUConditionEstimate.h.
 
-  /** 
-eturns a Hager-Higham estimate of kappa_1(A) = ||A||_1 ||A^{-1}||_1,
+  /** \returns a Hager-Higham estimate of kappa_1(A) = ||A||_1 ||A^{-1}||_1,
     *  computed from the existing factors and cached until the next factorize().
     *
     *  Costs 4-5 triangular solves the FIRST time it is called after a
@@ -445,9 +444,8 @@ eturns a Hager-Higham estimate of kappa_1(A) = ||A||_1 ||A^{-1}||_1,
   /** Triangular solves spent on the cached condition estimate, 0 if never asked. */
   Index conditionEstimateSolves() const { return m_conditionSolves; }
 
-  /** 
-eturns the Oettli-Prager componentwise relative backward error of  x
-    *  as a solution of A x =  b -- EXACT, not an estimate, and O(nnz).
+  /** \returns the Oettli-Prager componentwise relative backward error of \a x
+    *  as a solution of A x = \a b -- EXACT, not an estimate, and O(nnz).
     *
     *  Near machine epsilon means the solver was backward stable on this system
     *  and no method could have done better in this precision; any inaccuracy
@@ -457,8 +455,7 @@ eturns the Oettli-Prager componentwise relative backward error of  x
     return left_right_lu::componentwiseBackwardError(m_originalMatrix, b, x);
   }
 
-  /** 
-eturns kappa * omega, clamped to 1: a first-order bound on
+  /** \returns kappa * omega, clamped to 1: a first-order bound on
     *  ||x - x_exact|| / ||x_exact||. Meaningless once it approaches 1, which is
     *  exactly the case where it is telling you not to trust the answer. */
   template <typename RhsT, typename SolT>
@@ -467,8 +464,7 @@ eturns kappa * omega, clamped to 1: a first-order bound on
                                                componentwiseBackwardError(b, x));
   }
 
-  /** 
-eturns how many decimal digits of  x the forward-error estimate
+  /** \returns how many decimal digits of \a x the forward-error estimate
     *  supports, floored at 0 -- the "13 digits or 2 digits?" question a bare
     *  residual cannot answer. */
   template <typename RhsT, typename SolT>
@@ -476,7 +472,7 @@ eturns how many decimal digits of  x the forward-error estimate
     return digitsFromForwardError(estimatedForwardError(b, x));
   }
 
-  /** eturns the element growth factor of the last factorization,
+  /** \returns the element growth factor of the last factorization,
     *  max(max|L|, max|U|) / max|A~| on the equilibrated matrix.
     *
     *  The classic signal that elimination went wrong. Growth near 1 says the
@@ -489,6 +485,48 @@ eturns how many decimal digits of  x the forward-error estimate
     *  Costs one O(fill) scan of the factor arenas the first time it is called
     *  after a factorization, then nothing. Returns NaN if not factorized. */
   RealScalar growthFactor() const;
+
+  // --- dense rows -----------------------------------------------------------
+
+  /** Vertices whose degree in the eliminated graph exceeds denseRowThreshold().
+    *
+    * Measured on the same graph patternSymmetry() describes -- B + B^T after
+    * matching, before the block triangular form sets anything aside -- and with
+    * AMD's own threshold, so it counts the vertices AMD will treat as dense and
+    * order last rather than applying a definition nothing acts on. Free: the
+    * adjacency is already built. */
+  Index denseRowCount() const { return m_denseRowCount; }
+  /** max(16, 10*sqrt(n)), AMD's dense-vertex threshold. */
+  Index denseRowThreshold() const { return m_denseThreshold; }
+  /** The largest degree in the eliminated graph. */
+  Index maxDegree() const { return m_maxDegree; }
+
+  /** \returns how much fill the dense vertices are actually costing, as the
+    *  ratio of this factorization's predicted fill to what a bordered
+    *  factorization could achieve.
+    *
+    *  1.0 means they cost nothing. Do not read a large value as free money: the
+    *  denominator is the honest one, `fill(A without the dense vertices) + k^2`,
+    *  because a bordered factorization still has to form and factor a dense k x k
+    *  Schur complement. Leaving that term out overstates the opportunity badly --
+    *  on this project's `setfos_2` it turns a real 1.7x into an apparent 18x.
+    *
+    *  **Usually the useful response is a different ordering, not a different
+    *  factorization.** AMD already orders dense vertices last, and on the corpus
+    *  matrices with a handful of very dense rows the penalty measures 1.00.
+    *  Where it is larger the cause is many moderately dense rows, and METIS or
+    *  COLAMD frequently recovers most of it.
+    *
+    *  Costs one extra SYMBOLIC analysis (no numeric factorization) the first
+    *  time it is called, then nothing. Returns 1.0 when there are no dense
+    *  vertices, and NaN if the analysis has not run or the sub-analysis fails.
+    *
+    *  \a matrix must be the one analyzePattern() saw. It is passed rather than
+    *  remembered on purpose: this is a question you want answered BEFORE paying
+    *  for a factorization, and the solver does not retain the matrix until
+    *  factorize() -- keeping a copy from analyzePattern() just to answer an
+    *  optional diagnostic would put a cost on every caller who never asks. */
+  double denseRowFillPenalty(const MatrixType& matrix) const;
 
   /** Form refinement's residual r = b - A x in DOUBLE-DOUBLE arithmetic rather
     *  than working precision. OFF by default.
@@ -868,6 +906,11 @@ eturns how many decimal digits of  x the forward-error estimate
     m_errorBounds = false;
     m_extendedResidual = false;
     m_maxScaledEntry = RealScalar(0);
+    m_denseRowCount = 0;
+    m_denseThreshold = 0;
+    m_maxDegree = 0;
+    m_densePenaltyValid = false;
+    m_densePenalty = NumTraits<double>::quiet_NaN();
     m_growthValid = false;
     m_growthFactor = NumTraits<RealScalar>::quiet_NaN();
     m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
@@ -1235,6 +1278,11 @@ eturns how many decimal digits of  x the forward-error estimate
   bool m_errorBounds;
   bool m_extendedResidual;
   RealScalar m_maxScaledEntry;
+  Index m_denseRowCount;
+  Index m_denseThreshold;
+  Index m_maxDegree;
+  mutable bool m_densePenaltyValid;
+  mutable double m_densePenalty;
   mutable bool m_growthValid;
   mutable RealScalar m_growthFactor;
   mutable RealScalar m_lastBackwardError;
@@ -1349,6 +1397,25 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::buildSymmetrizedPattern(
   } else {
     m_patternSymmetry = RealScalar(1);  // diagonal-only: trivially symmetric
     m_structurallySymmetric = true;
+  }
+
+  // Dense-vertex statistics, recorded HERE for the same reason patternSymmetry
+  // is: before the BTF filter, so they describe the graph as it arrived rather
+  // than the reduced one. Free -- the adjacency is already built.
+  //
+  // The threshold is AMD's own, max(16, 10*sqrt(n)) (see Eigen's Amd.h), so the
+  // count means "vertices AMD will treat as dense and order last" rather than a
+  // definition of our own that no ordering acts on.
+  {
+    m_denseThreshold = numext::maxi(Index(16), Index(10 * numext::sqrt(double(n))));
+    m_denseRowCount = 0;
+    m_maxDegree = 0;
+    for (StorageIndex j = 0; j < n; ++j) {
+      const Index degree = Index(m_patternStart[static_cast<std::size_t>(j) + 1] -
+                                 m_patternStart[static_cast<std::size_t>(j)]);
+      m_maxDegree = numext::maxi(m_maxDegree, degree);
+      if (degree > m_denseThreshold) ++m_denseRowCount;
+    }
   }
 
   // Pass 4 (BTF only): drop the edges that cross a diagonal block. They are
@@ -2289,6 +2356,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
   // factorization, not the pattern, so it cannot survive a refactorization.
   m_conditionValid = false;
   m_conditionSolves = 0;
+  m_densePenaltyValid = false;
 
   // Fail-fast fill guard: abort BEFORE allocating the factor arenas if the
   // symbolic structure predicts a factor larger than the configured limit. This
@@ -2886,6 +2954,78 @@ LeftRightLU<MatrixType, OrderingType, Executor>::conditionEstimate() const {
                             ? anorm * invNorm
                             : NumTraits<RealScalar>::infinity();
   return m_conditionEstimate;
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+double LeftRightLU<MatrixType, OrderingType, Executor>::denseRowFillPenalty(
+    const MatrixType& matrix) const {
+  if (m_densePenaltyValid) return m_densePenalty;
+  m_densePenaltyValid = true;
+  m_densePenalty = NumTraits<double>::quiet_NaN();
+  if (!m_analysisDone || matrix.rows() != Index(m_size)) return m_densePenalty;
+  if (m_denseRowCount <= 0) {
+    m_densePenalty = 1.0;  // nothing dense: nothing to blame
+    return m_densePenalty;
+  }
+  const Index n = Index(m_size);
+  if (m_denseRowCount >= n) return m_densePenalty;  // everything is dense; the ratio says nothing
+
+  // Which vertices are dense, in the ORIGINAL numbering. m_patternStart is in
+  // internal numbering and may have been filtered by BTF, so the degrees are
+  // recomputed from the input rather than reused.
+  std::vector<Index> degree(std::size_t(n), 0);
+  for (Index j = 0; j < n; ++j)
+    for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+      const Index i = Index(it.index());
+      if (i == j) continue;
+      ++degree[std::size_t(j)];
+      ++degree[std::size_t(i)];
+    }
+  std::vector<Index> remap(std::size_t(n), -1);
+  Index kept = 0;
+  for (Index i = 0; i < n; ++i)
+    if (degree[std::size_t(i)] <= m_denseThreshold) remap[std::size_t(i)] = kept++;
+  const Index removed = n - kept;
+  if (kept <= 0 || removed <= 0) return m_densePenalty;
+
+  MatrixType sub(kept, kept);
+  {
+    std::vector<Triplet<Scalar, StorageIndex>> triplets;
+    triplets.reserve(std::size_t(matrix.nonZeros()));
+    for (Index j = 0; j < n; ++j) {
+      if (remap[std::size_t(j)] < 0) continue;
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+        const Index i = Index(it.index());
+        if (remap[std::size_t(i)] < 0) continue;
+        triplets.emplace_back(StorageIndex(remap[std::size_t(i)]),
+                              StorageIndex(remap[std::size_t(j)]), it.value());
+      }
+    }
+    sub.setFromTriplets(triplets.begin(), triplets.end());
+    sub.makeCompressed();
+  }
+
+  // A symbolic analysis only -- no numeric factorization -- of the same solver
+  // with the same settings, so the comparison is like for like.
+  LeftRightLU<MatrixType, OrderingType, Executor> probe;
+  probe.setMatchingMethod(m_matchingMethod);
+  probe.setBlockTriangularForm(m_btfEnabled);
+  probe.setAmalgamation(m_relaxedSize, m_maxAmalgamationZeroRows);
+  probe.setMaxBlockSize(m_maxBlockSize);
+  try {
+    probe.analyzePattern(sub);
+  } catch (...) {
+    return m_densePenalty;
+  }
+  if (probe.info() != Success) return m_densePenalty;
+
+  const double sparseFill = double(probe.predictedFactorNonzeros());
+  const double schur = double(removed) * double(removed);  // the dense k x k block
+  const double achievable = sparseFill + schur;
+  const double actual = double(predictedFactorNonzeros());
+  if (!(achievable > 0) || !(actual > 0)) return m_densePenalty;
+  m_densePenalty = actual / achievable;
+  return m_densePenalty;
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>

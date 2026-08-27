@@ -118,6 +118,7 @@ struct Attempt {
   double probeResidual = 0;
   long long replacedPivots = 0;
   long long factorNonzeros = -1;      ///< nnzL + nnzU for an LU rung; nnz(R) for QR.
+  long long denseRows = -1;           ///< Vertices above AMD's dense threshold; -1 for QR.
   long long rank = -1;                ///< Rank-revealing rung only; -1 elsewhere.
   double leastSquaresOptimality = 0;  ///< ||A^T r|| / (||A|| ||r||); see acceptable().
   double milliseconds = 0;
@@ -234,6 +235,28 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     * LeftRightLU still measures the REAL right-hand side afterwards either way. */
   void setProbeRightHandSide(const DenseVector& b) { m_probe = b; }
 
+  // --- dense rows -----------------------------------------------------------
+
+  /** Vertices above AMD's dense threshold in the eliminated graph, or -1 if no
+    *  LU rung ran. Free -- measured during the symbolic analysis. */
+  Index denseRowCount() const { return m_denseRowCount; }
+
+  /** How much fill those vertices are costing, as a ratio against what a
+    *  bordered factorization could achieve (see
+    *  LeftRightLU::denseRowFillPenalty). NaN unless the ladder had to escalate.
+    *
+    *  Computed only when a rung is rejected, because that is the only time it is
+    *  actionable, and it costs a symbolic analysis -- trivial next to the
+    *  refactorization the escalation is about to do, but not worth imposing on
+    *  the 19 of 33 corpus matrices that never leave the first rung.
+    *
+    *  **The usual response is a different ordering, not a different solver.**
+    *  AMD already orders dense vertices last, and on the corpus matrices with a
+    *  handful of very dense rows this measures exactly 1.00 -- meaning they cost
+    *  nothing at all. Where it is larger the cause is many moderately dense
+    *  rows, and METIS or COLAMD often recovers most of it. */
+  double denseRowFillPenalty() const { return m_denseRowPenalty; }
+
   /** Numerical rank, from the rank-revealing rung. -1 when that rung never ran. */
   Index rank() const { return m_rank; }
 
@@ -301,6 +324,8 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     m_maxRankRevealingFill = 5000000;
     m_leastSquaresTolerance = RealScalar(1e-8);
     m_rank = -1;
+    m_denseRowCount = -1;
+    m_denseRowPenalty = NumTraits<double>::quiet_NaN();
     m_maxFactorNonzeros = 0;
     m_backwardError = NumTraits<RealScalar>::quiet_NaN();
     m_conditionEstimate = NumTraits<RealScalar>::quiet_NaN();
@@ -376,6 +401,8 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   long long m_maxRankRevealingFill;
   RealScalar m_leastSquaresTolerance;
   Index m_rank;
+  Index m_denseRowCount;
+  double m_denseRowPenalty;
   Index m_maxFactorNonzeros;
   RealScalar m_backwardError;
   RealScalar m_conditionEstimate;
@@ -471,6 +498,7 @@ robust_lu::Attempt RobustLU<MatrixType>::runDirect(const MatrixType& matrix,
   a.growthFactor = double(m_direct->growthFactor());
   a.replacedPivots = (long long)m_direct->replacedPivots();
   a.factorNonzeros = (long long)m_direct->nnzL() + m_direct->nnzU();
+  a.denseRows = (long long)m_direct->denseRowCount();
   const RealScalar bn = probe.norm();
   a.probeResidual = double(bn > RealScalar(0) ? (matrix * x - probe).norm() / bn
                                               : (matrix * x - probe).norm());
@@ -688,6 +716,8 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
   m_usePivoting = false;
   m_useRankRevealing = false;
   m_rank = -1;
+  m_denseRowCount = -1;
+  m_denseRowPenalty = NumTraits<double>::quiet_NaN();
   m_info = NumericalIssue;
   m_outcome = Outcome::Exhausted;
   m_isInitialized = true;
@@ -704,6 +734,7 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
   // ---- rung 0: the default strategy ------------------------------------
   Attempt first = runDirect(matrix, Strategy::Default);
   m_attempts.push_back(first);
+  if (first.factored) m_denseRowCount = Index(first.denseRows);
 
   // Structural singularity is checked BEFORE the acceptance test, not only when
   // a rung is rejected. A singular matrix can still produce a small backward
@@ -769,6 +800,12 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
     m_lastError = first.note;
     return;
   }
+
+  // The first rung was rejected, so escalation is coming. That makes the
+  // dense-row penalty actionable -- and worth its symbolic analysis, which is
+  // trivial next to the refactorization about to happen.
+  if (first.factored && m_denseRowCount > 0)
+    m_denseRowPenalty = m_direct->denseRowFillPenalty(matrix);
 
   // ---- rung: MC64 --------------------------------------------------------
   // The measured workhorse: 4 of the 5 rescuable corpus failures. A large
@@ -872,6 +909,16 @@ std::string RobustLU<MatrixType>::report() const {
       out += a.note;
     }
     out += "\n";
+  }
+  // Only worth saying when it is both true and actionable: a penalty of 1.00 is
+  // AMD having already dealt with the dense rows, which is the common case.
+  if ((numext::isfinite)(m_denseRowPenalty) && m_denseRowPenalty > 1.2) {
+    std::snprintf(buf, sizeof(buf),
+                  "  note: %lld dense rows are costing %.2fx the fill a bordered factorization "
+                  "would need. A different ordering (METIS, COLAMD) usually recovers most of "
+                  "that and costs nothing to try.\n",
+                  (long long)m_denseRowCount, m_denseRowPenalty);
+    out += buf;
   }
   if (!m_lastError.empty()) {
     out += "  ";

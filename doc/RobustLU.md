@@ -110,6 +110,49 @@ minutes for a correct answer where every LU strategy returns 1.8e+33 — and the
 it. A silent multi-minute stall is judged the worse failure mode, and the declined rung is logged
 with its reason, so raising the guard is an informed choice rather than a discovery.
 
+## Dense rows: detected and costed, not acted on
+
+A single dense row can densify an entire sparse factor, and the roadmap's last item was to factor
+such rows separately. Measurement says the interesting half of that job is already done — by
+Eigen, not by us. AMD marks any vertex with degree above `max(16, 10√n)` as dense, excludes it
+from degree minimisation and orders it last (`Amd.h`), and it works:
+
+| matrix | n | max degree | dense rows | fill penalty |
+|---|---:|---:|---:|---:|
+| `Sandia/adder_dcop_11` | 1813 | **2641** | 3 | **1.00** |
+| `TSOPF/TSOPF_RS_b9_c6` | 7224 | **3603** | 3 | **1.00** |
+| `Muite/Chebyshev3` | 4101 | 4100 | 4 | 1.09 |
+| `JGD_CAG/CAG_mat1916` | 1916 | 1135 | 77 | 1.39 |
+| `setfos_2` | 3048 | 1088 | 1335 | 1.68 |
+| `tomography` | 500 | 385 | 47 | **3.89** |
+
+The rows that match the textbook story — a handful of vertices of degree 2600–3600 — cost
+**nothing**. What remains is a different problem: *many moderately* dense rows, where the penalty
+is real but modest.
+
+**The penalty is measured honestly, which matters because the naive version is wildly
+optimistic.** It compares this factorization's predicted fill against
+`fill(A without the dense vertices) + k²` — including the dense `k × k` Schur complement a
+bordered factorization would have to form and factor. Omitting that term turns `setfos_2`'s real
+1.7x into an apparent **18x**, which is exactly the kind of number that gets a large feature built
+on a false premise.
+
+So `RobustLU` **reports** rather than acts:
+
+- `denseRowCount()` — free, from the symbolic analysis.
+- `denseRowFillPenalty()` — computed only when a rung is rejected, since that is the only time it
+  is actionable, and it costs one extra symbolic analysis (no numeric factorization).
+- `report()` adds an advisory line when the penalty exceeds 1.2, and stays quiet otherwise —
+  a penalty of 1.00 means AMD has already dealt with it and there is nothing to say.
+
+**The usual response is a different ordering, not a different factorization.** On `setfos_2`,
+METIS takes the fill from 3.9M to 1.6M — more than a bordered factorization's honest 1.7x would
+have bought, for a one-line change. A bordered factorization remains implementable (the pieces
+exist: multi-RHS solve, the BTF block-substitution shape, dense `PartialPivLU`), but on this
+corpus it would be a 1.0–3.9x fill improvement on four matrices, with an unpivoted elimination
+across the block boundary as the numerical risk. That is a performance project, not a robustness
+one, and it is deliberately not built.
+
 ## Knowing when to stop is the hard half
 
 Some corpus matrices cannot be rescued by any rung, and an MC64 attempt on `Mallya/lhr10c` costs
@@ -166,6 +209,8 @@ either way.
   produced a fill figure) — what the terminal QR rung is allowed to attempt.
 - **`rank()`** and **`isLeastSquares()`** — meaningful only after the rank-revealing rung; `-1`
   and `false` otherwise, so a caller cannot mistake an unmeasured rank for a full one.
+- **`denseRowCount()`** and **`denseRowFillPenalty()`** — see above. The penalty is NaN unless the
+  ladder escalated, since it is only computed when it can change a decision.
 - **`setProbeRightHandSide(const DenseVector&)`** — see above.
 - **`strategy()`, `outcome()`, `attempts()`, `report()`** — what was tried, what was accepted, and
   why it stopped. Each `Attempt` carries its backward error, condition estimate, growth factor,
