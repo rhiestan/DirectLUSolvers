@@ -153,19 +153,117 @@ analysis (~40% of analyze time) and changes nothing else, bit for bit.
 many the numeric phase looked at and declined, which is the design working rather than failing:
 the matching's job is to make the good pivot *available*, not to force it.
 
-## Not implemented yet
+## Three things deliberately not here, and the measurements that keep them out
 
-Stated so it is not mistaken for an oversight:
+Each of these is an obvious-looking addition. Each was measured rather than argued about, and
+each measurement said no. They are recorded here so the case can be reopened with evidence
+rather than repeated from scratch.
 
-- **A blocked Bunch–Kaufman kernel.** The dense diagonal-block factorization is unblocked,
-  deliberately: the block is capped by `setMaxBlockSize` (128) and the BLAS-3 work that matters
-  is the off-diagonal panel, so a worse constant on a small term does not show up in the
-  measurements above.
-- **A Krylov refinement option.** Refinement here is stationary. The natural Krylov method for
-  this operator is CG when it is definite and MINRES when it is not, not the BiCGStab the
-  unsymmetric siblings default to.
-- **Duff–Pralet *scaling*.** The matching's dual variables also yield a symmetric scaling; this
-  solver uses its own symmetric Ruiz equilibration instead, computed from the matrix.
+### A blocked Bunch–Kaufman kernel
+
+The dense diagonal-block factorization is unblocked. `Pivoting::None` *is* blocked (64-column
+panels), which makes the comparison direct: on an SPD matrix Bunch–Kaufman takes all 1×1 pivots
+and performs no interchange, so the gap between them is almost purely blocked-versus-unblocked.
+
+| `setMaxBlockSize` | 32 | 64 | **128 (default)** | 256 | 512 |
+|---|--:|--:|--:|--:|--:|
+| unblocked / blocked, `lap3d 30³` | 0.89 | 0.97 | **1.004** | 1.035 | 1.040 |
+| unblocked / blocked, `lap2d 300²` | 1.04 | 1.09 | 0.99 | 1.00 | 1.12 |
+
+**≤4% at four times the default block width**, and the 2D row is pure noise. The shape matters
+more than the numbers: an unblocked `O(w³)` kernel that mattered would get rapidly worse as `w`
+grows, and this does not — which is the signature of the off-diagonal panel dominating. On an
+indefinite matrix (`lap3d 30³ − 5.3I`) factor time is flat at 722 / 744 / 712 / 704 ms across
+block sizes 64–512 while the 2×2 pivot count climbs from 1268 to 1420.
+
+(The 32-column column is worse for an unrelated reason: it makes the *panel* GEMMs too narrow.)
+
+### A Krylov refinement option
+
+Refinement here is stationary, and the natural-looking upgrade is MINRES — a symmetric operator
+deserves a short recurrence, and the unsymmetric siblings default to BiCGStab for good measured
+reasons. It was implemented, validated, and removed.
+
+| matrix | refinement | iterations | residual | forward error |
+|---|---|--:|--:|--:|
+| zero diagonal, n=800 | none | 0 | 9.4e-09 | 9.7e-08 |
+| | stationary | **2** | **1.5e-16** | **2.4e-15** |
+| | MINRES | 18 | 7.1e-13 | 1.0e-12 |
+| zero diagonal, n=2000 | stationary | **2** | **1.5e-16** | 9.9e-14 |
+| | MINRES | 0 | 1.0e-08 | 6.2e-06 |
+
+**Stationary refinement reaches machine precision in two iterations, every time.** The
+implementation was checked against theory before this was believed: run standalone with `M = I`
+it converges to machine precision within `1.5n` iterations on a dense indefinite system, and
+with `M = |A|` it converges in **exactly 2** at every size — which is the prediction, since
+`M⁻¹A` then has eigenvalues ±1. The recurrence is right; MINRES simply has nothing to add.
+
+There are two reasons, and the second is the interesting one:
+
+1. **The perturbation is bounded by construction.** Static pivoting bumps a pivot to
+   `sqrt(eps)·max|Ã|` and no further, so `‖A − Ã‖/‖A‖` stays around `sqrt(eps)`. Stationary
+   refinement is Richardson with `M = Ã`, so its error contracts by roughly `1e-8` per step:
+   two steps *is* convergence, and divergence — the case a Krylov method exists to rescue —
+   cannot arise.
+2. **The repair that makes MINRES applicable is what destroys its preconditioner.**
+   Preconditioned MINRES uses the preconditioner as an inner product, so it must be positive
+   definite; `L D Lᴴ` is not, when `A` is indefinite. The standard fix is `L |D| Lᴴ` — but that
+   is no longer the factorization of anything near `A`. It turns `M⁻¹A` from *almost the
+   identity* into a matrix with eigenvalues of both signs, and MINRES then has to spend
+   iterations rediscovering the sign structure that Richardson never had to lose. BiCGStab does
+   not face this, which is exactly why the siblings' precedent does not transfer: it never
+   treats its preconditioner as an inner product.
+
+### Duff–Pralet *scaling*
+
+The matching's dual variables also yield a symmetric scaling; this solver uses symmetric Ruiz,
+computed from the matrix. On a zero-diagonal matrix whose row magnitudes are spread over a
+given number of decades (dense SVD, n=600):
+
+| row-magnitude spread | κ(A) | κ(S·A·S) | κ(SAS)·eps | forward error |
+|---|--:|--:|--:|--:|
+| 10⁰ | 9.3e+02 | 8.2e+02 | 1.8e-13 | 4.3e-15 |
+| 10^±3 | 8.2e+12 | **5.4e+04** | 1.2e-11 | 1.5e-10 |
+| 10^±6 | **inf** | **6.2e+08** | 1.4e-07 | 3.1e-05 |
+
+Ruiz removes eight orders of conditioning and turns a numerically infinite κ into 6.2e+08 — and
+the forward error then tracks `κ(SAS)·eps` within a small factor, i.e. the first-order bound is
+being *attained*. A different scaling can only help by producing a smaller `κ(SAS)`, and there
+is very little left to take. Scaling and matching are also not substitutes: on the 10^±3 matrix,
+matching alone leaves 209 perturbed pivots and Ruiz alone leaves 301, while the two together
+leave 10.
+
+What that measurement did expose is a real gap, and it was closed rather than documented —
+see [the condition estimate](#the-condition-estimate) below.
+
+## The condition estimate
+
+`conditionEstimate()` is a Hager–Higham estimate of `κ₁` of the operator the factors invert. It
+is computed on first call and cached until the next `factorize()`, so a caller who never asks
+pays nothing.
+
+It exists because of a case the scaling measurement above turned up. On the 10^±6 matrix this
+solver returns a **residual of 1.1e-16 next to a forward error of 4.3e-05, and reports
+`Success`** — correctly, because the factorization really is backward stable and the error is
+the matrix's conditioning. But nothing in a residual can tell you that, and before this the
+solver had no way to say it. Its siblings did: `LeftRightLU` has had `conditionEstimate()` since
+the robustness roadmap's second step, and the asymmetry meant `RobustLU`'s symmetric rung could
+diagnose something `SupernodalLDLT` could not.
+
+It comes almost free, for a reason worth knowing: `A` is Hermitian, so `A⁻ᴴ` and `A⁻¹` are the
+*same operator* and the estimator's two callbacks coincide. A solver with no condition estimator
+of its own gets one for the price of the shared generic routine
+([`LeftRightLUConditionEstimate.h`](../src/LeftRightLUConditionEstimate.h)).
+
+```cpp
+const double kappa = solver.conditionEstimate();
+const double bound = Eigen::left_right_lu::estimateForwardError(kappa, solver.solveResidual());
+```
+
+Two caveats travel with it, both inherited and neither cosmetic. It is a **lower bound** on
+`‖A⁻¹‖₁` — Hager's algorithm maximises over a subset of the unit ball — so it can report a
+matrix as better conditioned than it is. And it describes the operator the *factors* represent,
+which under static pivoting is a perturbed `A`; read it next to `replacedPivots()`.
 
 ## The factors
 
@@ -235,9 +333,8 @@ behave identically because they drive the same code:
 - **`setMaxFactorNonzeros(Index)`** (default `0` = off) — fail-fast fill guard; aborts before
   allocating the arena.
 - **`setMaxIterativeRefinements(Index)`** (default `5`, gated by `setRefineOnlyIfPerturbed`) —
-  stationary refinement. The natural Krylov method for a symmetric operator is conjugate
-  gradients, or MINRES when it is indefinite, not the BiCGStab the unsymmetric siblings default
-  to; the stationary loop here is for small corrections.
+  stationary refinement. Stationary and not Krylov, unlike the siblings — see
+  [the measurement](#a-krylov-refinement-option). Two iterations reach machine precision.
 - **`setSolveFailureThreshold(RealScalar)`** (default `1e-6`) — `solve()` measures the true
   relative residual against the original operator and downgrades `info()` rather than return a
   bad answer silently. `solveResidual()` reports the measured value.
@@ -254,9 +351,12 @@ Diagnostics: `info()`, `isFactorized()`, `lastErrorMessage()`,
 `notPositiveDefiniteColumn()`, `replacedPivots()`, `pivotBlocks2x2()`, `straddlingPivots()`,
 `matchedPairs()`, `inertia()`, `nnzL()`, `predictedFactorNonzeros()`, `supernodeCount()`,
 `levelCount()`, `intraParallelSupernodes()`, `permutation()`, `factorPermutation()`,
-`solveResidual()`, `iterativeRefinements()`, `determinant()`, `determinantSign()`,
-`logAbsDeterminant()`, and the factor accessors `matrixL()`, `matrixD()`, `vectorD()`,
-`scalingS()`.
+`solveResidual()`, `conditionEstimate()`, `iterativeRefinements()`, `determinant()`,
+`determinantSign()`, `logAbsDeterminant()`, and the factor accessors `matrixL()`, `matrixD()`,
+`vectorD()`, `scalingS()`.
+
+Everything in that list is free except `conditionEstimate()`, which costs a handful of
+triangular solves on its first call and is then cached until the next `factorize()`.
 
 `determinant()` overflows on moderately sized systems exactly as it does on the LU solvers —
 prefer `logAbsDeterminant()` with `determinantSign()`. `L` is unit triangular and the
@@ -404,6 +504,11 @@ Three more properties are pinned because each could regress silently:
 - **Matching changes nothing it should not.** On an SPD matrix it must form no pair and return a
   bit-identical answer; on a zero-diagonal matrix it must cut perturbed pivots by an order of
   magnitude and solve what the unmatched path cannot.
+- **The residual/accuracy trap is asserted, not just described.** On a badly scaled matrix the
+  suite requires all four of: a residual at machine precision, a forward error orders of
+  magnitude worse, `info() == Success` (which is *correct* — the factorization is backward
+  stable), and a `conditionEstimate()` large enough to expose it. A solver that quietly started
+  flagging that case, or one whose κ stopped tracking it, would both fail here.
 
 A note on what is *not* asserted there: the zero-diagonal matrices agree across `Lower`, `Upper`
 and a full input to rounding rather than bit for bit. They perturb pivots, so refinement runs,

@@ -731,21 +731,12 @@ robust_lu::Attempt RobustLU<MatrixType>::runSymmetric(const MatrixType& matrix,
   a.probeResidual = double(bn > RealScalar(0) ? (matrix * x - probe).norm() / bn
                                               : (matrix * x - probe).norm());
 
-  // Hager-Higham, driven by this solver's own solve. A is Hermitian, so A^-H and
-  // A^-1 are the same operator and the estimator's two callbacks coincide --
-  // which is why a solver with no condition estimator of its own can still
-  // produce the number the ladder's stopping rules are written against. Without
-  // it the symmetric rung would be a hole in the one guarantee this class exists
-  // for: "ill-conditioned" and "the solver did badly" look identical from a
-  // residual, and only a kappa separates them.
-  {
-    Index solves = 0;
-    const RealScalar invNorm = left_right_lu::oneNormEstimate<Scalar>(
-        Index(m_size), [&](const DenseVector& in, DenseVector& out) { out = m_symmetric->solve(in); },
-        [&](const DenseVector& in, DenseVector& out) { out = m_symmetric->solve(in); }, &solves);
-    a.conditionEstimate = double(left_right_lu::oneNorm(matrix) * invNorm);
-    a.milliseconds = elapsed();
-  }
+  // Without a kappa the symmetric rung would be a hole in the one guarantee this
+  // class exists for: "ill-conditioned" and "the solver did badly" look identical
+  // from a residual, and only a kappa separates them. SupernodalLDLT computes one
+  // on demand (Hager-Higham over its own factor solve), so the rung just asks.
+  a.conditionEstimate = double(m_symmetric->conditionEstimate());
+  a.milliseconds = elapsed();
 
   // ACCEPTED ONLY WHEN UNAMBIGUOUSLY GOOD. Beyond the usual backward error and
   // residual: nothing perturbed, and comfortably enough conditioned that no

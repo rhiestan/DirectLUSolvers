@@ -96,11 +96,11 @@ this rung has none of. Falling through costs one `LDL^T` — about half an LU �
 diagnosis the class promises.
 
 The κ is worth a note, because a hole there would have been the one regression this class cannot
-afford: `SupernodalLDLT` has no condition estimator. The rung gets one anyway by driving the
-shared Hager–Higham estimator with that solver's own `solve()` — `A` is Hermitian, so `A⁻ᴴ` and
-`A⁻¹` are the same operator and the estimator's two callbacks coincide. Without it,
-"ill-conditioned" and "the solver did badly" would be indistinguishable on every symmetric
-matrix, which is precisely the confusion the ladder exists to resolve.
+afford: "ill-conditioned" and "the solver did badly" are indistinguishable from a residual, and
+only a κ separates them. `SupernodalLDLT` had no condition estimator when this rung was written;
+it does now — [`conditionEstimate()`](SupernodalLDLT.md#the-condition-estimate), which is nearly
+free there because `A` is Hermitian and so `A⁻ᴴ` and `A⁻¹` are the same operator — and the rung
+simply asks it.
 
 `matrixIsSymmetric()` says whether the rung was offered; `nnzU()` returns `0` when it was taken,
 and that is the fact rather than a missing value.

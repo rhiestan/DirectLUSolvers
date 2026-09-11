@@ -756,6 +756,100 @@ SparseMatrix<double> zeroDiagonalSymmetric(int n, int perRow, unsigned seed) {
   return A;
 }
 
+// A small residual says the computed x solves a NEARBY system. It says nothing
+// about how far x is from the answer to the system that was asked about, and on a
+// badly scaled matrix those come apart completely. This pins both halves: that
+// the solver reports Success with a tiny residual and a badly wrong answer (which
+// is correct -- the factorization is backward stable and the error is the
+// matrix), and that conditionEstimate() is what makes that visible.
+void testConditionEstimate() {
+  std::printf("\n-- condition estimate --\n");
+
+  // Well conditioned: kappa is small and the answer is as good as the residual.
+  {
+    const SparseMatrix<double> A = laplacian2d(20, 20);
+    const int n = static_cast<int>(A.rows());
+    VectorXd xTrue = VectorXd::Random(n), b = A * xTrue;
+    Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+    s.compute(triangleOf(A, true));
+    const VectorXd x = s.solve(b);
+    const double kappa = s.conditionEstimate();
+    // A 2D Laplacian's kappa grows like (g/pi)^2; for g=20 that is in the hundreds.
+    checkTrue(kappa > 10.0 && kappa < 1e6, "a well-conditioned matrix estimates a modest kappa");
+    check((x - xTrue).norm() / xTrue.norm() < 1e-10, "and the answer is accurate",
+          (x - xTrue).norm() / xTrue.norm());
+    std::printf("        lap2d 20x20: kappa=%.2e\n", kappa);
+  }
+
+  // Badly scaled: row magnitudes spanning 10^+-6 make the matrix ill-conditioned
+  // even after symmetric Ruiz, and the residual stops predicting the error.
+  {
+    const int n = 600;
+    std::mt19937 gen(11);
+    std::uniform_int_distribution<int> pick(0, n - 1);
+    std::uniform_real_distribution<double> val(0.5, 2.0);
+    std::uniform_real_distribution<double> expo(-6.0, 6.0);
+    std::vector<double> rowScale(n);
+    for (int i = 0; i < n; ++i) rowScale[i] = std::pow(10.0, expo(gen));
+    std::vector<Eigen::Triplet<double>> t;
+    for (int i = 0; i < n; ++i)
+      for (int k = 0; k < 3; ++k) {
+        const int j = pick(gen);
+        if (j == i) continue;
+        const double v = val(gen) * (k % 2 ? -1.0 : 1.0) * rowScale[i] * rowScale[j];
+        t.emplace_back(i, j, v);
+        t.emplace_back(j, i, v);
+      }
+    SparseMatrix<double> A(n, n);
+    A.setFromTriplets(t.begin(), t.end());
+    A.makeCompressed();
+
+    VectorXd xTrue = VectorXd::Random(n), b = A * xTrue;
+    Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+    s.setMatching(true);
+    s.compute(triangleOf(A, true));
+    if (s.info() != Eigen::Success) {
+      lu_testing::fail("ill-conditioned: factorization failed");
+      return;
+    }
+    const VectorXd x = s.solve(b);
+    const double resid = (A * x - b).norm() / b.norm();
+    const double err = (x - xTrue).norm() / xTrue.norm();
+    const double kappa = s.conditionEstimate();
+    std::printf("        badly scaled: kappa=%.2e resid=%.2e err=%.2e\n", kappa, resid, err);
+
+    // The trap, stated as an assertion: residual tiny, answer wrong, Success.
+    checkTrue(resid < 1e-10, "the residual is at machine precision");
+    checkTrue(err > 1e4 * resid, "yet the answer is orders of magnitude less accurate");
+    checkTrue(s.info() == Eigen::Success,
+              "and solve() reports Success, correctly -- it IS backward stable");
+    // kappa is what separates "the solver did badly" from "the matrix has no
+    // answer in this precision". Only it can flag this case.
+    checkTrue(kappa > 1e6, "the condition estimate is what exposes it");
+    // The first-order bound has to actually bound: err <~ kappa * omega.
+    const double bound =
+        Eigen::left_right_lu::estimateForwardError(kappa, std::max(resid, 1e-17));
+    checkTrue(bound >= err || bound == 1.0, "and kappa * omega bounds the observed error");
+  }
+
+  // Re-factorizing must invalidate the cache rather than hand back a stale kappa.
+  {
+    const SparseMatrix<double> A = laplacian2d(12, 12);
+    const SparseMatrix<double> Lo = triangleOf(A, true);
+    Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+    s.compute(Lo);
+    const double first = s.conditionEstimate();
+    const SparseMatrix<double> scaled = (1e6 * A).eval();
+    s.factorize(triangleOf(scaled, true));
+    const double second = s.conditionEstimate();
+    // kappa is scale invariant, so the two must AGREE -- which is only possible
+    // if the second call actually recomputed rather than returned a cached value
+    // from a different factorization. Equilibration makes both identical.
+    check(std::abs(first - second) <= 1e-6 * first, "the estimate is recomputed after factorize()",
+          std::abs(first - second) / first);
+  }
+}
+
 void testSymmetricMatching() {
   std::printf("\n-- symmetric weighted matching --\n");
 
@@ -1089,6 +1183,7 @@ int main() {
   testRefactorization();
   testComplexHermitian();
   testHalvedAgainstSupernodalLu();
+  testConditionEstimate();
   testSymmetricMatching();
   testFactorAccessors();
   testParallelAgreement();

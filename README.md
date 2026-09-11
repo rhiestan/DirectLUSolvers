@@ -130,7 +130,7 @@ solver.factorize(A2);
 | `src/LeftRightLU.h` | The [PARDISO-style sibling solver](doc/LeftRightLU.md). Reuses the shared support/matching/executor headers; self-contained otherwise. |
 | `src/LeftRightLU` | Umbrella header for `LeftRightLU`, `#include <LeftRightLU>`. |
 | `src/LeftRightLUBlockTriangular.h` | Block triangular form: strongly connected components of the matched matrix, the second half of the Dulmage–Mendelsohn decomposition (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
-| `src/LeftRightLUConditionEstimate.h` | Hager-Higham 1-norm condition estimation and the Oettli-Prager componentwise backward error — what lets a caller tell a 13-digit answer from a 2-digit one (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
+| `src/LeftRightLUConditionEstimate.h` | Hager-Higham 1-norm condition estimation and the Oettli-Prager componentwise backward error — what lets a caller tell a 13-digit answer from a 2-digit one (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Shared by `LeftRightLU`, `SupernodalLDLT` and `RobustLU` despite the name. Eigen only. |
 | `src/LeftRightLUExtendedResidual.h` | Double-double (compensated) residuals for iterative refinement — what turns refinement's small *backward* error into a small *forward* one. Portable software arithmetic, not `long double`. Eigen only. |
 | `src/PointBlockLU.h` | The [unsymmetric-pattern solver](doc/PointBlockLU.md) with refactorization replay. |
 | `src/PointBlockLU` | Umbrella header for `PointBlockLU`, `#include <PointBlockLU>`. |

@@ -73,6 +73,14 @@
 // worse than SupernodalLU even so: half the flops sit against the same fixed
 // costs, and there is one panel per supernode to chunk rather than two.
 //
+// A SMALL RESIDUAL IS NOT AN ACCURATE ANSWER, and on a badly scaled matrix the
+// two come apart completely: measured here, a residual of 1.1e-16 next to a
+// forward error of 4.3e-05, reported as Success. That report is CORRECT -- the
+// factorization is backward stable and the error is the matrix's conditioning --
+// but nothing in a residual can say so. conditionEstimate() is what can, and it
+// is nearly free because A is Hermitian: A^-H and A^-1 are the same operator, so
+// the Hager-Higham estimator's two callbacks coincide.
+//
 // Usage:
 //   #include <SupernodalLDLT.h>
 //   Eigen::SupernodalLDLT<Eigen::SparseMatrix<double>> solver;   // Lower by default
@@ -98,6 +106,7 @@
 #include "SupernodalLUSymbolic.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLDLTMatching.h"
+#include "LeftRightLUConditionEstimate.h"
 
 namespace Eigen {
 
@@ -323,6 +332,48 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
    *  happened. */
   PermutationType factorPermutation() const;
 
+  /** Hager-Higham estimate of kappa_1 of the operator this factorization
+   *  inverts. Computed on FIRST CALL and cached until the next factorize(); it
+   *  costs a handful of triangular solves, so a caller who does not ask pays
+   *  nothing.
+   *
+   *  WHY IT IS WORTH ASKING FOR. A small residual says the computed x solves a
+   *  nearby system; it says nothing about how far x is from the solution of the
+   *  system you asked about. Those come apart badly on a poorly scaled matrix,
+   *  and solve() cannot tell from the residual alone -- measured on a symmetric
+   *  matrix whose row magnitudes span 10^+-6, this solver returns a residual of
+   *  1.3e-16 next to a forward error of 3e-05, and reports Success. It is right
+   *  to: the factorization IS backward stable and the error is the matrix's
+   *  conditioning. But only a kappa makes that visible, which is what this is.
+   *
+   *  Pair it with solveResidual() through
+   *  left_right_lu::estimateForwardError(kappa, omega) for the standard
+   *  first-order bound. The estimate is a LOWER bound on ||A^-1||_1 (Hager's
+   *  algorithm maximises over a subset of the unit ball), and it describes the
+   *  operator the factors represent -- under static pivoting a perturbed A, so
+   *  read it next to replacedPivots(). */
+  RealScalar conditionEstimate() const {
+    eigen_assert(m_factorized && "conditionEstimate() before a successful factorize()");
+    if (m_conditionEstimate >= RealScalar(0)) return m_conditionEstimate;
+    if (m_size == 0) return m_conditionEstimate = RealScalar(0);
+    // A is Hermitian, so A^-H and A^-1 are the SAME operator and the estimator's
+    // two callbacks coincide -- which is the whole reason a solver with no
+    // condition estimator of its own can have one for the price of the generic
+    // routine. The factor solve is used directly rather than solve(), both
+    // because that is the operator being described and because solve() would
+    // overwrite the residual and info() this class reports.
+    typedef Matrix<Scalar, Dynamic, 1> EstimatorVector;
+    auto apply = [this](const EstimatorVector& in, EstimatorVector& out) {
+      const DenseMatrix rhs = in;
+      DenseMatrix x(m_size, 1);
+      solveTriangular(rhs, x);
+      out = x.col(0);
+    };
+    const RealScalar invNorm = left_right_lu::oneNormEstimate<Scalar>(Index(m_size), apply, apply);
+    m_conditionEstimate = symmetricOneNorm() * invNorm;
+    return m_conditionEstimate;
+  }
+
   /** Relative residual ||b - Ax|| / ||b|| measured by the last solve(). */
   RealScalar solveResidual() const { return m_lastSolveRelativeResidual; }
   /** Refinement steps taken by the last solve(). */
@@ -449,9 +500,11 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
    *  gated on perturbation -- see setRefineOnlyIfPerturbed.
    *
    *  Stationary refinement is the right tool here only for small corrections;
-   *  the natural Krylov method for a symmetric operator is conjugate gradients,
-   *  or MINRES when it is indefinite, not the BiCGStab the unsymmetric siblings
-   *  default to. */
+   *  Stationary and not Krylov, unlike the unsymmetric siblings, and that is a
+   *  measured choice rather than an omission: static pivoting bounds the
+   *  perturbation at sqrt(eps), so this is a Richardson iteration contracting by
+   *  ~1e-8 a step and TWO steps reach machine precision. See the documentation
+   *  for the MINRES measurement that did not justify itself. */
   void setMaxIterativeRefinements(Index iters) { m_maxRefinementIterations = iters; }
   Index maxIterativeRefinements() const { return m_maxRefinementIterations; }
   void setRefinementTolerance(const RealScalar& tol) { m_refinementTolerance = tol; }
@@ -562,6 +615,7 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
     m_intraSupernodes = 0;
     m_inertia = supernodal_ldlt::Inertia();
     m_lastSolveRelativeResidual = RealScalar(0);
+    m_conditionEstimate = RealScalar(-1);
     m_lastRefinementIterations = 0;
     m_nnzL = 0;
     m_isInitialized = false;
@@ -636,6 +690,25 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
 
   // Symmetric Ruiz equilibration: one scaling vector applied on both sides.
   void computeEquilibration(const MatrixType& matrix);
+
+  /** ||A||_1 of the FULL symmetric matrix from the one triangle that is stored:
+   *  a stored off-diagonal entry contributes to the absolute column sum of both
+   *  its column and its row. Forming the full matrix to ask Eigen would cost more
+   *  than the estimate it feeds. */
+  RealScalar symmetricOneNorm() const {
+    std::vector<RealScalar> colSum(static_cast<std::size_t>(m_size), RealScalar(0));
+    for (StorageIndex j = 0; j < m_size; ++j)
+      for (typename MatrixType::InnerIterator it(m_originalMatrix, j); it; ++it) {
+        const StorageIndex i = static_cast<StorageIndex>(it.index());
+        if (!inputTriangleHolds(i, j)) continue;
+        const RealScalar a = numext::abs(it.value());
+        colSum[static_cast<std::size_t>(j)] += a;
+        if (i != j) colSum[static_cast<std::size_t>(i)] += a;
+      }
+    RealScalar best(0);
+    for (const RealScalar& v : colSum) best = numext::maxi(best, v);
+    return best;
+  }
 
   /** Everything one update needs to borrow rather than allocate. Caller-owned
    *  rather than a member: these run concurrently across a level, so a shared
@@ -874,6 +947,8 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   supernodal_ldlt::Inertia m_inertia;
   RealScalar m_refinementTolerance, m_solveFailureThreshold;
   mutable RealScalar m_lastSolveRelativeResidual;
+  // Negative until asked for; reset by every factorize().
+  mutable RealScalar m_conditionEstimate;
   mutable Index m_lastRefinementIterations;
   Index m_nnzL;
 };
@@ -1654,6 +1729,7 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
   m_pivot2x2Count = 0;
   m_straddlingPivots = 0;
   m_intraSupernodes = 0;
+  m_conditionEstimate = RealScalar(-1);  // the factors are changing; re-estimate on demand
   m_inertia = supernodal_ldlt::Inertia();
   m_lastError.clear();
   m_info = Success;
