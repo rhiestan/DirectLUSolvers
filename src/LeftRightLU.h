@@ -81,6 +81,7 @@
 #include "LeftRightLUConditionEstimate.h"
 #include "LeftRightLUExtendedResidual.h"
 #include "SupernodalLUSupport.h"
+#include "SupernodalLUSymbolic.h"
 #include "SupernodalLUExecutor.h"
 #include "SupernodalLUMatching.h"
 #include "SupernodalLUMC64.h"
@@ -978,14 +979,22 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   // order; the ordering only permutes within them.
   void orderWithinBlocks(const MatrixType& B, const std::vector<StorageIndex>& btfPosition,
                          const std::vector<StorageIndex>& blockPtr);
-  void computeEliminationTree(const std::vector<std::vector<StorageIndex>>& adjacency,
-                              std::vector<StorageIndex>& parent) const;
-  void computePostorder(const std::vector<StorageIndex>& parent, std::vector<StorageIndex>& postorder) const;
-  void computeSupernodePartition(const std::vector<std::vector<StorageIndex>>& adjacency,
-                                 const std::vector<StorageIndex>& parent,
-                                 std::vector<std::vector<StorageIndex>>& supernodeOffDiagRows);
-  void buildRowBlocksAndUpdateSources(const std::vector<std::vector<StorageIndex>>& supernodeOffDiagRows);
-  void computeSupernodeLevels();
+  // The rest of the symbolic pipeline -- elimination tree, postorder, supernode
+  // partition, block structure, update lists, scheduling levels -- depends on the
+  // pattern alone and lives in SupernodalLUSymbolic.h, shared with this project's
+  // other supernodal solvers. Only the steps that read THIS solver's matrix,
+  // numbering and BTF block structure are members.
+
+  // The amalgamation/splitting knobs, packaged for the shared partition pass.
+  supernodal_lu::symbolic::PartitionOptions partitionOptions() const {
+    supernodal_lu::symbolic::PartitionOptions options;
+    options.relaxedSize = m_relaxedSize;
+    options.maxZeroRows = m_maxAmalgamationZeroRows;
+    options.fillFraction = m_amalgamationFillFraction;
+    options.maxBlockSize = m_maxBlockSize;
+    return options;
+  }
+
   // build the reverse assembly-DAG edges: m_consumers[s] = supernodes that s
   // updates (targets t with s in m_updateSources[t]). Drives the right-looking
   // readiness push in the dynamic scheduler.
@@ -1480,246 +1489,12 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::relabelAdjacency(
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
-void LeftRightLU<MatrixType, OrderingType, Executor>::computeEliminationTree(
-    const std::vector<std::vector<StorageIndex>>& adjacency, std::vector<StorageIndex>& parent) const {
-  const StorageIndex n = m_size;
-  parent.assign(n, StorageIndex(-1));
-  std::vector<StorageIndex> ancestor(n, StorageIndex(-1));
-  for (StorageIndex j = 0; j < n; ++j) {
-    for (StorageIndex neighbor : adjacency[j]) {
-      if (neighbor >= j) continue;
-      StorageIndex r = neighbor;
-      while (ancestor[r] != StorageIndex(-1) && ancestor[r] != j) {
-        StorageIndex next = ancestor[r];
-        ancestor[r] = j;
-        r = next;
-      }
-      if (ancestor[r] == StorageIndex(-1)) {
-        ancestor[r] = j;
-        parent[r] = j;
-      }
-    }
-  }
-}
-
-template <typename MatrixType, typename OrderingType, typename Executor>
-void LeftRightLU<MatrixType, OrderingType, Executor>::computePostorder(
-    const std::vector<StorageIndex>& parent, std::vector<StorageIndex>& postorder) const {
-  const StorageIndex n = m_size;
-  std::vector<StorageIndex> childHead(n, StorageIndex(-1));
-  std::vector<StorageIndex> childNext(n, StorageIndex(-1));
-  for (StorageIndex j = n - 1; j >= 0; --j) {
-    if (parent[j] != StorageIndex(-1)) {
-      childNext[j] = childHead[parent[j]];
-      childHead[parent[j]] = j;
-    }
-    if (j == 0) break;
-  }
-  postorder.clear();
-  postorder.reserve(n);
-  std::vector<StorageIndex> stack;
-  std::vector<StorageIndex> nextChild = childHead;
-  for (StorageIndex root = 0; root < n; ++root) {
-    if (parent[root] != StorageIndex(-1)) continue;
-    stack.push_back(root);
-    while (!stack.empty()) {
-      StorageIndex node = stack.back();
-      StorageIndex child = nextChild[node];
-      if (child != StorageIndex(-1)) {
-        nextChild[node] = childNext[child];
-        stack.push_back(child);
-      } else {
-        postorder.push_back(node);
-        stack.pop_back();
-      }
-    }
-  }
-}
-
-template <typename MatrixType, typename OrderingType, typename Executor>
-void LeftRightLU<MatrixType, OrderingType, Executor>::computeSupernodePartition(
-    const std::vector<std::vector<StorageIndex>>& adjacency, const std::vector<StorageIndex>& parent,
-    std::vector<std::vector<StorageIndex>>& supernodeOffDiagRows) {
-  const StorageIndex n = m_size;
-  m_supernodes.clear();
-  m_supernodeOfColumn.assign(n, 0);
-  supernodeOffDiagRows.clear();
-  if (n == 0) return;
-
-  std::vector<std::vector<StorageIndex>> children(n);
-  for (StorageIndex j = 0; j < n; ++j)
-    if (parent[j] != StorageIndex(-1)) children[parent[j]].push_back(j);
-
-  // Per-column symbolic fill via Liu's children-merge (sorted set-unions), with
-  // each column's list freed the moment its elimination-tree parent consumes it.
-  std::vector<std::vector<StorageIndex>> columnStructure(n);
-  std::vector<StorageIndex> scratch, scratch2;
-
-  auto rowsBeyond = [](const std::vector<StorageIndex>& structure, StorageIndex col) -> StorageIndex {
-    return static_cast<StorageIndex>(structure.end() - std::upper_bound(structure.begin(), structure.end(), col));
-  };
-  auto closeSupernode = [&](StorageIndex lastColumn, const std::vector<StorageIndex>& structure) {
-    auto tailBegin = std::upper_bound(structure.begin(), structure.end(), lastColumn);
-    supernodeOffDiagRows.emplace_back(tailBegin, structure.end());
-  };
-
-  Supernode s0;
-  s0.firstColumn = 0;
-  s0.lastColumn = 0;
-  m_supernodes.push_back(s0);
-  StorageIndex currentStart = 0;
-
-  for (StorageIndex j = 0; j < n; ++j) {
-    const auto& adjJ = adjacency[j];
-    auto adjBeyond = std::upper_bound(adjJ.begin(), adjJ.end(), j);
-    scratch.assign(adjBeyond, adjJ.end());
-    for (StorageIndex c : children[j]) {
-      const std::vector<StorageIndex>& cs = columnStructure[c];
-      auto childBeyond = std::upper_bound(cs.begin(), cs.end(), j);
-      if (childBeyond == cs.end()) continue;
-      // Write into a PRE-SIZED buffer rather than through back_inserter. The
-      // union can never exceed the sum of its inputs, so sizing scratch2 to
-      // that bound up front lets set_union store through a contiguous iterator
-      // -- a plain pointer write per element -- instead of a push_back whose
-      // capacity check on every element also defeats any bulk copy of the tail
-      // that remains when one input runs out. Same result, and this is the
-      // single hottest line in analyzePattern.
-      scratch2.resize(scratch.size() + static_cast<std::size_t>(cs.end() - childBeyond));
-      const auto unionEnd =
-          std::set_union(scratch.begin(), scratch.end(), childBeyond, cs.end(), scratch2.begin());
-      scratch2.resize(static_cast<std::size_t>(unionEnd - scratch2.begin()));
-      scratch.swap(scratch2);
-    }
-    columnStructure[j].clear();
-    columnStructure[j].reserve(scratch.size() + 1);
-    columnStructure[j].push_back(j);
-    columnStructure[j].insert(columnStructure[j].end(), scratch.begin(), scratch.end());
-
-    if (j > 0) {
-      const std::vector<StorageIndex>& structPrev = columnStructure[j - 1];
-      const std::vector<StorageIndex>& structJ = columnStructure[j];
-      bool start;
-      if (parent[j - 1] != j) {
-        start = true;  // mandatory structural boundary
-      } else if (children[j].size() == 1 && rowsBeyond(structJ, j) == rowsBeyond(structPrev, j)) {
-        // Fundamental continuation: one child AND the same off-diagonal row set,
-        // so the merge is free. The structure half matters on chain elimination
-        // trees (banded matrices), where the etree conditions alone hold at every
-        // column and would collapse the whole matrix into one dense supernode.
-        // See the fuller note in SupernodalLU.h's computeSupernodePartition.
-        start = false;
-      } else {
-        const StorageIndex childWidth = j - currentStart;
-        const StorageIndex existingRows = rowsBeyond(structPrev, j);
-        const StorageIndex deltaRows = rowsBeyond(structJ, j) - existingRows;
-        const bool merge =
-            (static_cast<Index>(childWidth) < m_relaxedSize) ||
-            (static_cast<Index>(deltaRows) <= m_maxAmalgamationZeroRows) ||
-            (static_cast<double>(deltaRows) <= m_amalgamationFillFraction * static_cast<double>(existingRows));
-        start = !merge;
-      }
-      if (m_maxBlockSize > 0 && static_cast<Index>(j - currentStart) >= m_maxBlockSize) start = true;
-
-      if (start) {
-        closeSupernode(static_cast<StorageIndex>(j - 1), structPrev);
-        if (parent[j - 1] == StorageIndex(-1)) std::vector<StorageIndex>().swap(columnStructure[j - 1]);
-        Supernode s;
-        s.firstColumn = j;
-        s.lastColumn = j;
-        m_supernodes.push_back(s);
-        currentStart = j;
-      } else {
-        m_supernodes.back().lastColumn = j;
-      }
-    }
-    m_supernodeOfColumn[j] = static_cast<StorageIndex>(m_supernodes.size() - 1);
-    for (StorageIndex c : children[j]) std::vector<StorageIndex>().swap(columnStructure[c]);
-  }
-  closeSupernode(static_cast<StorageIndex>(n - 1), columnStructure[n - 1]);
-}
-
-template <typename MatrixType, typename OrderingType, typename Executor>
-void LeftRightLU<MatrixType, OrderingType, Executor>::buildRowBlocksAndUpdateSources(
-    const std::vector<std::vector<StorageIndex>>& supernodeOffDiagRows) {
-  m_rowBlocks.clear();
-  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
-    Supernode& sn = m_supernodes[s];
-    const std::vector<StorageIndex>& structure = supernodeOffDiagRows[s];
-    sn.firstRowBlock = static_cast<StorageIndex>(m_rowBlocks.size());
-    sn.rowBlockCount = 0;
-    sn.offDiagonalRowCount = 0;
-
-    StorageIndex offset = 0;
-    bool inBlock = false;
-    RowBlock current;
-    for (StorageIndex r : structure) {
-      const StorageIndex facing = m_supernodeOfColumn[r];
-      if (inBlock && r == current.lastRow + 1 && facing == current.facingSupernode) {
-        current.lastRow = r;
-      } else {
-        if (inBlock) {
-          m_rowBlocks.push_back(current);
-          ++sn.rowBlockCount;
-          offset += current.height();
-        }
-        current.firstRow = r;
-        current.lastRow = r;
-        current.facingSupernode = facing;
-        current.panelOffset = offset;
-        inBlock = true;
-      }
-    }
-    if (inBlock) {
-      m_rowBlocks.push_back(current);
-      ++sn.rowBlockCount;
-      offset += current.height();
-    }
-    sn.offDiagonalRowCount = offset;
-  }
-
-  m_updateSources.assign(supernodeNbr, std::vector<UpdateSource>());
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
-    const Supernode& sn = m_supernodes[s];
-    StorageIndex previousFacing = StorageIndex(-1);
-    for (StorageIndex b = 0; b < sn.rowBlockCount; ++b) {
-      const StorageIndex blockIndex = sn.firstRowBlock + b;
-      const RowBlock& block = m_rowBlocks[blockIndex];
-      if (block.facingSupernode != previousFacing) {
-        UpdateSource src;
-        src.sourceSupernode = s;
-        src.facingRowBlock = blockIndex;
-        m_updateSources[block.facingSupernode].push_back(src);
-        previousFacing = block.facingSupernode;
-      }
-    }
-  }
-}
-
-template <typename MatrixType, typename OrderingType, typename Executor>
 void LeftRightLU<MatrixType, OrderingType, Executor>::buildConsumerLists() {
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   m_consumers.assign(supernodeNbr, std::vector<StorageIndex>());
   for (StorageIndex t = 0; t < supernodeNbr; ++t)
     for (const UpdateSource& src : m_updateSources[t])
       m_consumers[src.sourceSupernode].push_back(t);
-}
-
-template <typename MatrixType, typename OrderingType, typename Executor>
-void LeftRightLU<MatrixType, OrderingType, Executor>::computeSupernodeLevels() {
-  const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
-  std::vector<StorageIndex> level(supernodeNbr, 0);
-  StorageIndex maxLevel = 0;
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) {
-    StorageIndex lv = 0;
-    for (const UpdateSource& src : m_updateSources[s])
-      lv = std::max<StorageIndex>(lv, static_cast<StorageIndex>(level[src.sourceSupernode] + 1));
-    level[s] = lv;
-    maxLevel = std::max(maxLevel, lv);
-  }
-  m_levelGroups.assign(supernodeNbr == 0 ? 0 : (maxLevel + 1), std::vector<StorageIndex>());
-  for (StorageIndex s = 0; s < supernodeNbr; ++s) m_levelGroups[level[s]].push_back(s);
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
@@ -1875,15 +1650,16 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   // 2) elimination tree of the ordered, symmetrized (B + B^T) pattern. The
   //    pattern itself is numbering-independent, so it is built once here and
   //    only relabelled below.
+  namespace symbolic = supernodal_lu::symbolic;
   buildSymmetrizedPattern(B, blockOfB);
   std::vector<std::vector<StorageIndex>> adjacency;
   relabelAdjacency(adjacency);
   std::vector<StorageIndex> parent;
-  computeEliminationTree(adjacency, parent);
+  symbolic::computeEliminationTree(n, adjacency, parent);
 
   // 3) postorder + fold into the internal numbering (contiguous supernodes).
   std::vector<StorageIndex> postorder;
-  computePostorder(parent, postorder);
+  symbolic::computePostorder(n, parent, postorder);
   std::vector<StorageIndex> relabel(n);
   for (StorageIndex t = 0; t < n; ++t) relabel[postorder[t]] = t;
   for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = relabel[m_toInternal[i]];
@@ -1892,21 +1668,24 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   //    after this, and it is O(nnz) of the input -- tens of MB on a large matrix
   //    -- so release it rather than carry it for the solver's lifetime.
   relabelAdjacency(adjacency);
-  computeEliminationTree(adjacency, parent);
+  symbolic::computeEliminationTree(n, adjacency, parent);
   std::vector<std::size_t>().swap(m_patternStart);
   std::vector<StorageIndex>().swap(m_patternIndex);
 
   // 5) symbolic factorization + supernode partition (streaming).
   std::vector<std::vector<StorageIndex>> supernodeOffDiagRows;
-  computeSupernodePartition(adjacency, parent, supernodeOffDiagRows);
+  symbolic::computeSupernodePartition(n, adjacency, parent, partitionOptions(), m_supernodes,
+                                      m_supernodeOfColumn, supernodeOffDiagRows);
 
   // 6) block structure + update-source lists.
-  buildRowBlocksAndUpdateSources(supernodeOffDiagRows);
+  symbolic::buildRowBlocksAndUpdateSources(supernodeOffDiagRows, m_supernodeOfColumn, m_supernodes,
+                                           m_rowBlocks, m_updateSources);
 
   // 7) reverse assembly-DAG edges (consumer lists) for the dynamic scheduler,
   //    and tree levels for diagnostics.
   buildConsumerLists();
-  computeSupernodeLevels();
+  symbolic::computeSupernodeLevels(static_cast<StorageIndex>(m_supernodes.size()), m_updateSources,
+                                   m_levelGroups);
 
   m_toOriginal.resize(n);
   for (StorageIndex i = 0; i < n; ++i) m_toOriginal[m_toInternal[i]] = i;
