@@ -114,25 +114,82 @@ that the search costs them something.
 **No unsymmetric matching, and that is not a gap.** The LU siblings permute rows to put large
 entries on the diagonal (MC64/transversal). That is an *unsymmetric* row permutation: applying
 it to a symmetric matrix destroys the symmetry this solver exploits. The symmetric analogue is
-Duff–Pralet matching, noted below, not MC64 as the LU solvers use it.
+the Duff–Pralet matching below, which is read as a *pairing* rather than applied as a row
+permutation.
+
+## When the diagonal itself is the problem
+
+Bunch–Kaufman can only pivot **inside a supernode**. If the ordering never puts a usable 2×2
+candidate there, the solver perturbs its way through the factorization and the answer is
+flagged but worthless. `setMatching(true)` fixes that upstream rather than downstream: a
+symmetric weighted matching (Duff–Pralet) pairs columns into 2×2 candidates and keeps each pair
+together through the ordering by ordering the **quotient graph**, so the pivot the numeric
+phase wants is where it can reach it. See [`SupernodalLDLTMatching.h`](../src/SupernodalLDLTMatching.h)
+for the cycle argument.
+
+Measured here (`clang 22, -O3`), matching **off → on**:
+
+| matrix | pairs | perturbed pivots | `nnzL` | factor (ms) | forward error |
+|---|--:|--:|--:|--:|---|
+| SPD `lap2d 120²` | 0 | 0 → 0 | 381k → 381k | 9.6 → 9.5 | 4.6e-15 → 4.6e-15 |
+| KKT, `H` **has** a diagonal | 1174 | 0 → 0 | 299k → **597k** | 13 → **36** | 2.5e-15 → 8.6e-16 |
+| KKT, `H` diagonal removed | 1998 | 0 → 30 | 1.70M → 752k | 60 → 45 | 7.3e-11 → **5.4e-15** |
+| KKT, larger | 5749 | 0 → 60 | 14.8M → 8.2M | 1484 → 1315 | 3.3e-10 → **1.2e-14** |
+| zero diagonal, n=2000 | 999 | 289 → 8 | 979k → 580k | 63 → 34 | **5.6e+04** → 3.6e-15 |
+| zero diagonal, n=8000 | 3998 | 1189 → 20 | 15.7M → 9.1M | 3980 → 1587 | **2.4e+17** → 5.8e-14 |
+
+The bottom two rows are matrices this solver **cannot solve at all** without matching — it
+perturbs 15% of the pivots and flags the result. With matching they solve to machine precision,
+in *less* time and *less* fill.
+
+**It is off by default, and the second row is why.** A saddle-point system that already had a
+usable diagonal gains nothing numerically and pays 2× the fill and 3× the factorization time
+for pairs the numeric phase then declines. The matching cannot tell the two cases apart in
+advance; `replacedPivots()` can, after the fact, and it is the number to watch. On an SPD matrix
+the matching forms no pair at all — every cycle is a fixed point — so it costs only its own
+analysis (~40% of analyze time) and changes nothing else, bit for bit.
+
+`matchedPairs()` reports the pairs formed. Comparing it against `pivotBlocks2x2()` shows how
+many the numeric phase looked at and declined, which is the design working rather than failing:
+the matching's job is to make the good pivot *available*, not to force it.
 
 ## Not implemented yet
 
 Stated so it is not mistaken for an oversight:
 
-- **Intra-supernode parallelism.** Factorization is dispatched over elimination-tree levels
-  only, so the few enormous root separators run on one lane. [Parallelism](Parallelism.md)
-  records that intra-supernode chunking is where most of `SupernodalLU`'s parallel speedup
-  comes from, so expect this solver to *scale* worse than that one until it is ported, even
-  though its serial work is smaller.
-- **Symmetric weighted matching (Duff–Pralet).** Bunch–Kaufman chooses pivots *inside* a
-  supernode; a matching would choose a better diagonal before the ordering ever runs, which is
-  what an indefinite matrix with a genuinely awkward diagonal wants.
 - **A blocked Bunch–Kaufman kernel.** The dense diagonal-block factorization is unblocked,
   deliberately: the block is capped by `setMaxBlockSize` (128) and the BLAS-3 work that matters
   is the off-diagonal panel, so a worse constant on a small term does not show up in the
   measurements above.
-- **`matrixL()` / `vectorD()`** factor accessors.
+- **A Krylov refinement option.** Refinement here is stationary. The natural Krylov method for
+  this operator is CG when it is definite and MINRES when it is not, not the BiCGStab the
+  unsymmetric siblings default to.
+- **Duff–Pralet *scaling*.** The matching's dual variables also yield a symmetric scaling; this
+  solver uses its own symmetric Ruiz equilibration instead, computed from the matrix.
+
+## The factors
+
+`matrixL()`, `matrixD()`, `vectorD()`, `scalingS()` and `factorPermutation()` materialize the
+factorization for inspection or export. They allocate and walk the whole factor, so they are
+not a path to a faster solve — `solve()` reads the panel arena directly. What they satisfy:
+
+```
+L * D * L^H  ==  P (S A S) P^T
+```
+
+with `S = scalingS()` and `P = factorPermutation()`. **`P` is not `permutation()`**: it also
+carries the local symmetric interchanges Bunch–Kaufman chose inside each diagonal block. The
+two coincide exactly when nothing was interchanged, which is every `Pivoting::None`
+factorization and most positive definite ones.
+
+That distinction is the whole difficulty of assembling a standalone `L`. The solve gets to
+*defer* each supernode's interchange until it reaches that supernode — which is precisely why
+the Schur complement a supernode sends out is invariant to its local permutation — so the
+stored off-diagonal panels sit in un-permuted global rows. `matrixL()` has to pay that deferral
+off, mapping every panel row through the interchange of the supernode that owns it.
+
+`vectorD()` is the whole of `D` exactly when `pivotBlocks2x2()` is `0`; otherwise each 2×2 block
+also carries an off-diagonal that lives only in `matrixD()`.
 
 ## Storage
 
@@ -184,14 +241,22 @@ behave identically because they drive the same code:
 - **`setSolveFailureThreshold(RealScalar)`** (default `1e-6`) — `solve()` measures the true
   relative residual against the original operator and downgrades `info()` rather than return a
   bad answer silently. `solveResidual()` reports the measured value.
+- **`setMatching(bool)`** (default **off**) — symmetric weighted matching before the ordering;
+  see [above](#when-the-diagonal-itself-is-the-problem). Turn it on when `replacedPivots()` is
+  large; it is a 2×-fill, 3×-time regression on a matrix that does not need it.
 - **`setParallelSolve(bool)`** (default **on**) — dispatch the triangular sweeps across the
   `Executor` over elimination-tree levels. Systems below `rows × nrhs = 200000` stay serial.
+- **`setIntraSupernodeParallelism(bool)`** (default **on**) — on a level too narrow to fill the
+  executor, run its supernodes sequentially and split their panel work across the pool instead.
+  See [below](#parallelism).
 
 Diagnostics: `info()`, `isFactorized()`, `lastErrorMessage()`,
 `notPositiveDefiniteColumn()`, `replacedPivots()`, `pivotBlocks2x2()`, `straddlingPivots()`,
-`inertia()`, `nnzL()`, `predictedFactorNonzeros()`, `supernodeCount()`, `levelCount()`,
-`permutation()`, `solveResidual()`, `iterativeRefinements()`, `determinant()`,
-`determinantSign()`, `logAbsDeterminant()`.
+`matchedPairs()`, `inertia()`, `nnzL()`, `predictedFactorNonzeros()`, `supernodeCount()`,
+`levelCount()`, `intraParallelSupernodes()`, `permutation()`, `factorPermutation()`,
+`solveResidual()`, `iterativeRefinements()`, `determinant()`, `determinantSign()`,
+`logAbsDeterminant()`, and the factor accessors `matrixL()`, `matrixD()`, `vectorD()`,
+`scalingS()`.
 
 `determinant()` overflows on moderately sized systems exactly as it does on the LU solvers —
 prefer `logAbsDeterminant()` with `determinantSign()`. `L` is unit triangular and the
@@ -268,6 +333,42 @@ Eigen's AMD and METIS functors symmetrize whatever they are given, so passing a 
 triangle orders the same graph the factorization eliminates. See
 [HeaderOnlyMetis](HeaderOnlyMetis.md).
 
+## Parallelism
+
+Factorization is dispatched over elimination-tree levels, and a level too narrow to fill the
+executor switches to **intra-supernode** parallelism instead: its supernodes run sequentially
+and their panel work is split across the pool by disjoint row ranges. This is the same
+mechanism, and the same tuning constants, as
+[`SupernodalLU`](Parallelism.md)'s — the quantity being traded off, panel rows per lane against
+dispatch overhead, is identical.
+
+It matters more here than the option surface suggests, because level dispatch on its own is
+nearly useless on a 3D problem. `lap3d 40³`, factor ms, `PooledExecutor`:
+
+| lanes | level dispatch only | + intra-supernode | chunked supernodes |
+|--:|--:|--:|--:|
+| 1 | 2342 | 2347 | 0 |
+| 4 | 2159 | 1431 | 33 |
+| 16 | 2061 | **884** | 47 |
+| 32 | 2064 | 1031 | 55 |
+
+Level dispatch alone reaches 1.14× at 16 lanes; with chunking the same matrix reaches **2.65×**.
+The reason is Amdahl's, not a defect: the root-separator chain is a handful of supernodes
+carrying most of the time, and there is no inter-supernode parallelism there to find. The
+`chunked supernodes` column is `intraParallelSupernodes()` — 47 of 6,000-odd, and they are where
+the factorization lives.
+
+**It still scales less well than `SupernodalLU`.** On the same harness at `lap3d 30³`, LU
+reaches 3.18× at 32 lanes against this solver's 1.87× at 16 (and 32 lanes is a regression here,
+as over-subscription of 16 physical cores). So the serial 1.93× advantage narrows as lanes are
+added — `LU/LDLT` falls from 1.96× at one lane to 1.54× at 16 — and past roughly 16 lanes on
+these matrices `SupernodalLU` can win outright. Two structural reasons: half the flops sit
+against the same fixed dispatch costs, and there is one panel per supernode to chunk here
+rather than two.
+
+Results do not depend on any of this. Chunks write disjoint elements and leave each element's
+accumulation order unchanged, so the answer is the same whichever path runs.
+
 ## Testing
 
 ```sh
@@ -289,6 +390,26 @@ the inertia. Beyond accuracy and the determinant, it pins the three things speci
   on complex input. Dropping it makes the solver factor the (non-Hermitian) *symmetric* matrix
   instead, which still runs and gives a wrong answer — so there is a complex Hermitian case
   with an exact right-hand side.
+
+Three more properties are pinned because each could regress silently:
+
+- **Intra-supernode parallelism agrees with level dispatch** on an *indefinite* matrix — the
+  chunked update kernel has to reproduce a 2×2 pivot's row mixing, which a positive definite
+  matrix never exercises. `intraParallelSupernodes()` is asserted non-zero first, so the rest of
+  that test cannot pass vacuously.
+- **`matrixL()` and `matrixD()` reconstruct the matrix**, on an SPD matrix (no interchange, so
+  `factorPermutation() == permutation()`) and on an indefinite one (interchanges, and the two
+  permutations must then *differ*). `L` is also required to be exactly unit lower triangular,
+  not merely close.
+- **Matching changes nothing it should not.** On an SPD matrix it must form no pair and return a
+  bit-identical answer; on a zero-diagonal matrix it must cut perturbed pivots by an order of
+  magnitude and solve what the unmatched path cannot.
+
+A note on what is *not* asserted there: the zero-diagonal matrices agree across `Lower`, `Upper`
+and a full input to rounding rather than bit for bit. They perturb pivots, so refinement runs,
+and refinement's residual goes through `selfadjointView<UpLo>() * x` — which sums the same
+numbers in a different order depending on which triangle is stored. The factorizations are
+identical; the last bits of the refined answer are not.
 
 For the indefinite path specifically:
 

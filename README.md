@@ -59,7 +59,11 @@ Practical guidance:
   only assemble half. **Indefinite is fine** — 2×2 Bunch–Kaufman pivots cover saddle-point and
   KKT systems, and `inertia()` then reports the eigenvalue signs for free. Positive
   definiteness needs no declaring; `setPivoting(None)` is a fast path that assumes it and
-  reports if it was wrong.
+  reports if it was wrong. If `replacedPivots()` comes back large, the diagonal is the problem:
+  `setMatching(true)` pairs columns into 2×2 candidates before the ordering and solves matrices
+  that are otherwise out of reach (a zero-diagonal system goes from a flagged `2e17` residual to
+  machine precision, in less time and less fill). It is off by default because it is a 2×-fill
+  regression on a matrix that does not need it.
 - **Start with `LeftRightLU`** for anything else. It takes any pattern, matches `SupernodalLU`
   on symmetric-pattern matrices, and is far ahead of it on unsymmetric ones (`gemat11` 9.1 ms
   against 1415 ms).
@@ -69,7 +73,7 @@ Practical guidance:
 - **`SupernodalLU` is the reference implementation** of the shared analysis pipeline and the
   option surface; reach for it when your pattern is symmetric anyway and you want tree-parallel
   BLAS-3 factorization.
-- **Use [`RobustLU`](doc/RobustLU.md) when you cannot inspect the matrix yourself** — it runs `LeftRightLU`, measures the backward error, and escalates to MC64 matching, true partial pivoting, or a rank-revealing QR only when the diagnosis calls for it. On this project's SuiteSparse tier it costs 19 of 33 matrices exactly one factorization, rescues 6 that would otherwise fail — two of them by reporting a **rank** and a least-squares answer where no LU exists — and stops with a diagnosis on the rest rather than thrashing.
+- **Use [`RobustLU`](doc/RobustLU.md) when you cannot inspect the matrix yourself** — it takes the `LDL^T` shortcut when the matrix turns out symmetric and the factorization is unambiguously good, and otherwise runs `LeftRightLU`, measures the backward error, and escalates to MC64 matching, true partial pivoting, or a rank-revealing QR only when the diagnosis calls for it. On this project's SuiteSparse tier it costs 19 of 33 matrices exactly one factorization, rescues 6 that would otherwise fail — two of them by reporting a **rank** and a least-squares answer where no LU exists — and stops with a diagnosis on the rest rather than thrashing.
 - **Ordering usually matters more than the solver.** On large well-separated 3D systems nested
   dissection is worth ~2x the fill of AMD; use [`HeaderOnlyMetisOrdering`](doc/HeaderOnlyMetis.md)
   if you would rather not link METIS.
@@ -135,6 +139,7 @@ solver.factorize(A2);
 | `src/RobustLU` | Umbrella header, `#include <RobustLU>`. |
 | `src/SupernodalLDLT.h` | [`Eigen::SupernodalLDLT`](doc/SupernodalLDLT.md) — supernodal `LDL^T` for symmetric matrices, definite or indefinite. Reads one triangle, stores one factor, reports inertia. Eigen only. |
 | `src/SupernodalLDLT` | Umbrella header, `#include <SupernodalLDLT>`. |
+| `src/SupernodalLDLTMatching.h` | Symmetric weighted matching (Duff–Pralet): reads a maximum transversal as a set of 2×2 pivot candidates rather than as a row permutation (`SupernodalLDLT::setMatching`). |
 | `src/SupernodalLUSymbolic.h` | The symbolic analysis shared by every supernodal solver here: the A+Aᵀ adjacency graph, elimination tree, postorder, supernode partition with amalgamation, block structure, update lists, scheduling levels — plus the fill estimate used to rank candidate orderings. Free functions over plain vectors, so a solver passes its own state in and inherits nothing. No METIS dependency, unlike `SupernodalLUAutoOrdering.h`, which uses it. |
 | `src/SupernodalLUSupport.h` | Plain data structures shared by the analysis/factorization phases (`Supernode`, `RowBlock`, `UpdateSource`). |
 | `src/SupernodalLUMatching.h` | The maximum-transversal matching + permutation-sign helpers (`MatchingMethod::Transversal`). |

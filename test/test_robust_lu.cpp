@@ -20,6 +20,12 @@
 //      attempts.
 //   4. HONESTY. It must never report Success with an untrustworthy answer, and
 //      its report() must match what actually happened.
+//   5. THE SYMMETRIC SHORTCUT. Below the ladder sits a rung that is cheaper
+//      rather than more robust, which makes it the one rung that could silently
+//      COST something: taken on a matrix it cannot diagnose, it would hand back
+//      an answer the ladder would have flagged. So it is tested from both sides
+//      -- that it is taken when it is unambiguously right, and that it declines
+//      and gets out of the way when it is not.
 //
 // The SuiteSparse corpus is the proving ground when present, because the
 // expected outcome per matrix was measured before the ladder was written. The
@@ -111,7 +117,9 @@ SpMat rankDeficientDiagonal(int n, int k) {
 
 void testCostsNothingWhenTheFirstRungWorks() {
   std::printf("  a well-behaved matrix costs exactly one factorization\n");
-  const SpMat A = lu_testing::laplacian2d(25, 25);
+  // UNSYMMETRIC on purpose: a symmetric matrix takes the LDL^T rung below the
+  // ladder, which is a different property and is tested separately.
+  const SpMat A = lu_testing::upwind2d(25, 25);
   const VectorXd b = deterministicRhs(A);
 
   Robust s;
@@ -119,6 +127,7 @@ void testCostsNothingWhenTheFirstRungWorks() {
   const VectorXd x = s.solve(b);
 
   checkTrue(s.info() == Eigen::Success, "solves");
+  checkTrue(!s.matrixIsSymmetric(), "the matrix is not symmetric, so no LDL^T rung");
   checkTrue(s.attempts().size() == 1, "exactly one attempt was made");
   checkTrue(s.strategy() == rlu::Strategy::Default, "and it was the default strategy");
   checkTrue(s.outcome() == rlu::Outcome::Solved, "outcome is Solved");
@@ -132,6 +141,88 @@ void testCostsNothingWhenTheFirstRungWorks() {
   const VectorXd xp = plain.solve(b);
   checkTrue((x - xp).cwiseAbs().maxCoeff() == 0.0,
             "and it is bit-identical to LeftRightLU on its own");
+}
+
+// The symmetric rung is not an escalation but a SHORTCUT, so what has to be
+// pinned down is different from every other rung: that it is taken when it
+// applies, that it is skipped when it does not, that it really is the cheaper
+// factorization, and -- the part that matters most -- that taking it does not
+// quietly cost the class any of the diagnoses it promises.
+void testSymmetricFastPath() {
+  std::printf("  a symmetric matrix takes the LDL^T rung below the ladder\n");
+  const SpMat A = lu_testing::laplacian2d(40, 40);
+  const VectorXd b = deterministicRhs(A);
+
+  Robust s;
+  s.compute(A);
+  const VectorXd x = s.solve(b);
+
+  checkTrue(s.matrixIsSymmetric(), "symmetry is detected");
+  checkTrue(s.info() == Eigen::Success, "solves");
+  checkTrue(s.attempts().size() == 1, "and costs exactly one factorization");
+  checkTrue(s.strategy() == rlu::Strategy::SymmetricLDLT, "via the symmetric rung");
+  checkTrue(s.outcome() == rlu::Outcome::Solved, "outcome is Solved");
+  check((A * x - b).norm() / b.norm() < 1e-12, "residual is small", (A * x - b).norm() / b.norm());
+  check(s.backwardError() < 1e-14, "backward error is at machine precision", s.backwardError());
+  checkTrue(std::isfinite(s.conditionEstimate()) && s.conditionEstimate() > 1.0,
+            "a condition estimate is still produced, without a condition estimator");
+
+  // The point of the rung: no U at all, and a factor around half the size.
+  checkTrue(s.nnzU() == 0, "there is no U");
+  Eigen::LeftRightLU<SpMat> plain;
+  plain.compute(A);
+  const double ratio = double(plain.nnzL() + plain.nnzU()) / double(s.nnzL());
+  check(ratio > 1.4, "and the factor is roughly half what the LU rung would store", ratio);
+
+  // Turning it off must put the ladder back exactly where it was.
+  Robust off;
+  off.setSymmetryTolerance(-1.0);
+  off.compute(A);
+  checkTrue(!off.matrixIsSymmetric(), "a negative tolerance skips the rung");
+  checkTrue(off.strategy() == rlu::Strategy::Default, "and the ladder runs as before");
+
+  // A matrix that is symmetric but NOT solvable by this rung must fall through
+  // rather than be judged by it. Its diagonal is zero-free and the ordering
+  // leaves it usable, but the matrix is singular, so pivots get perturbed.
+  {
+    const int n = 120;
+    std::vector<Triplet<double>> t;
+    for (int j = 0; j + 1 < n; ++j) {
+      t.emplace_back(j, j, 1.0);
+      t.emplace_back(j, j + 1, 1.0);
+      t.emplace_back(j + 1, j, 1.0);
+      t.emplace_back(j + 1, j + 1, 1.0);  // rank-1 blocks: singular by construction
+    }
+    SpMat S(n, n);
+    S.setFromTriplets(t.begin(), t.end());
+    S.makeCompressed();
+    Robust r;
+    r.compute(S);
+    checkTrue(r.matrixIsSymmetric(), "the singular matrix is symmetric");
+    checkTrue(r.attempts().size() >= 2 && r.attempts()[0].strategy == rlu::Strategy::SymmetricLDLT,
+              "the symmetric rung is tried first");
+    checkTrue(!r.attempts()[0].accepted, "and declines rather than claiming a singular matrix");
+    checkTrue(r.strategy() != rlu::Strategy::SymmetricLDLT,
+              "so the ladder proper takes over, with its diagnosis intact");
+    std::printf("        singular symmetric: %s via %s (%zu attempts)\n",
+                rlu::outcomeName(r.outcome()), rlu::strategyName(r.strategy()),
+                r.attempts().size());
+
+    // The symmetric rung analyzes the LU solver too, to compare predicted fill,
+    // and the ladder REUSES that analysis rather than redoing it. That reuse is
+    // silent if it goes wrong -- a solver analyzed with the wrong settings still
+    // factors and still answers -- so it is pinned against a standalone
+    // LeftRightLU, which must agree bit for bit.
+    if (r.strategy() == rlu::Strategy::Default && r.info() == Eigen::Success) {
+      const VectorXd rhs = deterministicRhs(S);
+      const VectorXd xr = r.solve(rhs);
+      Eigen::LeftRightLU<SpMat> plain;
+      plain.compute(S);
+      const VectorXd xp = plain.solve(rhs);
+      checkTrue((xr - xp).cwiseAbs().maxCoeff() == 0.0,
+                "and the LU analysis it reuses is the one it would have built itself");
+    }
+  }
 }
 
 void testStructuralSingularityEscalatesToRankRevealing() {
@@ -195,7 +286,10 @@ void testStopsWhenConditioningIsHopeless() {
 
 void testEscalationCanBeCapped() {
   std::printf("  setMaxStrategy caps the climb\n");
-  const SpMat A = lu_testing::laplacian2d(20, 20);
+  // Unsymmetric, so the cap applies to the rung it names: on a symmetric matrix
+  // the LDL^T rung below the ladder would answer first and the cap would never
+  // be consulted.
+  const SpMat A = lu_testing::upwind2d(20, 20);
   Robust s;
   s.setMaxStrategy(rlu::Strategy::Default);
   s.compute(A);
@@ -429,10 +523,18 @@ void testCorpus() {
       std::printf("        %-24s %s (%zu attempts)\n", m.label().c_str(),
                   rlu::strategyName(s.strategy()), s.attempts().size());
     } else if (s.outcome() == rlu::Outcome::Solved &&
-               s.strategy() == rlu::Strategy::Default) {
+               (s.strategy() == rlu::Strategy::Default ||
+                s.strategy() == rlu::Strategy::SymmetricLDLT)) {
       // The cost property, per matrix: an untouched matrix pays for one
-      // factorization and nothing more.
-      checkTrue(s.attempts().size() == 1, m.label() + ": solved on the first rung, one attempt");
+      // FACTORIZATION and nothing more -- whichever of the two first-try rungs it
+      // took. Counting factorizations rather than attempts is the accurate form,
+      // and the symmetric rung is why it had to become accurate: it can decline
+      // on predicted fill alone, which logs a second attempt that did no numeric
+      // work at all and costs one symbolic analysis.
+      std::size_t factorizations = 0;
+      for (const rlu::Attempt& a : s.attempts())
+        if (a.factored) ++factorizations;
+      checkTrue(factorizations == 1, m.label() + ": solved with exactly one factorization");
       ++firstRung;
     } else {
       ++stopped;
@@ -459,6 +561,7 @@ int main() {
   std::printf("RobustLU fallback ladder\n");
 
   testCostsNothingWhenTheFirstRungWorks();
+  testSymmetricFastPath();
   testStructuralSingularityEscalatesToRankRevealing();
   testStopsWhenConditioningIsHopeless();
   testEscalationCanBeCapped();

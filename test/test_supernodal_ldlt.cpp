@@ -19,6 +19,7 @@
 
 #include <complex>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -730,6 +731,295 @@ void testParallelAgreement() {
   check(residP <= std::max(residS * 10.0, 1e-12), "parallel residual no worse than serial", residP);
 }
 
+// A symmetric matrix with an ENTIRELY ZERO diagonal on a random pattern: no 1x1
+// pivot exists anywhere, so every pivot has to be a 2x2 block, and whether one is
+// reachable is decided by the ordering rather than by the numeric phase. n is
+// even, so the generic matrix of this shape is nonsingular -- which matters,
+// because a singular one would fail for reasons that have nothing to do with the
+// matching and would make this test look like it passed for the right reason.
+SparseMatrix<double> zeroDiagonalSymmetric(int n, int perRow, unsigned seed) {
+  std::mt19937 gen(seed);
+  std::uniform_int_distribution<int> pick(0, n - 1);
+  std::uniform_real_distribution<double> val(0.5, 2.0);
+  std::vector<Eigen::Triplet<double>> t;
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < perRow; ++k) {
+      const int j = pick(gen);
+      if (j == i) continue;
+      const double v = val(gen) * (k % 2 ? -1.0 : 1.0);
+      t.emplace_back(i, j, v);
+      t.emplace_back(j, i, v);
+    }
+  SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+void testSymmetricMatching() {
+  std::printf("\n-- symmetric weighted matching --\n");
+
+  // On a positive definite matrix the diagonal is already the best pivot there
+  // is, every cycle of the matching is a fixed point, and no pair is formed. The
+  // check is that this costs nothing but the matching itself -- same fill, same
+  // answer, bit for bit.
+  {
+    const SparseMatrix<double> A = laplacian2d(30, 30);
+    const SparseMatrix<double> Lo = triangleOf(A, true);
+    const int n = static_cast<int>(A.rows());
+    VectorXd xTrue = VectorXd::Random(n), b = A * xTrue;
+    Eigen::SupernodalLDLT<SparseMatrix<double>> plain, matched;
+    matched.setMatching(true);
+    plain.compute(Lo);
+    matched.compute(Lo);
+    checkTrue(plain.matchedPairs() == 0, "matching off reports no pairs");
+    checkTrue(matched.matchedPairs() == 0, "and on an SPD matrix it forms none either");
+    checkTrue(plain.nnzL() == matched.nnzL(), "so the fill is unchanged");
+    const VectorXd xp = plain.solve(b), xm = matched.solve(b);
+    checkTrue((xp - xm).cwiseAbs().maxCoeff() == 0.0, "and the answer is bit-identical");
+  }
+
+  // The case it exists for. Without matching the ordering puts no 2x2 candidate
+  // where the numeric phase can reach it, so pivots get perturbed wholesale and
+  // the answer is worthless -- correctly FLAGGED, but worthless. With matching the
+  // pairs arrive adjacent inside a supernode and the same matrix solves cleanly.
+  for (int n : {2000, 4000}) {
+    const SparseMatrix<double> A = zeroDiagonalSymmetric(n, 3, 5u + unsigned(n));
+    const SparseMatrix<double> Lo = triangleOf(A, true);
+    VectorXd xTrue = VectorXd::Random(n), b = A * xTrue;
+
+    Eigen::SupernodalLDLT<SparseMatrix<double>> plain, matched;
+    matched.setMatching(true);
+    plain.compute(Lo);
+    matched.compute(Lo);
+    if (matched.info() != Eigen::Success) {
+      lu_testing::fail("matched factorization failed: " + matched.lastErrorMessage());
+      continue;
+    }
+    const VectorXd xm = matched.solve(b);
+    const double matchedErr = (xm - xTrue).norm() / xTrue.norm();
+    double plainErr = std::numeric_limits<double>::infinity();
+    if (plain.info() == Eigen::Success) {
+      const VectorXd xp = plain.solve(b);
+      plainErr = (xp - xTrue).norm() / xTrue.norm();
+    }
+    std::printf("        n=%d: pairs=%lld 2x2=%lld perturbed=%lld->%lld nnzL=%lld->%lld err %.1e->%.1e\n",
+                n, static_cast<long long>(matched.matchedPairs()),
+                static_cast<long long>(matched.pivotBlocks2x2()),
+                static_cast<long long>(plain.replacedPivots()),
+                static_cast<long long>(matched.replacedPivots()),
+                static_cast<long long>(plain.nnzL()), static_cast<long long>(matched.nnzL()),
+                plainErr, matchedErr);
+
+    // A zero diagonal rules out 1-cycles, so the matching pairs off along cycles
+    // of length 2 or more and leaves a singleton only where a cycle is odd. That
+    // is a handful of columns, not half of them.
+    checkTrue(2 * matched.matchedPairs() >= n - n / 50,
+              "a zero diagonal forces nearly every column into a pair");
+    checkTrue(matched.pivotBlocks2x2() > 0, "and 2x2 pivot blocks are actually taken");
+    check(matchedErr < 1e-9, "the matched factorization solves it", matchedErr);
+
+    // THE MECHANISM, which is what is worth asserting: without matching the
+    // ordering leaves no reachable 2x2 pivot and the solver perturbs its way
+    // through a large fraction of the columns. Whether the answer then survives
+    // iterative refinement varies with the matrix -- at n=2000 it does and at
+    // n=4000 it does not -- so the perturbation count is the robust statement and
+    // the errors above are printed rather than asserted on.
+    checkTrue(plain.replacedPivots() > n / 20,
+              "without matching, a large fraction of pivots are perturbed");
+    checkTrue(matched.replacedPivots() * 10 < plain.replacedPivots(),
+              "and matching cuts that by an order of magnitude");
+    checkTrue(matched.nnzL() <= plain.nnzL(), "while costing no fill: the quotient orders better");
+  }
+
+  // The quotient ordering must read the same triangle rule as everything else: a
+  // caller holding the upper triangle, or the whole matrix, gets the same answer.
+  {
+    const int n = 800;
+    const SparseMatrix<double> A = zeroDiagonalSymmetric(n, 3, 77);
+    VectorXd xTrue = VectorXd::Random(n), b = A * xTrue;
+    Eigen::SupernodalLDLT<SparseMatrix<double>> lower;
+    Eigen::SupernodalLDLT<SparseMatrix<double>, Eigen::Upper> upper;
+    Eigen::SupernodalLDLT<SparseMatrix<double>> whole;
+    lower.setMatching(true);
+    upper.setMatching(true);
+    whole.setMatching(true);
+    lower.compute(triangleOf(A, true));
+    upper.compute(triangleOf(A, false));
+    whole.compute(A);
+    checkTrue(lower.matchedPairs() == upper.matchedPairs() &&
+                  lower.matchedPairs() == whole.matchedPairs(),
+              "the same pairs are found from either triangle or the whole matrix");
+    checkTrue(lower.nnzL() == upper.nnzL() && lower.nnzL() == whole.nnzL(),
+              "and the quotient ordering reaches the same structure");
+    const VectorXd xl = lower.solve(b), xu = upper.solve(b), xw = whole.solve(b);
+    check((xl - xTrue).norm() / xTrue.norm() < 1e-9, "lower triangle solves",
+          (xl - xTrue).norm() / xTrue.norm());
+    // Not bit-identity, unlike the SPD case: this matrix perturbs pivots, so
+    // refinement runs, and refinement's residual goes through
+    // selfadjointView<UpLo>() * x -- which sums the same numbers in a different
+    // order depending on which triangle is stored. The factorizations agree
+    // exactly; the last bits of the refined answer do not.
+    const double gapUpper = (xl - xu).norm() / xl.norm();
+    const double gapWhole = (xl - xw).norm() / xl.norm();
+    check(gapUpper < 1e-12 && gapWhole < 1e-12, "and all three agree to rounding",
+          std::max(gapUpper, gapWhole));
+  }
+}
+
+// L, D and the permutation are only worth exposing if they RECONSTRUCT the
+// matrix, and the reconstruction is where the local Bunch-Kaufman interchanges
+// have to be paid off: the solve gets to defer them per supernode, a standalone
+// L does not. So this runs the same check on a positive definite matrix (no
+// interchange, factorPermutation() == permutation()) and on an indefinite one
+// (interchanges, and they had better differ).
+void checkReconstruction(const SparseMatrix<double>& A, const char* name, bool expectPivoting) {
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+  s.compute(triangleOf(A, true));
+  if (s.info() != Eigen::Success) {
+    lu_testing::fail(std::string(name) + ": factorization failed");
+    return;
+  }
+  const int n = static_cast<int>(A.rows());
+  const SparseMatrix<double> L = s.matrixL(), D = s.matrixD();
+  const VectorXd sc = s.scalingS();
+  const auto P = s.factorPermutation();
+
+  // L * D * L^T should equal P (S A S) P^T.
+  const MatrixXd lhs = MatrixXd(L) * MatrixXd(D) * MatrixXd(L).transpose();
+  const MatrixXd scaled = sc.asDiagonal() * MatrixXd(A) * sc.asDiagonal();
+  MatrixXd rhs(n, n);
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j) rhs(P.indices()(i), P.indices()(j)) = scaled(i, j);
+  const double err = (lhs - rhs).norm() / rhs.norm();
+  check(err < 1e-11, (std::string(name) + ": L D L^T reconstructs P (S A S) P^T").c_str(), err);
+
+  // L must be genuinely unit lower triangular, not merely close to it.
+  double worstUpper = 0.0, worstDiag = 0.0;
+  for (int j = 0; j < n; ++j)
+    for (SparseMatrix<double>::InnerIterator it(L, j); it; ++it) {
+      if (it.row() < j) worstUpper = std::max(worstUpper, std::abs(it.value()));
+      if (it.row() == j) worstDiag = std::max(worstDiag, std::abs(it.value() - 1.0));
+    }
+  checkTrue(worstUpper == 0.0 && worstDiag == 0.0,
+            (std::string(name) + ": L is exactly unit lower triangular").c_str());
+
+  bool permsDiffer = false;
+  for (int i = 0; i < n; ++i)
+    if (P.indices()(i) != s.permutation().indices()(i)) permsDiffer = true;
+  checkTrue(permsDiffer == expectPivoting,
+            expectPivoting ? (std::string(name) + ": factorPermutation() carries the interchanges").c_str()
+                           : (std::string(name) + ": no interchange, so the two permutations agree").c_str());
+}
+
+void testFactorAccessors() {
+  std::printf("\n-- matrixL() / matrixD() reconstruct the matrix --\n");
+  checkReconstruction(laplacian2d(12, 12), "SPD 2D Laplacian", /*expectPivoting=*/false);
+
+  // Indefinite, with a zero diagonal block, so Bunch-Kaufman must interchange.
+  {
+    const int m = 60;
+    std::vector<Eigen::Triplet<double>> t;
+    for (int i = 0; i < m; ++i) {
+      t.emplace_back(i, i, 2.0);
+      if (i + 1 < m) {
+        t.emplace_back(i + 1, i, -1.0);
+        t.emplace_back(i, i + 1, -1.0);
+      }
+      t.emplace_back(m + i, i, 1.0);  // B = I coupling block
+      t.emplace_back(i, m + i, 1.0);
+    }
+    for (int i = 0; i < m; ++i)
+      if (i + 1 < m) {
+        t.emplace_back(m + i, m + i + 1, 0.25);  // a little structure, still zero diagonal
+        t.emplace_back(m + i + 1, m + i, 0.25);
+      }
+    SparseMatrix<double> K(2 * m, 2 * m);
+    K.setFromTriplets(t.begin(), t.end());
+    K.makeCompressed();
+    Eigen::SupernodalLDLT<SparseMatrix<double>> probe;
+    probe.compute(triangleOf(K, true));
+    std::printf("        saddle point: %lld 2x2 pivots, %lld perturbed\n",
+                static_cast<long long>(probe.pivotBlocks2x2()),
+                static_cast<long long>(probe.replacedPivots()));
+    checkReconstruction(K, "indefinite saddle point",
+                        /*expectPivoting=*/probe.pivotBlocks2x2() > 0);
+  }
+
+  // vectorD() is the whole of D exactly when nothing needed a 2x2 block.
+  {
+    Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+    const SparseMatrix<double> A = laplacian2d(10, 10);
+    s.compute(triangleOf(A, true));
+    checkTrue(s.pivotBlocks2x2() == 0, "SPD input needs no 2x2 block");
+    const MatrixXd fromVector = MatrixXd(s.vectorD().asDiagonal());
+    const double gap = (MatrixXd(s.matrixD()) - fromVector).norm();
+    check(gap == 0.0, "vectorD() is all of D when there is no 2x2 block", gap);
+  }
+}
+
+// Level dispatch leaves the root-separator chain on one lane; the chunked path
+// splits those supernodes' panels across the pool instead. The risk it carries is
+// not a wrong answer on average but a RACE, so what this pins down is that the
+// two paths agree on every count the factorization produces -- and it uses an
+// INDEFINITE matrix, because the chunked update kernel has to reproduce the 2x2
+// pivot's row MIXING, which a positive definite matrix never exercises.
+void testIntraSupernodeParallelism() {
+  std::printf("\n-- intra-supernode parallelism --\n");
+  typedef Eigen::SupernodalLDLT<SparseMatrix<double>, Eigen::Lower, Eigen::AMDOrdering<int>,
+                                Eigen::supernodal_lu::StdThreadExecutor>
+      ThreadedLDLT;
+  {
+    ThreadedLDLT probe;
+    if (probe.executor().concurrency() <= 1) {
+      std::printf("  [SKIP] one lane available; nothing to dispatch\n");
+      return;
+    }
+  }
+
+  SparseMatrix<double> A = laplacian3d(16, 16, 16);
+  SparseMatrix<double> shift(A.rows(), A.cols());
+  shift.setIdentity();
+  A = A - 5.3 * shift;  // indefinite: 5.3 sits inside the spectrum (0, 12)
+  const SparseMatrix<double> Lo = triangleOf(A, true);
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  ThreadedLDLT chunked;  // on by default
+  chunked.compute(Lo);
+  ThreadedLDLT outer;
+  outer.setIntraSupernodeParallelism(false);
+  outer.compute(Lo);
+  if (chunked.info() != Eigen::Success || outer.info() != Eigen::Success) {
+    lu_testing::fail("intra-supernode: a factorization failed");
+    return;
+  }
+
+  // Without this the rest of the test would pass vacuously on a build where the
+  // guards never admit a single level.
+  checkTrue(chunked.intraParallelSupernodes() > 0, "the chunked path actually ran");
+  checkTrue(outer.intraParallelSupernodes() == 0, "disabling it leaves every level outer");
+  std::printf("        %lld of %lld supernodes ran chunked, %lld 2x2 pivots\n",
+              static_cast<long long>(chunked.intraParallelSupernodes()),
+              static_cast<long long>(chunked.supernodeCount()),
+              static_cast<long long>(chunked.pivotBlocks2x2()));
+  checkTrue(chunked.pivotBlocks2x2() > 0, "the matrix needed 2x2 pivots, so the mixing was used");
+
+  checkTrue(chunked.nnzL() == outer.nnzL(), "fill is identical either way");
+  checkTrue(chunked.pivotBlocks2x2() == outer.pivotBlocks2x2(), "same 2x2 pivot count");
+  checkTrue(chunked.replacedPivots() == outer.replacedPivots(), "same perturbation count");
+  checkTrue(chunked.inertia().positive == outer.inertia().positive &&
+                chunked.inertia().negative == outer.inertia().negative,
+            "same inertia");
+
+  const VectorXd xc = chunked.solve(b), xo = outer.solve(b);
+  check((xc - xo).norm() / xo.norm() < 1e-12, "the two paths agree to rounding",
+        (xc - xo).norm() / xo.norm());
+  const double resid = (A * xc - b).norm() / b.norm();
+  check(resid < 1e-9, "the chunked answer is accurate", resid);
+}
+
 void testEdgeCasesAndGuards() {
   std::printf("\n-- edge cases and the fill guard --\n");
   {
@@ -799,7 +1089,10 @@ int main() {
   testRefactorization();
   testComplexHermitian();
   testHalvedAgainstSupernodalLu();
+  testSymmetricMatching();
+  testFactorAccessors();
   testParallelAgreement();
+  testIntraSupernodeParallelism();
   testEdgeCasesAndGuards();
   return lu_testing::summarize("SupernodalLDLT correctness");
 }

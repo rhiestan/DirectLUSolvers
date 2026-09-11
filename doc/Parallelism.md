@@ -2,8 +2,8 @@
 
 *[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [LeftRightLU](LeftRightLU.md) · [Testing](Testing.md)*
 
-Both `SupernodalLU` and `LeftRightLU` thread their numeric factorization through the same
-pluggable `Executor`, and both parallelize `solve()`. `PointBlockLU` is deliberately
+`SupernodalLU`, `LeftRightLU` and `SupernodalLDLT` thread their numeric factorization through the
+same pluggable `Executor`, and all three parallelize `solve()`. `PointBlockLU` is deliberately
 single-threaded — see [Why PointBlockLU is not parallel](PointBlockLU.md#why-pointblocklu-is-not-parallel),
 which is a measurement rather than an omission. This document covers the executor backends,
 the two parallel mechanisms, and every scaling measurement in the project.
@@ -25,6 +25,15 @@ level barrier, and the same `setIntraSupernodeParallelism` switch, which there c
 top levels out of the DAG phase and sweeps them afterwards with the pool applied inside each
 supernode. The split matters for the same reason and by the same order (1.18x → 3.08x on the
 same matrix).
+
+[`SupernodalLDLT`](SupernodalLDLT.md#parallelism) uses the level scheme and the same
+`setIntraSupernodeParallelism` switch, with the same tuning constants — the quantity they trade
+off, panel rows per lane against dispatch overhead, does not depend on which factorization is
+running. The split matters there most of all: 1.14x from level dispatch alone against 2.65x with
+chunking on `lap3d 40³`. It still scales less well than `SupernodalLU` in absolute terms, for two
+structural reasons — half the flops sit against the same fixed dispatch costs, and there is one
+panel per supernode to chunk rather than two — so its ~1.95x serial advantage narrows as lanes
+are added and can disappear past roughly 16 lanes.
 
 The `Executor` concept (`SupernodalLUExecutor.h`) is two methods:
 

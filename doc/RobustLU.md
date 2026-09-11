@@ -32,8 +32,9 @@ Over this project's 33-matrix SuiteSparse quick tier:
 
 The first row is the one to watch. A ladder that quietly doubles everyone's work in order to
 rescue a minority is a bad trade, and `test_robust_lu` asserts per matrix that a case the first
-rung handles costs exactly one attempt — and returns a **bit-identical** answer to `LeftRightLU`
-used alone.
+rung handles costs exactly one attempt — and, for an unsymmetric matrix, returns a
+**bit-identical** answer to `LeftRightLU` used alone. A symmetric one takes the `LDL^T` rung
+below the ladder instead, still in one attempt, for roughly half the work.
 
 ## Diagnosis-directed, not cheapest-first
 
@@ -58,6 +59,51 @@ So the class does not climb. It measures, diagnoses, and jumps:
 Note where structural singularity now goes. Before the rank-revealing rung existed it was a dead
 end; it is now the one diagnosis that reaches QR *without* an LU failure first, because there is
 no point trying MC64 or partial pivoting on a matrix that has no LU at all.
+
+## The one rung that is not a fallback
+
+Below all of that sits a symmetric rung. If `A` is its own transpose, an LU of it computes a `U`
+that is the transpose of the `L` it already has, and [`SupernodalLDLT`](SupernodalLDLT.md)
+declines to: about half the arena and half the time, definite or indefinite. That is not an
+escalation, it is the cheaper answer to the same question, so it runs **first** and only on a
+matrix that actually is symmetric (`‖A − Aᴴ‖ ≤ tol·‖A‖`, `setSymmetryTolerance`, default `1e-12`;
+negative skips the rung entirely).
+
+A tolerance is safe here in a way it usually is not, because this rung is verified like every
+other one. Reading one triangle of a not-quite-symmetric matrix factors a matrix differing from
+`A` by the asymmetry — which is exactly what the backward error then measures, so a tolerance
+that was too generous shows up as a *rejected rung*, not as a wrong answer.
+
+**Is it actually cheaper? The rung asks rather than assumes.** Dropping `U` is worth about half
+the arena *for the same structure*, but the two solvers do not produce the same structure:
+`SupernodalLDLT` orders the symmetric graph with AMD, while `LeftRightLU` brings block triangular
+form and a matching to the same matrix — and on some symmetric matrices that wins by more than
+the factor of two being saved. On `GHS_indef/sit100` the `LDL^T` predicts **5.49M** scalars
+against `LeftRightLU`'s **2.50M**, and factors in **673 ms against 99 ms**. The "cheaper answer
+to the same question" is 7× more expensive there.
+
+So the rung compares `predictedFactorNonzeros()` on both and declines when its own is larger.
+Both figures come from `analyzePattern()` alone, before either solver allocates anything, so the
+comparison costs one symbolic analysis and no numeric work — and the LU analysis is not wasted
+when the answer is "no", because the ladder reuses it. On `sit100` that turns 673 ms of
+misplaced factorization into 22 ms of declining.
+
+**It is otherwise a fast path, not a diagnosis, and is accepted only when unambiguously good:**
+small ω and residual as for any rung, plus **no perturbed pivot** and a κ small enough that no
+further rung could add anything. Anything else falls straight through to the ladder proper,
+which has the matching, the extended-precision residual and the structural-singularity detection
+this rung has none of. Falling through costs one `LDL^T` — about half an LU — and buys back every
+diagnosis the class promises.
+
+The κ is worth a note, because a hole there would have been the one regression this class cannot
+afford: `SupernodalLDLT` has no condition estimator. The rung gets one anyway by driving the
+shared Hager–Higham estimator with that solver's own `solve()` — `A` is Hermitian, so `A⁻ᴴ` and
+`A⁻¹` are the same operator and the estimator's two callbacks coincide. Without it,
+"ill-conditioned" and "the solver did badly" would be indistinguishable on every symmetric
+matrix, which is precisely the confusion the ladder exists to resolve.
+
+`matrixIsSymmetric()` says whether the rung was offered; `nnzU()` returns `0` when it was taken,
+and that is the fact rather than a missing value.
 
 MC64 is the workhorse — 4 of the 6 rescues. The partial-pivoting rung matters because
 `LeftRightLU` confines pivoting to a diagonal block *by construction*; a failure that survives
@@ -200,7 +246,11 @@ either way.
 ## Option reference
 
 - **`setMaxStrategy(Strategy)`** — how far the ladder may climb. `Strategy::Default` disables
-  escalation entirely, leaving a thin wrapper over `LeftRightLU` plus the diagnosis.
+  escalation entirely, leaving a thin wrapper over `LeftRightLU` plus the diagnosis. The
+  symmetric rung is `Strategy::SymmetricLDLT`, below `Default`, so it is never capped out by
+  this; `setSymmetryTolerance(-1)` is what turns it off.
+- **`setSymmetryTolerance(RealScalar)`** (default `1e-12`) and **`matrixIsSymmetric()`** — the
+  symmetric rung's admission test; see above.
 - **`setBackwardErrorTolerance(RealScalar)`** (default `1e-6`) and
   **`setResidualTolerance(RealScalar)`** (default `1e-6`) — a rung must satisfy **both**.
 - **`setMaxFactorNonzeros(Index)`** — the fill guard, applied to every rung.

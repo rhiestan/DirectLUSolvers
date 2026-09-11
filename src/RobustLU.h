@@ -39,6 +39,29 @@
 //   backward error >> eps                      -> MC64 (bad diagonal)
 //   backward error >> eps after MC64           -> true partial pivoting
 //
+// THE ONE RUNG THAT IS NOT A FALLBACK
+//
+// Below all of that sits a symmetric rung. If A is its own transpose, an LU of it
+// computes a U that is the transpose of the L it already has, and SupernodalLDLT
+// declines to: about half the arena and half the time, definite or indefinite.
+// That is not an escalation, it is the cheaper answer to the same question, so it
+// runs FIRST and only on a matrix that is actually symmetric.
+//
+// IS IT ACTUALLY CHEAPER? The rung asks rather than assumes. The two solvers do
+// not produce the same structure -- this one orders the symmetric graph with AMD,
+// LeftRightLU brings BTF and a matching to it -- and on some symmetric matrices
+// that wins by more than the factor of two being saved. So the predicted fill of
+// both is compared, from analyzePattern() alone and before either allocates, and
+// the rung declines when its own is larger. The LU analysis is reused, so
+// declining costs one symbolic analysis and no numeric work.
+//
+// It is otherwise a fast path and NOT a diagnosis. It is accepted only when it is
+// UNAMBIGUOUSLY good: verified backward error and residual as for any rung, plus
+// no perturbed pivot and a kappa small enough that nothing further could add
+// anything. Anything else falls straight through to the ladder proper, which has
+// the matching, the extended-precision residual and the structural-singularity
+// detection this rung has none of.
+//
 // The stopping rules are the reason this step came after condition estimation.
 // "The solver did badly" and "the matrix is unsolvable in this precision" look
 // identical from a residual, and only the first is worth escalating. A small
@@ -77,6 +100,7 @@
 
 #include "LeftRightLU.h"
 #include "PointBlockLU.h"
+#include "SupernodalLDLT.h"
 
 namespace Eigen {
 
@@ -85,6 +109,7 @@ namespace robust_lu {
 /** The rungs, in the order they are numbered rather than the order they run --
   * which rung runs next is a function of the diagnosis, not of this list. */
 enum class Strategy {
+  SymmetricLDLT,     ///< SupernodalLDLT: half the work, and only for a symmetric matrix.
   Default,           ///< LeftRightLU as it ships: equilibration, transversal matching, BTF.
   ExtendedResidual,  ///< Same factorization, re-solved with a double-double residual.
   MC64,              ///< Re-analyze with the exact maximum-product matching.
@@ -158,6 +183,9 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   typedef Matrix<Scalar, Dynamic, 1> DenseVector;
   typedef Eigen::LeftRightLU<MatrixType> DirectSolver;
   typedef Eigen::PointBlockLU<MatrixType> PivotingSolver;
+  // Lower triangle: the input is symmetric by the time this rung runs, so either
+  // triangle would do, and the solver ignores the one it is not told to read.
+  typedef Eigen::SupernodalLDLT<MatrixType, Lower> SymmetricSolver;
   // COLAMD rather than AMD: QR's fill follows the pattern of A^T A, which is
   // what COLAMD is designed to order.
   typedef Eigen::SparseQR<MatrixType, COLAMDOrdering<StorageIndex>> RankRevealingSolver;
@@ -305,6 +333,23 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   void setMaxRankRevealingSize(Index rows) { m_maxRankRevealingRows = rows; }
   Index maxRankRevealingSize() const { return m_maxRankRevealingRows; }
 
+  /** How far A may miss being its own transpose and still be offered to the
+    *  symmetric rung: ||A - A^H|| <= tol * ||A||. Default 1e-12. Set 0 to demand
+    *  exact symmetry, or a negative value to skip the rung entirely.
+    *
+    *  A tolerance is safe here in a way it usually is not, because the rung is
+    *  VERIFIED like every other one. Reading a triangle of a not-quite-symmetric
+    *  matrix factors a matrix that differs from A by the asymmetry, which is
+    *  precisely what the backward error then measures -- so a tolerance that was
+    *  too generous shows up as a rejected rung, not as a wrong answer. */
+  void setSymmetryTolerance(const RealScalar& tol) { m_symmetryTolerance = tol; }
+  RealScalar symmetryTolerance() const { return m_symmetryTolerance; }
+
+  /** Whether compute() found the matrix symmetric enough to offer the symmetric
+    *  rung. False for an unsymmetric matrix and for one the tolerance excluded;
+    *  says nothing about whether that rung then succeeded. */
+  bool matrixIsSymmetric() const { return m_matrixIsSymmetric; }
+
   /** Diagnostics from the accepted rung. */
   RealScalar backwardError() const { return m_backwardError; }
   RealScalar conditionEstimate() const { return m_conditionEstimate; }
@@ -323,6 +368,8 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     m_maxRankRevealingRows = 50000;
     m_maxRankRevealingFill = 5000000;
     m_leastSquaresTolerance = RealScalar(1e-8);
+    m_symmetryTolerance = RealScalar(1e-12);
+    m_matrixIsSymmetric = false;
     m_rank = -1;
     m_denseRowCount = -1;
     m_denseRowPenalty = NumTraits<double>::quiet_NaN();
@@ -331,15 +378,37 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     m_conditionEstimate = NumTraits<RealScalar>::quiet_NaN();
     m_usePivoting = false;
     m_useRankRevealing = false;
+    m_useSymmetric = false;
     m_isInitialized = false;
   }
 
-  /** Configure and run one LeftRightLU rung; returns its attempt record. */
-  robust_lu::Attempt runDirect(const MatrixType& matrix, robust_lu::Strategy s);
+  /** ||A - A^H|| <= tol * ||A||, computed once per compute(). One transpose and
+    *  one subtraction -- negligible against the factorization it may save. */
+  bool symmetricEnough(const MatrixType& matrix) const {
+    if (m_symmetryTolerance < RealScalar(0)) return false;
+    MatrixType transposed = matrix.adjoint();
+    const RealScalar scale = matrix.norm();
+    const RealScalar gap = MatrixType(matrix - transposed).norm();
+    if (!(numext::isfinite)(gap)) return false;
+    return gap <= m_symmetryTolerance * (scale > RealScalar(0) ? scale : RealScalar(1));
+  }
+
+  /** Configure and run one LeftRightLU rung; returns its attempt record.
+   *
+   *  With `reuseAnalysis` the existing m_direct is taken as already analyzed and
+   *  only factorize() runs -- used when the symmetric rung analyzed it to compare
+   *  predicted fill and then declined, so that comparison costs nothing. */
+  robust_lu::Attempt runDirect(const MatrixType& matrix, robust_lu::Strategy s,
+                               bool reuseAnalysis = false);
   /** Re-solve the EXISTING factorization with a double-double residual. No
     *  refactorization, no re-analysis -- this is the one genuinely cheap rung. */
   robust_lu::Attempt resolveExtended(const MatrixType& matrix);
   robust_lu::Attempt runPivoting(const MatrixType& matrix);
+  /** The symmetric fast path. Runs first and only on a symmetric matrix.
+   *
+   *  Sets `directAnalyzed` when it has left m_direct analyzed and ready, which it
+   *  does whenever it got as far as comparing predicted fill. */
+  robust_lu::Attempt runSymmetric(const MatrixType& matrix, bool& directAnalyzed);
   robust_lu::Attempt runRankRevealing(const MatrixType& matrix);
   /** The terminal rung, entered only from a diagnosis that says no LU exists. */
   bool tryRankRevealing(const MatrixType& matrix);
@@ -400,6 +469,8 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   Index m_maxRankRevealingRows;
   long long m_maxRankRevealingFill;
   RealScalar m_leastSquaresTolerance;
+  RealScalar m_symmetryTolerance;
+  bool m_matrixIsSymmetric;
   Index m_rank;
   Index m_denseRowCount;
   double m_denseRowPenalty;
@@ -412,12 +483,14 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   // Which solver holds the accepted factors. Only one is ever true.
   bool m_usePivoting;
   bool m_useRankRevealing;
+  bool m_useSymmetric;
   // Held by pointer, not by value: neither solver is copy-assignable (a thread
   // pool and a mutex among the members), and each rung needs a clean instance
   // rather than one carrying the previous rung's settings.
   std::unique_ptr<DirectSolver> m_direct;
   std::unique_ptr<PivotingSolver> m_pivoting;
   std::unique_ptr<RankRevealingSolver> m_rankRevealing;
+  std::unique_ptr<SymmetricSolver> m_symmetric;
 };
 
 // ===========================================================================
@@ -428,6 +501,7 @@ namespace robust_lu {
 
 inline const char* strategyName(Strategy s) {
   switch (s) {
+    case Strategy::SymmetricLDLT: return "symmetric LDL^T (SupernodalLDLT)";
     case Strategy::Default: return "default (transversal matching + BTF)";
     case Strategy::ExtendedResidual: return "extended-precision residual re-solve";
     case Strategy::MC64: return "MC64 maximum-product matching";
@@ -461,25 +535,33 @@ typename RobustLU<MatrixType>::DenseVector RobustLU<MatrixType>::probeFor(
 }
 
 template <typename MatrixType>
-robust_lu::Attempt RobustLU<MatrixType>::runDirect(const MatrixType& matrix,
-                                                   robust_lu::Strategy s) {
+robust_lu::Attempt RobustLU<MatrixType>::runDirect(const MatrixType& matrix, robust_lu::Strategy s,
+                                                   bool reuseAnalysis) {
   using namespace robust_lu;
   Attempt a;
   a.strategy = s;
   const auto t0 = std::chrono::steady_clock::now();
 
-  m_direct.reset(new DirectSolver());
-  m_direct->setErrorBounds(true);
-  if (m_maxFactorNonzeros > 0) m_direct->setMaxFactorNonzeros(m_maxFactorNonzeros);
-  if (s == Strategy::MC64 || s == Strategy::MC64Extended)
-    m_direct->setMatchingMethod(supernodal_lu::MatchingMethod::MC64);
-  if (s == Strategy::ExtendedResidual || s == Strategy::MC64Extended) {
-    m_direct->setExtendedPrecisionResidual(true);
-    m_direct->setRefinementMethod(left_right_lu::Refinement::IterativeRefinement);
-    m_direct->setRefineOnlyIfPerturbed(false);
+  if (reuseAnalysis) {
+    // The symmetric rung already analyzed this instance with exactly these
+    // settings in order to compare predicted fill; only the numeric phase is
+    // left. The time below therefore excludes an analysis that was already paid
+    // for and charged to that attempt.
+    eigen_assert(m_direct && "runDirect(reuseAnalysis) without an analyzed solver");
+    m_direct->factorize(matrix);
+  } else {
+    m_direct.reset(new DirectSolver());
+    m_direct->setErrorBounds(true);
+    if (m_maxFactorNonzeros > 0) m_direct->setMaxFactorNonzeros(m_maxFactorNonzeros);
+    if (s == Strategy::MC64 || s == Strategy::MC64Extended)
+      m_direct->setMatchingMethod(supernodal_lu::MatchingMethod::MC64);
+    if (s == Strategy::ExtendedResidual || s == Strategy::MC64Extended) {
+      m_direct->setExtendedPrecisionResidual(true);
+      m_direct->setRefinementMethod(left_right_lu::Refinement::IterativeRefinement);
+      m_direct->setRefineOnlyIfPerturbed(false);
+    }
+    m_direct->compute(matrix);
   }
-
-  m_direct->compute(matrix);
   const auto elapsed = [&] {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   };
@@ -572,6 +654,136 @@ robust_lu::Attempt RobustLU<MatrixType>::runPivoting(const MatrixType& matrix) {
                                               : (matrix * x - probe).norm());
   a.accepted = acceptable(a, x.allFinite());
   if (!a.accepted) a.note = rejection(a);
+  return a;
+}
+
+template <typename MatrixType>
+robust_lu::Attempt RobustLU<MatrixType>::runSymmetric(const MatrixType& matrix,
+                                                      bool& directAnalyzed) {
+  using namespace robust_lu;
+  Attempt a;
+  a.strategy = Strategy::SymmetricLDLT;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto elapsed = [&] {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  };
+
+  m_symmetric.reset(new SymmetricSolver());
+  if (m_maxFactorNonzeros > 0) m_symmetric->setMaxFactorNonzeros(m_maxFactorNonzeros);
+  m_symmetric->analyzePattern(matrix);
+  if (m_symmetric->info() != Success) {
+    a.milliseconds = elapsed();
+    a.note = m_symmetric->lastErrorMessage();
+    return a;
+  }
+
+  // IS IT ACTUALLY CHEAPER? Ask, rather than assume. Dropping U is worth about
+  // half the arena FOR THE SAME STRUCTURE, but the two solvers do not produce the
+  // same structure: this one orders the symmetric graph with AMD, while
+  // LeftRightLU brings block triangular form and a matching to the same matrix,
+  // and on some symmetric matrices that wins by more than the factor of two being
+  // saved. Measured on GHS_indef/sit100, the LDL^T predicts 5.49M scalars against
+  // LeftRightLU's 2.50M, and factors in 673 ms against 99 ms -- so the "cheaper
+  // answer to the same question" is 7x more expensive there.
+  //
+  // Both predictions come from analyzePattern() alone, before either solver
+  // allocates anything, so the comparison is decided on structure and costs one
+  // symbolic analysis. The LU analysis is not wasted when the answer comes back
+  // "no": runDirect reuses it.
+  m_direct.reset(new DirectSolver());
+  m_direct->setErrorBounds(true);
+  if (m_maxFactorNonzeros > 0) m_direct->setMaxFactorNonzeros(m_maxFactorNonzeros);
+  m_direct->analyzePattern(matrix);
+  directAnalyzed = m_direct->info() == Success;
+
+  const long long ldltFill = (long long)m_symmetric->predictedFactorNonzeros();
+  const long long luFill = (long long)m_direct->predictedFactorNonzeros();
+  a.factorNonzeros = ldltFill;
+  if (directAnalyzed && luFill > 0 && ldltFill > luFill) {
+    char buf[300];
+    std::snprintf(buf, sizeof(buf),
+                  "declined on structure: this factorization would store %lld scalars against the "
+                  "LU rung's %lld (%.2fx), so dropping U does not pay here",
+                  ldltFill, luFill, double(ldltFill) / double(luFill));
+    a.note = buf;
+    a.milliseconds = elapsed();
+    return a;
+  }
+
+  m_symmetric->factorize(matrix);
+  if (m_symmetric->info() != Success) {
+    a.milliseconds = elapsed();
+    a.note = m_symmetric->lastErrorMessage();
+    return a;
+  }
+  a.factored = true;
+
+  const DenseVector probe = probeFor(matrix);
+  const DenseVector x = m_symmetric->solve(probe);
+  a.milliseconds = elapsed();
+  // Like PointBlockLU, this solver publishes no backward error of its own, so it
+  // is measured with the same Oettli-Prager routine every other rung is judged
+  // by -- the comparison would be meaningless otherwise.
+  a.backwardError = double(left_right_lu::componentwiseBackwardError(matrix, probe, x));
+  a.replacedPivots = (long long)m_symmetric->replacedPivots();
+  a.factorNonzeros = (long long)m_symmetric->nnzL();  // there is no U; that is the point
+  const RealScalar bn = probe.norm();
+  a.probeResidual = double(bn > RealScalar(0) ? (matrix * x - probe).norm() / bn
+                                              : (matrix * x - probe).norm());
+
+  // Hager-Higham, driven by this solver's own solve. A is Hermitian, so A^-H and
+  // A^-1 are the same operator and the estimator's two callbacks coincide --
+  // which is why a solver with no condition estimator of its own can still
+  // produce the number the ladder's stopping rules are written against. Without
+  // it the symmetric rung would be a hole in the one guarantee this class exists
+  // for: "ill-conditioned" and "the solver did badly" look identical from a
+  // residual, and only a kappa separates them.
+  {
+    Index solves = 0;
+    const RealScalar invNorm = left_right_lu::oneNormEstimate<Scalar>(
+        Index(m_size), [&](const DenseVector& in, DenseVector& out) { out = m_symmetric->solve(in); },
+        [&](const DenseVector& in, DenseVector& out) { out = m_symmetric->solve(in); }, &solves);
+    a.conditionEstimate = double(left_right_lu::oneNorm(matrix) * invNorm);
+    a.milliseconds = elapsed();
+  }
+
+  // ACCEPTED ONLY WHEN UNAMBIGUOUSLY GOOD. Beyond the usual backward error and
+  // residual: nothing perturbed, and comfortably enough conditioned that no
+  // further rung could add anything. Every other case -- a perturbed pivot, a
+  // kappa large enough to be losing digits, a kappa large enough that nothing can
+  // help -- falls through to the ladder proper, which has the matching, the
+  // extended-precision residual and the structural-singularity diagnosis that
+  // this rung has none of. The cost of falling through is one LDL^T, about half
+  // an LU; the cost of NOT falling through would be a quieter answer than the
+  // class promises.
+  const double kappaEps = a.conditionEstimate * double(NumTraits<RealScalar>::epsilon());
+  const bool wellConditioned = (numext::isfinite)(kappaEps) && kappaEps < 0.001;
+  a.accepted = acceptable(a, x.allFinite()) && a.replacedPivots == 0 && wellConditioned;
+  if (!a.accepted) {
+    a.note = rejection(a);
+    char buf[260];
+    if (a.replacedPivots > 0)
+      std::snprintf(buf, sizeof(buf),
+                    "; %lld pivots were perturbed, so the ladder runs anyway -- it can diagnose "
+                    "that and this rung cannot",
+                    a.replacedPivots);
+    else if (!wellConditioned)
+      std::snprintf(buf, sizeof(buf),
+                    "; kappa*eps=%.2e leaves digits at stake, and recovering or diagnosing them "
+                    "is the ladder's job, not this rung's",
+                    kappaEps);
+    else
+      buf[0] = '\0';
+    a.note += buf;
+  } else {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "symmetric: %lld 2x2 pivot blocks, inertia (%lld+, %lld-, %lld0)",
+                  (long long)m_symmetric->pivotBlocks2x2(),
+                  (long long)m_symmetric->inertia().positive,
+                  (long long)m_symmetric->inertia().negative,
+                  (long long)m_symmetric->inertia().zero);
+    a.note = buf;
+  }
   return a;
 }
 
@@ -715,6 +927,8 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
   m_lastError.clear();
   m_usePivoting = false;
   m_useRankRevealing = false;
+  m_useSymmetric = false;
+  m_matrixIsSymmetric = false;
   m_rank = -1;
   m_denseRowCount = -1;
   m_denseRowPenalty = NumTraits<double>::quiet_NaN();
@@ -731,8 +945,29 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
     m_conditionEstimate = RealScalar(a.conditionEstimate);
   };
 
+  // ---- the symmetric fast path ------------------------------------------
+  // Not an escalation: a cheaper answer to the same question, taken when the
+  // matrix admits it. Rejection here costs one LDL^T -- roughly half an LU -- and
+  // the ladder proceeds exactly as it would have.
+  m_matrixIsSymmetric = m_size > 0 && symmetricEnough(matrix);
+  bool directAnalyzed = false;
+  if (m_matrixIsSymmetric) {
+    Attempt sym = runSymmetric(matrix, directAnalyzed);
+    m_attempts.push_back(sym);
+    if (sym.accepted) {
+      m_useSymmetric = true;
+      m_strategy = Strategy::SymmetricLDLT;
+      m_outcome = Outcome::Solved;
+      m_info = Success;
+      m_backwardError = RealScalar(sym.backwardError);
+      m_conditionEstimate = RealScalar(sym.conditionEstimate);
+      return;
+    }
+    m_symmetric.reset();  // rejected: do not leave a solve pointing at it
+  }
+
   // ---- rung 0: the default strategy ------------------------------------
-  Attempt first = runDirect(matrix, Strategy::Default);
+  Attempt first = runDirect(matrix, Strategy::Default, directAnalyzed);
   m_attempts.push_back(first);
   if (first.factored) m_denseRowCount = Index(first.denseRows);
 
@@ -860,7 +1095,9 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
 template <typename MatrixType>
 template <typename Rhs, typename Dest>
 void RobustLU<MatrixType>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
-  if (m_useRankRevealing)
+  if (m_useSymmetric)
+    x = m_symmetric->solve(b.derived());
+  else if (m_useRankRevealing)
     x = m_rankRevealing->solve(b.derived());
   else if (m_usePivoting)
     x = m_pivoting->solve(b.derived());
@@ -870,11 +1107,15 @@ void RobustLU<MatrixType>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest
 
 template <typename MatrixType>
 Index RobustLU<MatrixType>::nnzL() const {
+  if (m_useSymmetric) return m_symmetric->nnzL();
   if (m_useRankRevealing) return Index(m_rankRevealing->matrixR().nonZeros());
   return m_usePivoting ? m_pivoting->nnzL() : m_direct->nnzL();
 }
 template <typename MatrixType>
 Index RobustLU<MatrixType>::nnzU() const {
+  // The symmetric rung stores no U at all -- L^H is read in its place, which is
+  // the whole of what it saves -- so 0 here is the fact, not a missing value.
+  if (m_useSymmetric) return 0;
   if (m_useRankRevealing) return Index(m_rankRevealing->matrixR().nonZeros());
   return m_usePivoting ? m_pivoting->nnzU() : m_direct->nnzU();
 }

@@ -47,24 +47,31 @@
 // non-positive pivot rather than stepping over one. The default handles either
 // case, and inertia() then says which it was, exactly.
 //
-// WHAT IS NOT HERE YET, stated so it is not mistaken for an oversight:
+// WHEN THE DIAGONAL ITSELF IS THE PROBLEM
 //
-//   * Intra-supernode parallelism. Factorization is dispatched over elimination-
-//     tree levels only, so the few enormous root separators run on one lane.
-//     SupernodalLU's measurements say that is where most of its parallel speedup
-//     comes from, so expect this solver to scale worse than that one until the
-//     chunking is ported, even though its serial work is smaller.
-//   * Symmetric weighted matching (Duff-Pralet). Bunch-Kaufman chooses pivots
-//     inside a supernode; a matching would choose a better diagonal before the
-//     ordering ever runs, which is what an indefinite matrix with a genuinely
-//     awkward diagonal wants.
-//   * matrixL() / vectorD() factor accessors.
+// Bunch-Kaufman can only pivot inside a supernode. If the ordering never puts a
+// good 2x2 candidate there, the solver perturbs its way through and the answer is
+// flagged but worthless. setMatching(true) fixes that upstream: a symmetric
+// weighted matching (Duff-Pralet) pairs columns into 2x2 candidates and keeps
+// each pair together through the ordering. On a matrix with an all-zero diagonal
+// this is the difference between an answer and none -- see SupernodalLDLTMatching.h.
+//
+// It is OFF by default because it is a real trade, not a free win: measured here,
+// a saddle-point system that already had a usable diagonal paid 2x the fill and
+// 3x the factorization time for pairs the numeric phase then declined.
+// replacedPivots() is the number that says whether you need it.
 //
 // NO UNSYMMETRIC MATCHING, AND THAT IS NOT A GAP. The siblings permute rows to
 // put large entries on the diagonal (MC64/transversal). That is an UNSYMMETRIC
 // row permutation: applying it to a symmetric matrix destroys the symmetry this
-// solver exists to exploit. The symmetric analogue is the Duff-Pralet matching
-// noted above, not MC64 as the LU solvers use it.
+// solver exists to exploit -- which is why the matching above is read as a
+// symmetric pairing rather than applied as the LU solvers apply theirs.
+//
+// PARALLELISM. Levels of the elimination tree are dispatched across the executor,
+// and a level too narrow to fill it switches to splitting one supernode's panel
+// instead (setIntraSupernodeParallelism). Expect this solver to scale somewhat
+// worse than SupernodalLU even so: half the flops sit against the same fixed
+// costs, and there is one panel per supernode to chunk rather than two.
 //
 // Usage:
 //   #include <SupernodalLDLT.h>
@@ -90,6 +97,7 @@
 #include "SupernodalLUSupport.h"
 #include "SupernodalLUSymbolic.h"
 #include "SupernodalLUExecutor.h"
+#include "SupernodalLDLTMatching.h"
 
 namespace Eigen {
 
@@ -255,9 +263,65 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   Index supernodeCount() const { return static_cast<Index>(m_supernodes.size()); }
   Index levelCount() const { return static_cast<Index>(m_levelGroups.size()); }
 
+  /** How many supernodes the last factorize() ran with intra-supernode
+   *  parallelism rather than as one task on one lane. Always 0 for a serial
+   *  executor or when setIntraSupernodeParallelism(false).
+   *
+   *  Expect a small number -- the root-separator chain only -- carrying a large
+   *  share of the time. A count of 0 on a multi-lane run means every level was
+   *  wide enough, or every panel too short, to leave alone. */
+  Index intraParallelSupernodes() const { return m_intraSupernodes; }
+
   /** The fill-reducing permutation: indices()(i) is the internal index of
    *  original column i. */
   const PermutationType& permutation() const { return m_permutation; }
+
+  // --- the factors themselves ------------------------------------------------
+  //
+  // These MATERIALIZE the factor rather than expose the panel arena, which is
+  // the only honest option: the arena is a set of dense panels whose rows are
+  // indirected through row blocks, and no Eigen expression maps onto it. They
+  // cost an allocation and a pass over the factor, so they are for inspecting,
+  // exporting or reusing the factorization, not for solving -- solve() reads the
+  // panels directly and is what you want inside a loop.
+  //
+  // The identity they satisfy, with S = scalingS() and P = factorPermutation():
+  //
+  //     L * D * L^H  ==  P (S A S) P^T
+  //
+  // P is NOT permutation(): it also carries the local symmetric interchanges
+  // Bunch-Kaufman chose inside each diagonal block. The two coincide exactly
+  // when nothing was interchanged, which is every Pivoting::None factorization
+  // and most positive definite ones.
+
+  /** L: unit lower triangular, with its unit diagonal stored explicitly.
+   *
+   *  Includes the explicit zeros amalgamation introduces -- they are part of
+   *  what the factor occupies, and nnzL() counts them the same way. */
+  SparseMatrix<Scalar, ColMajor, StorageIndex> matrixL() const;
+
+  /** D: block diagonal, 1x1 and 2x2 blocks. Equal to vectorD().asDiagonal()
+   *  exactly when pivotBlocks2x2() is 0. */
+  SparseMatrix<Scalar, ColMajor, StorageIndex> matrixD() const;
+
+  /** The diagonal of D. This is the WHOLE of D only when pivotBlocks2x2() is 0;
+   *  otherwise each 2x2 block also carries an off-diagonal that lives only in
+   *  matrixD(). */
+  Matrix<Scalar, Dynamic, 1> vectorD() const;
+
+  /** The symmetric equilibration S, in the CALLER's numbering: A~ = S A S was
+   *  what got factored. All ones when setEquilibration(false). */
+  Matrix<RealScalar, Dynamic, 1> scalingS() const {
+    Matrix<RealScalar, Dynamic, 1> s(m_size);
+    for (StorageIndex i = 0; i < m_size; ++i) s[i] = m_scale[i];
+    return s;
+  }
+
+  /** The permutation the FACTOR is expressed in: the fill-reducing ordering
+   *  followed by the local symmetric interchanges. indices()(i) is the factor
+   *  index of original column i. Equal to permutation() when no interchange
+   *  happened. */
+  PermutationType factorPermutation() const;
 
   /** Relative residual ||b - Ax|| / ||b|| measured by the last solve(). */
   RealScalar solveResidual() const { return m_lastSolveRelativeResidual; }
@@ -330,6 +394,32 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   }
   RealScalar staticPivotThreshold() const { return m_staticPivotThreshold; }
 
+  /** Symmetric weighted matching before the ordering (Duff-Pralet), OFF by
+   *  default. See SupernodalLDLTMatching.h for what it does and why the LU
+   *  solvers' matching is not it.
+   *
+   *  Turn it on for a symmetric matrix whose DIAGONAL is the problem: a
+   *  saddle-point or KKT system with a zero block, a mixed formulation, anything
+   *  where Bunch-Kaufman ends up perturbing pivots or reports straddlingPivots().
+   *  It pairs columns into 2x2 pivot candidates and keeps each pair together
+   *  through the ordering, so the pivot the numeric phase wants is inside the
+   *  supernode where it can be taken.
+   *
+   *  Off by default because it is not free and a positive definite matrix gets
+   *  nothing from it: the diagonal is already the best pivot available, every
+   *  pair the matching proposes is declined, and all that is left is the
+   *  matching's own cost plus a quotient graph the ordering handles slightly
+   *  worse than the original. replacedPivots() is the number to watch -- if it
+   *  is 0, this has nothing to offer. */
+  void setMatching(bool on) { m_matching = on; }
+  bool matching() const { return m_matching; }
+
+  /** 2x2 pivot candidate pairs the matching formed, or 0 when it did not run.
+   *  Compare against pivotBlocks2x2(): the gap is the pairs the numeric phase
+   *  looked at and declined, which is the matching working as intended rather
+   *  than failing. */
+  Index matchedPairs() const { return m_matchedPairs; }
+
   /** Symmetric Ruiz equilibration A~ = S A S, on by default. Symmetric by
    *  construction -- one scaling applied on both sides -- because a two-sided
    *  Dr A Dc would not preserve symmetry. Fully transparent to solve() and the
@@ -387,6 +477,19 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
    *  levels. Results are unchanged (each supernode writes only its own rows). */
   void setParallelSolve(bool on) { m_parallelSolve = on; }
   bool parallelSolve() const { return m_parallelSolve; }
+
+  /** Parallelize INSIDE a supernode on levels too narrow to fill the executor,
+   *  on by default.
+   *
+   *  Level dispatch alone leaves the root separators -- a handful of supernodes
+   *  that carry most of the work -- running on one lane. On such a level the
+   *  supernodes are run sequentially and their panel operations are split across
+   *  the pool instead: the Schur updates by disjoint target-panel row ranges, the
+   *  panel solve by independent rows. Chunks write disjoint outputs and leave
+   *  each element's accumulation order unchanged, so the answer does not depend
+   *  on the setting. */
+  void setIntraSupernodeParallelism(bool on) { m_intraParallel = on; }
+  bool intraSupernodeParallelism() const { return m_intraParallel; }
 
   Executor& executor() { return m_executor; }
   const Executor& executor() const { return m_executor; }
@@ -447,12 +550,16 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
     m_refinementTolerance = NumTraits<RealScalar>::epsilon();
     m_solveFailureThreshold = RealScalar(1e-6);
     m_parallelSolve = true;
+    m_intraParallel = true;
+    m_matching = false;
+    m_matchedPairs = 0;
     m_pivoting = supernodal_ldlt::Pivoting::BunchKaufman;
     m_staticPivotThreshold = RealScalar(0);
     m_thresholdIsAuto = true;
     m_replacedPivots = 0;
     m_pivot2x2Count = 0;
     m_straddlingPivots = 0;
+    m_intraSupernodes = 0;
     m_inertia = supernodal_ldlt::Inertia();
     m_lastSolveRelativeResidual = RealScalar(0);
     m_lastRefinementIterations = 0;
@@ -514,6 +621,13 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
     return (int(UpLo) & int(Lower)) ? (i >= j) : (i <= j);
   }
 
+  /** Numbering from the symmetric matching: pairs contracted, the quotient graph
+   *  ordered and postordered, then expanded so each pair lands on two ADJACENT
+   *  columns. Fills m_toInternal and returns true; returns false (leaving
+   *  m_toInternal untouched) when the matching found no pair worth keeping, in
+   *  which case the ordinary path is both cheaper and no worse. */
+  bool computeMatchedNumbering(const MatrixType& matrix);
+
   // Symmetric adjacency in the internal numbering. The input holds one triangle,
   // and every stored off-diagonal entry contributes BOTH directions, so this is
   // the full elimination graph whichever triangle UpLo selects.
@@ -523,10 +637,78 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   // Symmetric Ruiz equilibration: one scaling vector applied on both sides.
   void computeEquilibration(const MatrixType& matrix);
 
-  // `destRowScratch` is caller-owned rather than a member: factorizeSupernode
-  // runs concurrently across a level, so a shared scratch buffer would race.
+  /** Everything one update needs to borrow rather than allocate. Caller-owned
+   *  rather than a member: these run concurrently across a level, so a shared
+   *  buffer would race -- and allocating instead would SERIALIZE, which is the
+   *  more expensive mistake of the two. An LU update kernel gets to work
+   *  entirely in block views of its two arenas; an LDL^T one has to form
+   *  D * L^H somewhere, and doing that through the allocator once per source
+   *  block is what flattens the parallel speedup. */
+  struct UpdateScratch {
+    std::vector<StorageIndex> destRow;  // panel positions of the below-facing blocks
+    std::vector<Scalar> scaled;         // D_src * L_cb^H for the current column block
+  };
+
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex firstFacingBlock,
-                   std::vector<StorageIndex>& destRowScratch);
+                   UpdateScratch& scratch);
+
+  // Intra-parallel variant for the big root supernodes: applies ALL sources with
+  // ONE fork-join dispatch over the target's panel rows rather than running the
+  // sources on a single lane. Each chunk walks the sources in order and applies
+  // only the slice of each update landing in its own rows, so chunks write
+  // disjoint elements and every element still accumulates in source order.
+  // Only legal from a sequential caller -- the pool is fork-join, not nestable.
+  void applyAllUpdatesChunked(StorageIndex target);
+
+  // Largest rows of a chunk when splitting a panel operation across the pool:
+  // big enough that dispatch overhead is negligible against the chunk's BLAS-3
+  // work, small enough to balance the tall root panels. A CEILING, not the chunk
+  // size -- see intraChunkRows().
+  static constexpr Index kIntraChunkSize = 128;
+  // Floor on chunk extent: below this a panel GEMM is a strip too thin to
+  // amortize either the BLAS call or the per-chunk walk over the update sources.
+  static constexpr Index kMinIntraChunkSize = 32;
+  // How far from "wide enough to fill the lanes" a MULTI-supernode level may be
+  // and still switch to intra-supernode parallelism. A level of ONE supernode
+  // qualifies unconditionally: there is no inter-supernode parallelism to give
+  // up. These are SupernodalLU's tuned values, and they carry over because the
+  // quantity they trade off -- panel rows per lane against dispatch overhead --
+  // is the same in both solvers; only the number of panels per supernode differs.
+  static constexpr Index kIntraLevelSlack = 8;
+
+  // Chunk extent for splitting `total` rows across the pool. Aiming at one chunk
+  // per lane is what keeps this from being capped by the ceiling: a fixed extent
+  // would give ceil(total/128) chunks no matter how many lanes exist.
+  Index intraChunkRows(Index total) const {
+    const Index lanes = static_cast<Index>(m_executor.concurrency());
+    if (lanes <= 1 || total <= 0) return numext::maxi(Index(1), total);
+    const Index perLane = (total + lanes - 1) / lanes;
+    return numext::maxi(kMinIntraChunkSize, numext::mini(kIntraChunkSize, perLane));
+  }
+
+  // Split [0, total) into contiguous chunks of at most `chunkRows` and dispatch
+  // body(start, length) for each. Runs inline when only one chunk remains.
+  template <typename F>
+  void parallelChunks(Index total, Index chunkRows, const F& body) const {
+    const Index chunkCount = (total + chunkRows - 1) / chunkRows;
+    if (chunkCount <= 1) {
+      if (total > 0) body(Index(0), total);
+      return;
+    }
+    m_executor.parallelFor(Index(0), chunkCount, [&](Index c) {
+      const Index start = c * chunkRows;
+      body(start, numext::mini(chunkRows, total - start));
+    });
+  }
+
+  // D_src * L_cb^H for one facing column block of `source`: the factor every row
+  // block of that column block multiplies against. Formed once per column block
+  // so the block-diagonal scaling never enters a GEMM inner loop, and a 2x2 pivot
+  // MIXES the two rows rather than scaling them. Writes into `scratch`, which the
+  // returned map views, so a caller in a parallel region allocates at most once.
+  typedef Map<DenseMatrix> PlainPanel;
+  PlainPanel scaledSourceBlock(StorageIndex source, const RowBlock& colBlock,
+                               std::vector<Scalar>& scratch) const;
 
   /** Per-supernode outcome of the numeric phase, kept in a disjoint slot per
    *  supernode so a level can be factored concurrently without shared writes. */
@@ -539,7 +721,8 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
     Index straddling = 0;
   };
 
-  void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, SupernodeResult& result);
+  void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, SupernodeResult& result,
+                          bool intraParallel);
   /** 1x1 pivots taken in order, no search. Positive definite input only. */
   void factorizeDiagonalBlockUnpivoted(StridedPanel diag, signed char* pivotKind,
                                        SupernodeResult& result) const;
@@ -572,6 +755,23 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
     DenseMatrix tmp = head;
     for (StorageIndex k = 0; k < static_cast<StorageIndex>(perm.size()); ++k)
       head.row(perm[k]) = tmp.row(k);
+  }
+
+  /** toFactor[c] is the row/column the factor gives internal column c, i.e. the
+   *  internal numbering with each supernode's local interchange folded in.
+   *  Identity wherever no interchange happened, which is usually everywhere. */
+  void buildFactorIndexMap(std::vector<StorageIndex>& toFactor) const {
+    toFactor.resize(static_cast<std::size_t>(m_size));
+    for (StorageIndex c = 0; c < m_size; ++c) toFactor[c] = c;
+    for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+      const std::vector<StorageIndex>& perm = m_diagPivot[s];
+      if (perm.empty()) continue;
+      const StorageIndex first = m_supernodes[s].firstColumn;
+      // perm[k] is the local index now sitting at position k, so it is position
+      // k that the factor gives it.
+      for (StorageIndex k = 0; k < static_cast<StorageIndex>(perm.size()); ++k)
+        toFactor[first + perm[k]] = first + k;
+    }
   }
 
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& x) const;
@@ -660,7 +860,8 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   std::vector<RealScalar> m_scale;  // symmetric equilibration, original numbering
   MatrixType m_originalMatrix;
 
-  bool m_equilibrate, m_parallelSolve;
+  bool m_equilibrate, m_parallelSolve, m_intraParallel, m_matching;
+  Index m_matchedPairs;
   Index m_relaxedSize, m_maxAmalgamationZeroRows;
   double m_amalgamationFillFraction;
   Index m_maxBlockSize, m_maxFactorNonzeros;
@@ -669,7 +870,7 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   supernodal_ldlt::Pivoting m_pivoting;
   RealScalar m_staticPivotThreshold;
   bool m_thresholdIsAuto;
-  Index m_replacedPivots, m_pivot2x2Count, m_straddlingPivots;
+  Index m_replacedPivots, m_pivot2x2Count, m_straddlingPivots, m_intraSupernodes;
   supernodal_ldlt::Inertia m_inertia;
   RealScalar m_refinementTolerance, m_solveFailureThreshold;
   mutable RealScalar m_lastSolveRelativeResidual;
@@ -705,6 +906,121 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::buildSymmetricAdj
   }
 }
 
+// The matching path, end to end: pair, contract, order the quotient, expand.
+//
+// Everything here happens on the QUOTIENT graph rather than on A, and that is the
+// whole trick. Ordering A and hoping the pairs survive does not work: a pair is
+// connected, so one of its columns is the other's parent in the elimination tree,
+// and a postorder only puts them side by side if the child happens to be visited
+// last. Contracting first makes "side by side" a property of the construction
+// instead of a coincidence.
+//
+// The expanded numbering is still a valid postorder of the expanded elimination
+// tree, which is what the supernode partition downstream wants. Each quotient
+// node expands to a CHAIN of one or two columns -- the leader's parent is its
+// partner, since they are adjacent -- and a quotient node's descendants are
+// exactly the expansions of its quotient descendants, all of which the quotient
+// postorder already placed before it. So no further postorder is needed, and the
+// caller must not apply one: it would undo this.
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+bool SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::computeMatchedNumbering(
+    const MatrixType& matrix) {
+  const StorageIndex n = m_size;
+  namespace symbolic = supernodal_lu::symbolic;
+
+  // The matching reads rows and columns alike, so it needs both triangles: a
+  // single stored triangle is a different, unsymmetric problem and would be
+  // matched as one.
+  MatrixType full = matrix.template selfadjointView<UpLo>();
+  std::vector<StorageIndex> partner;
+  m_matchedPairs = supernodal_ldlt::symmetricMatchingPairs(full, partner);
+  if (m_matchedPairs == 0) return false;
+
+  // 1) contract each pair to one quotient vertex.
+  std::vector<StorageIndex> quotientOf(static_cast<std::size_t>(n), StorageIndex(-1));
+  std::vector<StorageIndex> leader, follower;  // members of each quotient vertex
+  leader.reserve(static_cast<std::size_t>(n));
+  follower.reserve(static_cast<std::size_t>(n));
+  for (StorageIndex i = 0; i < n; ++i) {
+    if (quotientOf[i] != StorageIndex(-1)) continue;
+    const StorageIndex c = static_cast<StorageIndex>(leader.size());
+    quotientOf[i] = c;
+    leader.push_back(i);
+    const StorageIndex p = partner[static_cast<std::size_t>(i)];
+    if (p >= 0) {
+      quotientOf[p] = c;
+      follower.push_back(p);
+    } else {
+      follower.push_back(StorageIndex(-1));
+    }
+  }
+  const StorageIndex nc = static_cast<StorageIndex>(leader.size());
+
+  // 2) quotient adjacency, in the original quotient numbering.
+  std::vector<std::vector<StorageIndex>> quotientAdj(static_cast<std::size_t>(nc));
+  for (StorageIndex j = 0; j < n; ++j) {
+    const StorageIndex cj = quotientOf[j];
+    for (typename MatrixType::InnerIterator it(full, j); it; ++it) {
+      const StorageIndex ci = quotientOf[static_cast<StorageIndex>(it.index())];
+      if (ci == cj) continue;
+      quotientAdj[cj].push_back(ci);
+      quotientAdj[ci].push_back(cj);
+    }
+  }
+  for (StorageIndex c = 0; c < nc; ++c) {
+    std::vector<StorageIndex>& row = quotientAdj[c];
+    std::sort(row.begin(), row.end());
+    row.erase(std::unique(row.begin(), row.end()), row.end());
+  }
+
+  // 3) fill-reducing ordering OF THE QUOTIENT. The functor wants a matrix, and
+  //    only its pattern is read, so the values are placeholders.
+  MatrixType quotient(nc, nc);
+  {
+    std::vector<Triplet<Scalar, StorageIndex>> entries;
+    std::size_t count = static_cast<std::size_t>(nc);
+    for (StorageIndex c = 0; c < nc; ++c) count += quotientAdj[c].size();
+    entries.reserve(count);
+    for (StorageIndex c = 0; c < nc; ++c) {
+      entries.emplace_back(c, c, Scalar(1));
+      for (StorageIndex v : quotientAdj[c]) entries.emplace_back(v, c, Scalar(1));
+    }
+    quotient.setFromTriplets(entries.begin(), entries.end());
+  }
+  PermutationType orderingPerm;
+  m_orderingFunctor(quotient, orderingPerm);
+  std::vector<StorageIndex> toOrdered(static_cast<std::size_t>(nc));
+  if (orderingPerm.size() == 0) {
+    for (StorageIndex c = 0; c < nc; ++c) toOrdered[c] = c;
+  } else {
+    for (StorageIndex c = 0; c < nc; ++c) toOrdered[orderingPerm.indices()(c)] = c;
+  }
+
+  // 4) elimination tree and postorder of the quotient, in that numbering.
+  std::vector<std::vector<StorageIndex>> orderedAdj(static_cast<std::size_t>(nc));
+  for (StorageIndex c = 0; c < nc; ++c) {
+    std::vector<StorageIndex>& row = orderedAdj[toOrdered[c]];
+    row.reserve(quotientAdj[c].size());
+    for (StorageIndex v : quotientAdj[c]) row.push_back(toOrdered[v]);
+    std::sort(row.begin(), row.end());
+  }
+  std::vector<StorageIndex> parent, postorder;
+  symbolic::computeEliminationTree(nc, orderedAdj, parent);
+  symbolic::computePostorder(nc, parent, postorder);
+
+  // 5) expand, leader immediately before its partner.
+  std::vector<StorageIndex> fromOrdered(static_cast<std::size_t>(nc));
+  for (StorageIndex c = 0; c < nc; ++c) fromOrdered[toOrdered[c]] = c;
+  StorageIndex next = 0;
+  for (StorageIndex t = 0; t < nc; ++t) {
+    const StorageIndex c = fromOrdered[postorder[t]];
+    m_toInternal[leader[c]] = next++;
+    if (follower[c] >= 0) m_toInternal[follower[c]] = next++;
+  }
+  eigen_assert(next == n && "matched numbering did not cover every column");
+  return true;
+}
+
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
 void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::analyzePattern(const MatrixType& matrix) {
   eigen_assert(matrix.rows() == matrix.cols() && "SupernodalLDLT requires a square matrix");
@@ -726,37 +1042,42 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::analyzePattern(co
     return;
   }
 
-  // 1) fill-reducing ordering. Eigen's AMD/METIS functors symmetrize whatever
-  //    they are given, so passing a single triangle orders the same graph the
-  //    factorization will eliminate.
-  PermutationType orderingPerm;
-  m_orderingFunctor(matrix, orderingPerm);
-  if (orderingPerm.size() == 0) {  // NaturalOrdering reports the identity as empty
-    for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = i;
-  } else {
-    // indices()(k) is the ORIGINAL column placed at new position k, so invert to
-    // get "the internal index OF original column i". Getting this backwards
-    // leaves residuals at machine precision and shows up only as fill -- by
-    // orders of magnitude on strongly directional 3D matrices.
-    for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
+  namespace symbolic = supernodal_lu::symbolic;
+  m_matchedPairs = 0;
+
+  // 1) the numbering: ordering plus postorder, from one of two paths. The
+  //    matching path does both on the quotient graph and arrives with the
+  //    numbering finished -- applying a second postorder to it would separate
+  //    the pairs it exists to keep together.
+  std::vector<std::vector<StorageIndex>> adjacency;
+  std::vector<StorageIndex> parent;
+  if (!(m_matching && computeMatchedNumbering(matrix))) {
+    // Eigen's AMD/METIS functors symmetrize whatever they are given, so passing a
+    // single triangle orders the same graph the factorization will eliminate.
+    PermutationType orderingPerm;
+    m_orderingFunctor(matrix, orderingPerm);
+    if (orderingPerm.size() == 0) {  // NaturalOrdering reports the identity as empty
+      for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = i;
+    } else {
+      // indices()(k) is the ORIGINAL column placed at new position k, so invert to
+      // get "the internal index OF original column i". Getting this backwards
+      // leaves residuals at machine precision and shows up only as fill -- by
+      // orders of magnitude on strongly directional 3D matrices.
+      for (StorageIndex i = 0; i < n; ++i) m_toInternal[orderingPerm.indices()(i)] = i;
+    }
+
+    // Postorder the elimination tree and fold it into the numbering, so that
+    // supernodes come out contiguous.
+    buildSymmetricAdjacency(matrix, adjacency);
+    symbolic::computeEliminationTree(n, adjacency, parent);
+    std::vector<StorageIndex> postorder;
+    symbolic::computePostorder(n, parent, postorder);
+    std::vector<StorageIndex> relabel(n);
+    for (StorageIndex t = 0; t < n; ++t) relabel[postorder[t]] = t;
+    for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = relabel[m_toInternal[i]];
   }
 
-  namespace symbolic = supernodal_lu::symbolic;
-
-  // 2) elimination tree of the ordered pattern.
-  std::vector<std::vector<StorageIndex>> adjacency;
-  buildSymmetricAdjacency(matrix, adjacency);
-  std::vector<StorageIndex> parent;
-  symbolic::computeEliminationTree(n, adjacency, parent);
-
-  // 3) postorder and fold into the numbering so supernodes are contiguous.
-  std::vector<StorageIndex> postorder;
-  symbolic::computePostorder(n, parent, postorder);
-  std::vector<StorageIndex> relabel(n);
-  for (StorageIndex t = 0; t < n; ++t) relabel[postorder[t]] = t;
-  for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = relabel[m_toInternal[i]];
-
-  // 4) recompute adjacency + tree in the final numbering.
+  // 4) adjacency + tree in the final numbering.
   buildSymmetricAdjacency(matrix, adjacency);
   symbolic::computeEliminationTree(n, adjacency, parent);
 
@@ -1061,18 +1382,52 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeDiagonal
 // only the lower triangle is computed. That is the whole factor-of-two in the
 // numeric phase.
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+typename SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::PlainPanel
+SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::scaledSourceBlock(
+    StorageIndex source, const RowBlock& colBlock, std::vector<Scalar>& scratch) const {
+  const Supernode& src = m_supernodes[source];
+  const StorageIndex wSrc = src.width(), cc = colBlock.height();
+  const ConstStridedPanel srcLower = lowerPanel(source);
+  const ConstStridedPanel srcDiag = diagBlock(source);
+  const signed char* srcPivotKind = m_pivotKind.data() + static_cast<std::size_t>(src.firstColumn);
+  const Scalar* srcDOffDiag = m_dOffDiag.data() + static_cast<std::size_t>(src.firstColumn);
+
+  const std::size_t need = static_cast<std::size_t>(wSrc) * static_cast<std::size_t>(cc);
+  if (scratch.size() < need) scratch.resize(need);
+  PlainPanel dl(scratch.data(), wSrc, cc);
+  dl = srcLower.block(colBlock.panelOffset, 0, cc, wSrc).adjoint();
+  for (StorageIndex q = 0; q < wSrc;) {
+    if (srcPivotKind[q] != 2) {
+      dl.row(q) *= srcDiag(q, q);
+      q += 1;
+    } else {
+      // D = [[a, conj(c)], [c, b]] mixes the two rows rather than scaling them.
+      // Done entry by entry: the two-row temporary the expression form needs
+      // would be another allocation, in the hottest loop there is.
+      const Scalar a = Scalar(numext::real(srcDiag(q, q))), c = srcDOffDiag[q],
+                   b = Scalar(numext::real(srcDiag(q + 1, q + 1)));
+      const Scalar cbar = numext::conj(c);
+      for (StorageIndex col = 0; col < cc; ++col) {
+        const Scalar x0 = dl(q, col), x1 = dl(q + 1, col);
+        dl(q, col) = a * x0 + cbar * x1;
+        dl(q + 1, col) = c * x0 + b * x1;
+      }
+      q += 2;
+    }
+  }
+  return dl;  // wSrc x cc
+}
+
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
 void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
     StorageIndex source, StorageIndex target, StorageIndex firstFacingBlock,
-    std::vector<StorageIndex>& destRowScratch) {
+    UpdateScratch& scratch) {
   const Supernode& src = m_supernodes[source];
   const StorageIndex wSrc = src.width();
   const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
   const StorageIndex targetFirstColumn = m_supernodes[target].firstColumn;
 
   const StridedPanel srcLower = lowerPanel(source);
-  const StridedPanel srcDiag = diagBlock(source);
-  const signed char* srcPivotKind = m_pivotKind.data() + static_cast<std::size_t>(src.firstColumn);
-  const Scalar* srcDOffDiag = m_dOffDiag.data() + static_cast<std::size_t>(src.firstColumn);
   StridedPanel targetDiag = diagBlock(target);
   StridedPanel targetLower = lowerPanel(target);
 
@@ -1083,9 +1438,9 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
   // Hoist the panel-position search for the below-facing blocks: it depends on
   // the row block alone, and the column-block loop below would otherwise repeat
   // it once per facing column block.
-  destRowScratch.clear();
+  scratch.destRow.clear();
   for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb)
-    destRowScratch.push_back(rowPanelPosition(target, m_rowBlocks[rb].firstRow));
+    scratch.destRow.push_back(rowPanelPosition(target, m_rowBlocks[rb].firstRow));
 
   // COLUMN BLOCK OUTER: D_src * L_cb^H is formed once per column block and every
   // row block reuses it, so the diagonal scaling never enters a GEMM inner loop.
@@ -1094,20 +1449,7 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
     const StorageIndex cc = colBlock.height();
     const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
 
-    DenseMatrix dl = srcLower.block(colBlock.panelOffset, 0, cc, wSrc).adjoint();  // wSrc x cc
-    for (StorageIndex q = 0; q < wSrc;) {
-      if (srcPivotKind[q] != 2) {
-        dl.row(q) *= srcDiag(q, q);
-        q += 1;
-      } else {
-        // D = [[a, conj(c)], [c, b]] mixes the two rows rather than scaling them.
-        const Scalar a = srcDiag(q, q), c = srcDOffDiag[q], b = srcDiag(q + 1, q + 1);
-        const DenseMatrix pair = dl.middleRows(q, 2);
-        dl.row(q) = Scalar(numext::real(a)) * pair.row(0) + numext::conj(c) * pair.row(1);
-        dl.row(q + 1) = c * pair.row(0) + Scalar(numext::real(b)) * pair.row(1);
-        q += 2;
-      }
-    }
+    const PlainPanel dl = scaledSourceBlock(source, colBlock, scratch.scaled);  // wSrc x cc
 
     // facing rows -> the target's diagonal block. rb starts at cb: the pairs with
     // rb < cb would land strictly above the diagonal, which is not stored.
@@ -1127,19 +1469,114 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
     for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
       const RowBlock& rowBlock = m_rowBlocks[rb];
       const StorageIndex rc = rowBlock.height();
-      const StorageIndex destRow = destRowScratch[static_cast<std::size_t>(rb - lastFacing)];
+      const StorageIndex destRow = scratch.destRow[static_cast<std::size_t>(rb - lastFacing)];
       targetLower.block(destRow, targetColStart, rc, cc).noalias() -=
           srcLower.block(rowBlock.panelOffset, 0, rc, wSrc) * dl;
     }
   }
 }
 
+// All of a target's updates, with the off-diagonal panel split across the pool.
+//
+// The split is by TARGET PANEL ROWS, which is the only axis that keeps the
+// outputs disjoint: two different sources write the same target rows, so
+// chunking by source would collide, while a row range of the target's panel is
+// written by exactly one chunk. Within a chunk the sources are still walked in
+// order, and for a fixed source exactly one (column block, row block) pair
+// reaches any given element -- so each element sees the same subtractions in the
+// same order as the serial sweep.
+//
+// The one thing this repeats rather than shares is D_src * L_cb^H, which every
+// chunk recomputes for each source's column blocks. That is wSrc x cc of work
+// against the chunk's rows x cc x wSrc of GEMM, and the chunk extent never falls
+// below kMinIntraChunkSize, so the repeat is bounded by ~1/32 of the work it
+// feeds -- cheaper than materializing every source's scaled block up front,
+// which for a root supernode is the size of the panel again.
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyAllUpdatesChunked(
+    StorageIndex target) {
+  const std::vector<UpdateSource>& sources = m_updateSources[target];
+  if (sources.empty()) return;
+  const Supernode& tn = m_supernodes[target];
+  const StorageIndex targetFirstColumn = tn.firstColumn;
+  const Index offDiag = static_cast<Index>(tn.offDiagonalRowCount);
+  StridedPanel targetDiag = diagBlock(target);
+  StridedPanel targetLower = lowerPanel(target);
+
+  // Pass 1 (serial): the target's diagonal block. At most width x width per
+  // source, and disjoint from the panel, so there is nothing to gain by
+  // splitting it and no ordering constraint against pass 2.
+  std::vector<Scalar> dlScratch;
+  for (const UpdateSource& u : sources) {
+    const Supernode& src = m_supernodes[u.sourceSupernode];
+    const StorageIndex wSrc = src.width();
+    const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
+    const StridedPanel srcLower = lowerPanel(u.sourceSupernode);
+    StorageIndex lastFacing = u.facingRowBlock;
+    while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target) ++lastFacing;
+    for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
+      const RowBlock& colBlock = m_rowBlocks[cb];
+      const StorageIndex cc = colBlock.height();
+      const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+      const PlainPanel dl = scaledSourceBlock(u.sourceSupernode, colBlock, dlScratch);
+      for (StorageIndex rb = cb; rb < lastFacing; ++rb) {
+        const RowBlock& rowBlock = m_rowBlocks[rb];
+        const StorageIndex rc = rowBlock.height();
+        const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
+        const auto lower = srcLower.block(rowBlock.panelOffset, 0, rc, wSrc);
+        if (rb == cb)
+          targetDiag.block(destRow, targetColStart, rc, cc).template triangularView<Lower>() -=
+              lower * dl;
+        else
+          targetDiag.block(destRow, targetColStart, rc, cc).noalias() -= lower * dl;
+      }
+    }
+  }
+
+  // Pass 2: the off-diagonal panel, chunked by disjoint target row ranges.
+  parallelChunks(offDiag, intraChunkRows(offDiag), [&](Index chunkStart, Index chunkLen) {
+    const Index chunkEnd = chunkStart + chunkLen;
+    std::vector<Scalar> chunkScratch;  // one per chunk, not one per source block
+    for (const UpdateSource& u : sources) {
+      const Supernode& src = m_supernodes[u.sourceSupernode];
+      const StorageIndex wSrc = src.width();
+      const StorageIndex lastBlock = src.firstRowBlock + src.rowBlockCount;
+      const StridedPanel srcLower = lowerPanel(u.sourceSupernode);
+      StorageIndex lastFacing = u.facingRowBlock;
+      while (lastFacing < lastBlock && m_rowBlocks[lastFacing].facingSupernode == target)
+        ++lastFacing;
+      for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
+        const RowBlock& colBlock = m_rowBlocks[cb];
+        const StorageIndex cc = colBlock.height();
+        const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
+        const PlainPanel dl = scaledSourceBlock(u.sourceSupernode, colBlock, chunkScratch);
+        for (StorageIndex rb = lastFacing; rb < lastBlock; ++rb) {
+          const RowBlock& rowBlock = m_rowBlocks[rb];
+          const Index destRow = static_cast<Index>(rowPanelPosition(target, rowBlock.firstRow));
+          if (destRow >= chunkEnd) break;  // panel positions increase with rb
+          const Index a = numext::maxi(destRow, chunkStart);
+          const Index b = numext::mini(destRow + static_cast<Index>(rowBlock.height()), chunkEnd);
+          if (a >= b) continue;
+          targetLower.block(a, targetColStart, b - a, cc).noalias() -=
+              srcLower.block(rowBlock.panelOffset + (a - destRow), 0, b - a, wSrc) * dl;
+        }
+      }
+    }
+  });
+}
+
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
 void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeSupernode(
-    StorageIndex s, const RealScalar& staticPivot, SupernodeResult& result) {
-  std::vector<StorageIndex> destRowScratch;  // per-call: this runs concurrently
-  for (const UpdateSource& u : m_updateSources[s])
-    applyUpdate(u.sourceSupernode, s, u.facingRowBlock, destRowScratch);
+    StorageIndex s, const RealScalar& staticPivot, SupernodeResult& result, bool intraParallel) {
+  // Both paths accumulate each element's updates in source order; the chunked
+  // one spreads the panel GEMMs across the pool instead of the supernodes.
+  if (intraParallel) {
+    applyAllUpdatesChunked(s);
+  } else {
+    UpdateScratch scratch;  // per-call: this runs concurrently across the level
+    for (const UpdateSource& u : m_updateSources[s])
+      applyUpdate(u.sourceSupernode, s, u.facingRowBlock, scratch);
+  }
 
   const Supernode& sn = m_supernodes[s];
   const StorageIndex w = sn.width();
@@ -1173,23 +1610,36 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeSupernod
 
   // A_Rk = L_Rk D_kk L_kk^H, so L_Rk = A_Rk L_kk^-H D_kk^-1: one right-solve
   // against the unit upper triangle, then a right-multiply by D^-1 that has to
-  // treat a 2x2 pivot as a block rather than two scalars.
-  diag.template triangularView<UnitLower>().adjoint().template solveInPlace<OnTheRight>(lower);
-  for (StorageIndex q = 0; q < w;) {
-    if (pivotKind[q] != 2) {
-      lower.col(q) /= diag(q, q);
-      q += 1;
-    } else {
-      const Scalar a = diag(q, q), c = dOffDiag[q], b = diag(q + 1, q + 1);
-      const RealScalar det = numext::real(a) * numext::real(b) - numext::abs2(c);
-      const DenseMatrix pair = lower.middleCols(q, 2);
-      // [x0 x1] * D^-1 with D^-1 = (1/det) [[b, -conj(c)], [-c, a]].
-      lower.col(q) = (pair.col(0) * Scalar(numext::real(b)) - pair.col(1) * c) / Scalar(det);
-      lower.col(q + 1) =
-          (pair.col(1) * Scalar(numext::real(a)) - pair.col(0) * numext::conj(c)) / Scalar(det);
-      q += 2;
+  // treat a 2x2 pivot as a block rather than two scalars. Every ROW of the panel
+  // goes through both independently, which is what lets chunks of rows run
+  // concurrently on a level too narrow to fill the pool any other way.
+  auto panelSolve = [&](Index start, Index len) {
+    auto rows = lower.middleRows(start, len);
+    diag.template triangularView<UnitLower>().adjoint().template solveInPlace<OnTheRight>(rows);
+    for (StorageIndex q = 0; q < w;) {
+      if (pivotKind[q] != 2) {
+        rows.col(q) /= diag(q, q);
+        q += 1;
+      } else {
+        // [x0 x1] * D^-1 with D^-1 = (1/det) [[b, -conj(c)], [-c, a]], taken row
+        // by row so the two-column temporary never reaches the allocator.
+        const Scalar c = dOffDiag[q], cbar = numext::conj(c);
+        const RealScalar a = numext::real(diag(q, q)), b = numext::real(diag(q + 1, q + 1));
+        const Scalar det = Scalar(a * b - numext::abs2(c));
+        for (Index r = 0; r < rows.rows(); ++r) {
+          const Scalar x0 = rows(r, q), x1 = rows(r, q + 1);
+          rows(r, q) = (x0 * Scalar(b) - x1 * c) / det;
+          rows(r, q + 1) = (x1 * Scalar(a) - x0 * cbar) / det;
+        }
+        q += 2;
+      }
     }
-  }
+  };
+  const Index offDiag = static_cast<Index>(sn.offDiagonalRowCount);
+  if (intraParallel)
+    parallelChunks(offDiag, intraChunkRows(offDiag), panelSolve);
+  else
+    panelSolve(Index(0), offDiag);
 }
 
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
@@ -1203,6 +1653,7 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
   m_replacedPivots = 0;
   m_pivot2x2Count = 0;
   m_straddlingPivots = 0;
+  m_intraSupernodes = 0;
   m_inertia = supernodal_ldlt::Inertia();
   m_lastError.clear();
   m_info = Success;
@@ -1298,12 +1749,41 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
   //    concurrently and levels run in order.
   std::vector<SupernodeResult> results(static_cast<std::size_t>(supernodeNbr));
   bool bad = false;
+  const Index lanes = static_cast<Index>(m_executor.concurrency());
   for (const std::vector<StorageIndex>& group : m_levelGroups) {
     const Index groupSize = static_cast<Index>(group.size());
-    m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
-      const StorageIndex s = group[static_cast<std::size_t>(k)];
-      factorizeSupernode(s, staticPivot, results[s]);
-    });
+    // A level too narrow to fill the lanes switches to INTRA-supernode
+    // parallelism: its supernodes run sequentially here and their panel work is
+    // chunked across the pool instead. That is the root-separator chain, where
+    // level dispatch has nothing left to give -- one supernode on one lane, the
+    // rest idle -- and where most of the factorization time is. The pool is
+    // fork-join and not nestable, so the two modes are exclusive per level.
+    //
+    // A level of ONE supernode qualifies regardless of the slack: there is no
+    // inter-supernode parallelism there to trade away, so the only question is
+    // whether the panel is tall enough to chunk, which the next guard answers.
+    bool innerMode = m_intraParallel && lanes > 1 &&
+                     (groupSize == 1 || groupSize * kIntraLevelSlack <= lanes);
+    if (innerMode) {
+      StorageIndex maxOffDiag = 0;
+      for (StorageIndex s : group) maxOffDiag = std::max(maxOffDiag, m_supernodes[s].offDiagonalRowCount);
+      // Tall enough for at least two chunks at the finest extent intraChunkRows()
+      // will pick. Tracks the FLOOR rather than the ceiling, because the extent
+      // scales with the lane count.
+      innerMode = static_cast<Index>(maxOffDiag) >= 2 * kMinIntraChunkSize;
+    }
+    if (innerMode) {
+      m_intraSupernodes += groupSize;
+      for (Index k = 0; k < groupSize; ++k) {
+        const StorageIndex s = group[static_cast<std::size_t>(k)];
+        factorizeSupernode(s, staticPivot, results[s], /*intraParallel=*/true);
+      }
+    } else {
+      m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
+        const StorageIndex s = group[static_cast<std::size_t>(k)];
+        factorizeSupernode(s, staticPivot, results[s], /*intraParallel=*/false);
+      });
+    }
     for (StorageIndex s : group)
       if (results[s].notPositiveDefinite || results[s].singular) bad = true;
     if (bad) break;  // the factor is unusable; stop launching further levels
@@ -1367,6 +1847,105 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
 
   m_factorized = true;
   m_isInitialized = true;
+}
+
+// ===========================================================================
+//  Factor accessors
+// ===========================================================================
+
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+typename SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::PermutationType
+SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorPermutation() const {
+  eigen_assert(m_factorized && "factorPermutation() before a successful factorize()");
+  std::vector<StorageIndex> toFactor;
+  buildFactorIndexMap(toFactor);
+  PermutationType p(m_size);
+  for (StorageIndex i = 0; i < m_size; ++i) p.indices()(i) = toFactor[m_toInternal[i]];
+  return p;
+}
+
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+SparseMatrix<typename MatrixType::Scalar, ColMajor, typename MatrixType::StorageIndex>
+SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::matrixL() const {
+  eigen_assert(m_factorized && "matrixL() before a successful factorize()");
+  typedef SparseMatrix<Scalar, ColMajor, StorageIndex> SparseFactor;
+  SparseFactor L(m_size, m_size);
+  if (m_size == 0) return L;
+
+  std::vector<StorageIndex> toFactor;
+  buildFactorIndexMap(toFactor);
+
+  std::vector<Triplet<Scalar, StorageIndex>> entries;
+  entries.reserve(static_cast<std::size_t>(m_nnzL));
+  for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+    const Supernode& sn = m_supernodes[s];
+    const StorageIndex w = sn.width(), first = sn.firstColumn;
+    const ConstStridedPanel diag = diagBlock(s);
+
+    // The diagonal block is ALREADY in factor coordinates -- the interchange was
+    // applied to it in place -- so its rows go out unmapped.
+    for (StorageIndex j = 0; j < w; ++j) {
+      entries.emplace_back(first + j, first + j, Scalar(1));  // L's implicit unit diagonal
+      for (StorageIndex i = j + 1; i < w; ++i)
+        entries.emplace_back(first + i, first + j, diag(i, j));
+    }
+
+    // The panel's rows are other supernodes' equations, and the solve defers
+    // THEIR interchanges until those supernodes are reached -- which is exactly
+    // why the Schur complement is invariant to a local permutation. Assembling a
+    // standalone L is where that deferral has to be paid off, by mapping each
+    // panel row through the interchange of the supernode that owns it.
+    const ConstStridedPanel lower = lowerPanel(s);
+    for (StorageIndex b = 0; b < sn.rowBlockCount; ++b) {
+      const RowBlock& block = m_rowBlocks[sn.firstRowBlock + b];
+      for (StorageIndex p = 0; p < block.height(); ++p) {
+        const StorageIndex row = toFactor[block.firstRow + p];
+        for (StorageIndex j = 0; j < w; ++j)
+          entries.emplace_back(row, first + j, lower(block.panelOffset + p, j));
+      }
+    }
+  }
+  L.setFromTriplets(entries.begin(), entries.end());
+  return L;
+}
+
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+SparseMatrix<typename MatrixType::Scalar, ColMajor, typename MatrixType::StorageIndex>
+SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::matrixD() const {
+  eigen_assert(m_factorized && "matrixD() before a successful factorize()");
+  typedef SparseMatrix<Scalar, ColMajor, StorageIndex> SparseFactor;
+  SparseFactor D(m_size, m_size);
+  if (m_size == 0) return D;
+
+  std::vector<Triplet<Scalar, StorageIndex>> entries;
+  entries.reserve(static_cast<std::size_t>(m_size) + 2 * static_cast<std::size_t>(m_pivot2x2Count));
+  for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+    const Supernode& sn = m_supernodes[s];
+    const ConstStridedPanel diag = diagBlock(s);
+    for (StorageIndex k = 0; k < sn.width(); ++k) {
+      const StorageIndex g = sn.firstColumn + k;
+      entries.emplace_back(g, g, diag(k, k));
+      if (!is2x2Leader(g)) continue;
+      const Scalar c = m_dOffDiag[static_cast<std::size_t>(g)];
+      entries.emplace_back(g + 1, g, c);
+      entries.emplace_back(g, g + 1, numext::conj(c));
+    }
+  }
+  D.setFromTriplets(entries.begin(), entries.end());
+  return D;
+}
+
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+Matrix<typename MatrixType::Scalar, Dynamic, 1>
+SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::vectorD() const {
+  eigen_assert(m_factorized && "vectorD() before a successful factorize()");
+  Matrix<Scalar, Dynamic, 1> d(m_size);
+  for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+    const Supernode& sn = m_supernodes[s];
+    const ConstStridedPanel diag = diagBlock(s);
+    for (StorageIndex k = 0; k < sn.width(); ++k) d[sn.firstColumn + k] = diag(k, k);
+  }
+  return d;
 }
 
 // ===========================================================================
