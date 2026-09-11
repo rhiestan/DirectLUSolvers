@@ -1,6 +1,6 @@
 # PointBlockOrdering — ordering the node graph
 
-*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md)*
+*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md)*
 
 `Eigen::PointBlockOrdering` (`src/PointBlockOrdering.h`) is a standalone ordering functor for
 matrices with `nv` unknowns per grid point. It collapses the pattern onto the **node** graph,

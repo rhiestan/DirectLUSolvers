@@ -22,9 +22,10 @@ external dependency (METIS, oneTBB, OpenMP, MKL) is an opt-in header or an opt-i
 
 | Document | What it covers |
 |---|---|
-| [SupernodalLU](doc/SupernodalLU.md) | PaStiX-style supernodal solver: static symbolic structure, static pivoting + refinement, BLAS-3 tree-parallel kernels. **The full option reference lives here** — the other two solvers document only their deltas from it. |
+| [SupernodalLU](doc/SupernodalLU.md) | PaStiX-style supernodal solver: static symbolic structure, static pivoting + refinement, BLAS-3 tree-parallel kernels. **The full option reference lives here** — the other solvers document only their deltas from it. |
 | [LeftRightLU](doc/LeftRightLU.md) | PARDISO-style sibling: barrier-free dynamic scheduler, in-block complete pivoting, block triangular form, and direct support for unsymmetric nonzero patterns. |
-| [PointBlockLU](doc/PointBlockLU.md) | Scalar left-looking Gilbert–Peierls with partial pivoting and refactorization replay — no symmetrization at all. Fastest of the three while the factor stays sparse. |
+| [PointBlockLU](doc/PointBlockLU.md) | Scalar left-looking Gilbert–Peierls with partial pivoting and refactorization replay — no symmetrization at all. Fastest of the LU solvers while the factor stays sparse. |
+| [SupernodalLDLT](doc/SupernodalLDLT.md) | Supernodal `LDL^T` for symmetric **positive definite** matrices: reads one triangle, stores one factor. Half the arena and up to 2x the factorization speed of running an LU on the same matrix. |
 | [RobustLU](doc/RobustLU.md) | The fallback ladder: one solver that escalates through strategies when the first fails, and reports what it tried and why it stopped. |
 | [PointBlockOrdering](doc/PointBlockOrdering.md) | Fill-reducing ordering on the *node* graph, for matrices with several unknowns per grid point. |
 | [HeaderOnlyMetis](doc/HeaderOnlyMetis.md) | `Eigen::HeaderOnlyMetisOrdering` — nested dissection, bit-identical to `METIS_NodeND`, with nothing to link; plus a deterministic parallel variant. |
@@ -45,10 +46,21 @@ Algorithmic background for the two supernodal solvers is in `pastix_algorithms.m
 | Block triangular form | no | **yes**, on by default | no |
 | Refactorization | re-run `factorize()` | re-run `factorize()` | **numeric replay** of a recorded pivot sequence |
 
+The table above covers the three **LU** solvers. [`SupernodalLDLT`](doc/SupernodalLDLT.md)
+sits outside it: it takes a symmetric positive definite matrix (one triangle of it), computes
+`L D L^T`, and declines anything indefinite.
+
 Practical guidance:
 
-- **Start with `LeftRightLU`.** It takes any pattern, matches `SupernodalLU` on symmetric-pattern
-  matrices, and is far ahead of it on unsymmetric ones (`gemat11` 9.1 ms against 1415 ms).
+- **If your matrix is symmetric positive definite, use [`SupernodalLDLT`](doc/SupernodalLDLT.md).**
+  An LU of an SPD matrix computes a `U` that is the transpose of the `L` it already has;
+  dropping it is worth 1.9x the arena and up to 2.06x the factorization time (measured on 3D
+  Laplacians), and 6.5x against `Eigen::SimplicialLDLT` at `n = 64000`. It reads one triangle,
+  so you need only assemble half. Indefinite symmetric systems — saddle-point and KKT
+  problems — are **not** in scope and belong in `LeftRightLU`.
+- **Start with `LeftRightLU`** for anything else. It takes any pattern, matches `SupernodalLU`
+  on symmetric-pattern matrices, and is far ahead of it on unsymmetric ones (`gemat11` 9.1 ms
+  against 1415 ms).
 - **Use `PointBlockLU` when the factor stays sparse** — below roughly 100k stored scalars it is
   the fastest solver here and often the most accurate, because it never perturbs a pivot. Above
   that its scalar kernels lose to supernodal ones.
@@ -119,7 +131,9 @@ solver.factorize(A2);
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
 | `src/RobustLU.h` | [`Eigen::RobustLU`](doc/RobustLU.md) — the fallback ladder over `LeftRightLU` and `PointBlockLU`, with an attempt log. |
 | `src/RobustLU` | Umbrella header, `#include <RobustLU>`. |
-| `src/SupernodalLUSymbolic.h` | Shared symbolic helpers: the A+Aᵀ adjacency graph and the fill estimate used to rank candidate orderings. No METIS dependency, unlike `SupernodalLUAutoOrdering.h`, which uses it. |
+| `src/SupernodalLDLT.h` | [`Eigen::SupernodalLDLT`](doc/SupernodalLDLT.md) — supernodal `LDL^T` for symmetric positive definite matrices. Reads one triangle, stores one factor. Eigen only. |
+| `src/SupernodalLDLT` | Umbrella header, `#include <SupernodalLDLT>`. |
+| `src/SupernodalLUSymbolic.h` | The symbolic analysis shared by every supernodal solver here: the A+Aᵀ adjacency graph, elimination tree, postorder, supernode partition with amalgamation, block structure, update lists, scheduling levels — plus the fill estimate used to rank candidate orderings. Free functions over plain vectors, so a solver passes its own state in and inherits nothing. No METIS dependency, unlike `SupernodalLUAutoOrdering.h`, which uses it. |
 | `src/SupernodalLUSupport.h` | Plain data structures shared by the analysis/factorization phases (`Supernode`, `RowBlock`, `UpdateSource`). |
 | `src/SupernodalLUMatching.h` | The maximum-transversal matching + permutation-sign helpers (`MatchingMethod::Transversal`). |
 | `src/SupernodalLUMC64.h` | Exact maximum-product matching with dual scaling (`MatchingMethod::MC64`). Eigen + standard library only. |

@@ -1,6 +1,6 @@
 # Parallelism
 
-*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [LeftRightLU](LeftRightLU.md) · [Testing](Testing.md)*
+*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [LeftRightLU](LeftRightLU.md) · [Testing](Testing.md)*
 
 Both `SupernodalLU` and `LeftRightLU` thread their numeric factorization through the same
 pluggable `Executor`, and both parallelize `solve()`. `PointBlockLU` is deliberately

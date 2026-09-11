@@ -306,6 +306,11 @@ endfunction()
 
 add_dlu_test(test_supernodal_lu SOURCE test/test_supernodal_lu.cpp LABELS "quick;correctness")
 add_dlu_test(test_leftright_lu  SOURCE test/test_leftright_lu.cpp  LABELS "quick;correctness")
+# Supernodal LDL^T for symmetric positive definite matrices. Dependency-free:
+# every matrix is generated, and the references are Eigen's own SimplicialLDLT
+# and a dense determinant.
+add_dlu_test(test_supernodal_ldlt SOURCE test/test_supernodal_ldlt.cpp
+                                                                  LABELS "quick;correctness")
 add_dlu_test(test_btf           SOURCE test/test_btf.cpp           LABELS "quick;correctness")
 # Condition estimation / error bounds. Dependency-free: every matrix is either
 # generated or has a closed-form condition number to check the estimate against.

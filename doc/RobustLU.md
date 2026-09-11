@@ -1,6 +1,6 @@
 # RobustLU — the fallback ladder
 
-*[← DirectLUSolvers](../README.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [SupernodalLU](SupernodalLU.md) · [Testing](Testing.md)*
+*[← DirectLUSolvers](../README.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [Testing](Testing.md)*
 
 `Eigen::RobustLU` (`src/RobustLU.h`, `#include <RobustLU>`) is not a fourth factorization. It is a
 **policy** over the ones that already exist: it runs `LeftRightLU`, measures how well that went,

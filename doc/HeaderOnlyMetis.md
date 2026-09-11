@@ -1,6 +1,6 @@
 # HeaderOnlyMetis — nested dissection with nothing to link
 
-*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [Parallelism](Parallelism.md) · [Testing](Testing.md)*
+*[← DirectLUSolvers](../README.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [Parallelism](Parallelism.md) · [Testing](Testing.md)*
 
 `Eigen::HeaderOnlyMetisOrdering<StorageIndex>` (`src/HeaderOnlyMetis.h`) is a drop-in
 replacement for `Eigen::MetisOrdering` that needs **no library on the link line**. It is a

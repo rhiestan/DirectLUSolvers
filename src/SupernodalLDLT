@@ -1,0 +1,3 @@
+// Eigen-style umbrella include for the SupernodalLDLT module.
+// Usage:  #include <SupernodalLDLT>   (with DirectLUSolvers/src on the include path)
+#include "SupernodalLDLT.h"
