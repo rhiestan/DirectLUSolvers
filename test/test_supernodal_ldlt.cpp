@@ -13,6 +13,7 @@
 // the forward sweep wrote.
 
 #include <Eigen/Dense>
+#include <Eigen/Eigenvalues>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseCholesky>
 
@@ -147,30 +148,354 @@ void testTriangleIndependence() {
   check((xl - xf).norm() <= 0.0, "lower-triangle and full input agree exactly", (xl - xf).norm());
 }
 
-void testIndefiniteIsDeclined() {
-  std::printf("\n-- an indefinite matrix is declined, not approximated --\n");
+void testPositiveDefiniteFastPathDeclines() {
+  std::printf("\n-- Pivoting::None declines an indefinite matrix rather than guessing --\n");
 
   // [[1,2],[2,1]]: positive diagonal, eigenvalues 3 and -1. The first pivot is
-  // fine and the second is not, so this also checks that the report names a
-  // column rather than just failing.
+  // fine and the second is not, so this also checks the report names a column.
   std::vector<Eigen::Triplet<double>> t{{0, 0, 1.0}, {1, 0, 2.0}, {1, 1, 1.0}};
   SparseMatrix<double> A(2, 2);
   A.setFromTriplets(t.begin(), t.end());
   Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+  s.setPivoting(Eigen::supernodal_ldlt::Pivoting::None);
   s.compute(A);
-  checkTrue(s.info() == Eigen::NumericalIssue, "indefinite 2x2 reports NumericalIssue");
-  checkTrue(!s.isFactorized(), "indefinite 2x2 leaves isFactorized() false");
-  checkTrue(s.notPositiveDefiniteColumn() >= 0, "indefinite 2x2 names the offending column");
+  checkTrue(s.info() == Eigen::NumericalIssue, "Pivoting::None reports NumericalIssue");
+  checkTrue(!s.isFactorized(), "Pivoting::None leaves isFactorized() false");
+  checkTrue(s.notPositiveDefiniteColumn() >= 0, "Pivoting::None names the offending column");
   if (!s.lastErrorMessage().empty()) lu_testing::note(s.lastErrorMessage());
 
-  // A negative diagonal entry: no positive definite matrix has one, so this must
-  // be caught wherever the ordering happens to place it.
   SparseMatrix<double> B = laplacian2d(10, 10);
   B.coeffRef(37, 37) = -4.0;
   B.makeCompressed();
   Eigen::SupernodalLDLT<SparseMatrix<double>> s2;
+  s2.setPivoting(Eigen::supernodal_ldlt::Pivoting::None);
   s2.compute(triangleOf(B, true));
-  checkTrue(s2.info() == Eigen::NumericalIssue, "negative diagonal entry is caught");
+  checkTrue(s2.info() == Eigen::NumericalIssue, "Pivoting::None catches a negative diagonal entry");
+
+  // The same matrix under the default must SUCCEED -- that is the whole point of
+  // Bunch-Kaufman, and the contrast is what makes the declining meaningful.
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s3;
+  s3.compute(triangleOf(B, true));
+  checkTrue(s3.info() == Eigen::Success, "the same matrix factors under Bunch-Kaufman");
+}
+
+// Solve an indefinite matrix and check against an exact right-hand side.
+void indefiniteSolve(const SparseMatrix<double>& A, const char* name, double tol = 1e-9) {
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+  s.compute(triangleOf(A, true));
+  if (s.info() != Eigen::Success) {
+    lu_testing::fail(std::string(name) + " failed: " + s.lastErrorMessage());
+    return;
+  }
+  VectorXd x = s.solve(b);
+  const double err = (x - xTrue).norm() / xTrue.norm();
+  const double resid = (A * x - b).norm() / b.norm();
+  check(std::max(err, resid) < tol, name, std::max(err, resid));
+}
+
+void testIndefinite() {
+  std::printf("\n-- symmetric indefinite matrices --\n");
+
+  // A zero diagonal is the case 1x1 pivots cannot touch at all: every pivot must
+  // be a 2x2 block. [[0,1],[1,0]] has eigenvalues +1 and -1.
+  {
+    std::vector<Eigen::Triplet<double>> t{{1, 0, 1.0}};
+    SparseMatrix<double> A(2, 2);
+    A.setFromTriplets(t.begin(), t.end());
+    A.makeCompressed();
+    Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+    s.compute(A);
+    if (s.info() != Eigen::Success) {
+      lu_testing::fail("zero-diagonal 2x2 failed: " + s.lastErrorMessage());
+    } else {
+      VectorXd b(2);
+      b << 3.0, 5.0;
+      VectorXd x = s.solve(b);       // [[0,1],[1,0]] x = b  =>  x = (5, 3)
+      VectorXd want(2);
+      want << 5.0, 3.0;
+      check((x - want).norm() < 1e-14, "zero diagonal forces a 2x2 pivot and solves",
+            (x - want).norm());
+      checkTrue(s.pivotBlocks2x2() == 1, "exactly one 2x2 pivot block was used");
+      checkTrue(s.inertia().positive == 1 && s.inertia().negative == 1,
+                "inertia of [[0,1],[1,0]] is (1 positive, 1 negative)");
+    }
+  }
+
+  // A Laplacian shifted past its smallest eigenvalues: symmetric, indefinite,
+  // and with a full diagonal, so the pivot choice is a genuine mixture.
+  //
+  // The shift is deliberately NOT an integer. A 2D Laplacian on a g x g grid has
+  // eigenvalues 4 - 2cos(p*pi/(g+1)) - 2cos(q*pi/(g+1)), which is exactly 4
+  // whenever p + q = g + 1 -- so A - 4I is singular by construction, and testing
+  // an indefinite solver on it measures nothing but the conditioning.
+  {
+    SparseMatrix<double> A = laplacian2d(14, 14);
+    SparseMatrix<double> I(A.rows(), A.cols());
+    I.setIdentity();
+    SparseMatrix<double> shifted = A - 4.37 * I;  // straddles zero, hits no eigenvalue
+    shifted.makeCompressed();
+    indefiniteSolve(shifted, "shifted 2D Laplacian (indefinite)");
+  }
+
+  // Random symmetric with a zero diagonal: nothing on the diagonal to divide by.
+  {
+    const int n = 120;
+    std::mt19937 gen(7);
+    std::uniform_real_distribution<double> value(-1.0, 1.0);
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+    std::vector<Eigen::Triplet<double>> t;
+    for (int j = 0; j < n; ++j)
+      for (int i = j + 1; i < n; ++i)
+        if (coin(gen) < 0.06) {
+          const double v = value(gen);
+          t.emplace_back(i, j, v);
+          t.emplace_back(j, i, v);
+        }
+    SparseMatrix<double> A(n, n);
+    A.setFromTriplets(t.begin(), t.end());
+    A.makeCompressed();
+    indefiniteSolve(A, "random symmetric, zero diagonal", 1e-7);
+  }
+}
+
+void testSaddlePoint() {
+  std::printf("\n-- a saddle-point (KKT) system, with its inertia known in advance --\n");
+  // [[H, B^T], [B, 0]] with H symmetric positive definite and B of full row rank
+  // has inertia exactly (n1 positive, n2 negative, 0 zero) -- Haynsworth. That
+  // makes it an exact test of the pivot signs rather than a plausibility check.
+  const int g = 10, n1 = g * g, n2 = 25, n = n1 + n2;
+  const SparseMatrix<double> H = laplacian2d(g, g);
+  std::mt19937 gen(99);
+  std::uniform_real_distribution<double> value(-1.0, 1.0);
+
+  std::vector<Eigen::Triplet<double>> t;
+  for (int j = 0; j < H.outerSize(); ++j)
+    for (SparseMatrix<double>::InnerIterator it(H, j); it; ++it)
+      t.emplace_back(static_cast<int>(it.row()), j, it.value());
+  // B: each constraint row touches a few unknowns; keep rows independent by
+  // giving constraint r a private column r on top of the random couplings.
+  for (int r = 0; r < n2; ++r) {
+    t.emplace_back(n1 + r, r, 1.0);
+    t.emplace_back(r, n1 + r, 1.0);
+    for (int k = 0; k < 3; ++k) {
+      const int c = n2 + (r * 7 + k * 13) % (n1 - n2);
+      const double v = value(gen);
+      t.emplace_back(n1 + r, c, v);
+      t.emplace_back(c, n1 + r, v);
+    }
+  }
+  SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+  s.compute(triangleOf(A, true));
+  if (s.info() != Eigen::Success) {
+    lu_testing::fail("saddle point failed: " + s.lastErrorMessage());
+    return;
+  }
+  VectorXd x = s.solve(b);
+  check((x - xTrue).norm() / xTrue.norm() < 1e-8, "saddle-point system solves",
+        (x - xTrue).norm() / xTrue.norm());
+
+  const MatrixXd denseA(A);
+  const Eigen::SelfAdjointEigenSolver<MatrixXd> es(denseA);
+  Eigen::Index pos = 0, neg = 0;
+  for (Eigen::Index k = 0; k < es.eigenvalues().size(); ++k)
+    (es.eigenvalues()[k] > 0 ? pos : neg)++;
+  const Eigen::supernodal_ldlt::Inertia in = s.inertia();
+  lu_testing::note("inertia: solver (" + std::to_string((long long)in.positive) + ", " +
+                   std::to_string((long long)in.negative) + ")  eigenvalues (" +
+                   std::to_string((long long)pos) + ", " + std::to_string((long long)neg) + ")");
+  checkTrue(in.positive == pos && in.negative == neg, "inertia matches the dense eigenvalue signs");
+  checkTrue(in.positive == n1 && in.negative == n2, "inertia is the (n1, n2) a KKT system predicts");
+  // Whether 2x2 pivots are NEEDED here is a property of the ordering, not of the
+  // matrix: AMD eliminates the H block first, and by the time the constraint rows
+  // come up the Schur complement -B H^-1 B^T has given them a usable diagonal. So
+  // this is reported, not asserted -- the inertia above is the real check.
+  lu_testing::note("2x2 blocks: " + std::to_string((long long)s.pivotBlocks2x2()) +
+                   ", perturbed pivots: " + std::to_string((long long)s.replacedPivots()));
+}
+
+void testInertiaAgainstEigenvalues() {
+  std::printf("\n-- inertia against dense eigenvalue signs --\n");
+  // Non-integer shifts on purpose: a g x g Laplacian has 4 as an exact
+  // eigenvalue (p + q = g + 1), and the inertia of a singular matrix is not
+  // something a factorization in floating point can be asked to agree on.
+  for (double shift : {1.3, 4.37, 6.9}) {
+    SparseMatrix<double> A = laplacian2d(9, 9);
+    SparseMatrix<double> I(A.rows(), A.cols());
+    I.setIdentity();
+    SparseMatrix<double> shifted = A - shift * I;
+    shifted.makeCompressed();
+
+    Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+    s.compute(triangleOf(shifted, true));
+    if (s.info() != Eigen::Success) {
+      lu_testing::fail("inertia: factorization failed at shift " + std::to_string(shift));
+      continue;
+    }
+    const MatrixXd denseShifted(shifted);
+    const Eigen::SelfAdjointEigenSolver<MatrixXd> es(denseShifted);
+    Eigen::Index pos = 0, neg = 0;
+    for (Eigen::Index k = 0; k < es.eigenvalues().size(); ++k)
+      (es.eigenvalues()[k] > 0 ? pos : neg)++;
+    const Eigen::supernodal_ldlt::Inertia in = s.inertia();
+    checkTrue(in.positive == pos && in.negative == neg,
+              "inertia correct at shift " + std::to_string(shift));
+  }
+}
+
+void testDeterminantSign() {
+  std::printf("\n-- determinant sign on an indefinite matrix --\n");
+  SparseMatrix<double> A = laplacian2d(8, 8);
+  SparseMatrix<double> I(A.rows(), A.cols());
+  I.setIdentity();
+  SparseMatrix<double> shifted = A - 5.3 * I;
+  shifted.makeCompressed();
+
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+  s.compute(triangleOf(shifted, true));
+  if (s.info() != Eigen::Success) {
+    lu_testing::fail("determinant sign: factorization failed");
+    return;
+  }
+  // The determinant is that of the matrix actually factored, so a perturbed
+  // pivot would legitimately move it. Assert there was none, or the comparison
+  // below is measuring the perturbation rather than the determinant.
+  checkTrue(s.replacedPivots() == 0, "no pivot perturbed, so det is of A itself");
+  const MatrixXd dense(shifted);
+  const Eigen::PartialPivLU<MatrixXd> lu(dense);
+  const double refLogAbs = std::log(std::abs(lu.determinant()));
+  const double refSign = lu.determinant() > 0 ? 1.0 : -1.0;
+  check(std::abs(refLogAbs - s.logAbsDeterminant()) / std::max(1.0, std::abs(refLogAbs)) < 1e-9,
+        "log|det| matches a dense LU on an indefinite matrix",
+        std::abs(refLogAbs - s.logAbsDeterminant()));
+  checkTrue(std::real(s.determinantSign()) == refSign, "determinant SIGN matches the dense LU");
+}
+
+void testPivotingModesAgreeOnSpd() {
+  std::printf("\n-- the two pivoting modes agree on a positive definite matrix --\n");
+  const SparseMatrix<double> A = laplacian3d(7, 7, 7);
+  const SparseMatrix<double> Lo = triangleOf(A, true);
+  const int n = static_cast<int>(A.rows());
+  VectorXd xTrue = VectorXd::Random(n);
+  VectorXd b = A * xTrue;
+
+  Eigen::SupernodalLDLT<SparseMatrix<double>> bk;  // default
+  bk.compute(Lo);
+  Eigen::SupernodalLDLT<SparseMatrix<double>> none;
+  none.setPivoting(Eigen::supernodal_ldlt::Pivoting::None);
+  none.compute(Lo);
+  if (bk.info() != Eigen::Success || none.info() != Eigen::Success) {
+    lu_testing::fail("pivoting modes: a factorization failed");
+    return;
+  }
+  const VectorXd xb = bk.solve(b), xn = none.solve(b);
+  check((xb - xTrue).norm() / xTrue.norm() < 1e-10, "Bunch-Kaufman is accurate on SPD",
+        (xb - xTrue).norm() / xTrue.norm());
+  check((xn - xTrue).norm() / xTrue.norm() < 1e-10, "Pivoting::None is accurate on SPD",
+        (xn - xTrue).norm() / xTrue.norm());
+  checkTrue(bk.nnzL() == none.nnzL(), "both modes produce the same fill");
+  checkTrue(bk.inertia().positive == n && bk.inertia().negative == 0,
+            "an SPD matrix reports all-positive inertia");
+  lu_testing::note("2x2 blocks chosen on this SPD matrix: " +
+                   std::to_string((long long)bk.pivotBlocks2x2()) + ", straddling fallbacks: " +
+                   std::to_string((long long)bk.straddlingPivots()));
+  checkTrue(bk.replacedPivots() == 0, "no pivot was perturbed on a well-conditioned SPD matrix");
+}
+
+void testComplexHermitianIndefinite() {
+  std::printf("\n-- complex Hermitian indefinite --\n");
+  typedef std::complex<double> C;
+  const int n = 40;
+  // Hermitian with a zero diagonal: purely 2x2 pivots, and the conjugation in
+  // the 2x2 arithmetic is what this exercises.
+  std::vector<Eigen::Triplet<C>> t;
+  for (int i = 0; i + 1 < n; ++i) t.emplace_back(i + 1, i, C(1.0, 0.5));
+  SparseMatrix<C> L(n, n);
+  L.setFromTriplets(t.begin(), t.end());
+  L.makeCompressed();
+
+  Eigen::SupernodalLDLT<SparseMatrix<C>> s;
+  s.compute(L);
+  if (s.info() != Eigen::Success) {
+    lu_testing::fail("complex Hermitian indefinite failed: " + s.lastErrorMessage());
+    return;
+  }
+  Eigen::Matrix<C, Eigen::Dynamic, Eigen::Dynamic> dense =
+      Eigen::Matrix<C, Eigen::Dynamic, Eigen::Dynamic>(L);
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) dense(i, j) = std::conj(dense(j, i));
+  Eigen::Matrix<C, Eigen::Dynamic, 1> xTrue = Eigen::Matrix<C, Eigen::Dynamic, 1>::Random(n);
+  Eigen::Matrix<C, Eigen::Dynamic, 1> b = dense * xTrue;
+  Eigen::Matrix<C, Eigen::Dynamic, 1> x = s.solve(b);
+  check((x - xTrue).norm() / xTrue.norm() < 1e-9, "Hermitian indefinite solve",
+        (x - xTrue).norm() / xTrue.norm());
+  checkTrue(s.pivotBlocks2x2() > 0, "Hermitian zero diagonal needed 2x2 pivots");
+}
+
+void testSingularIsReported() {
+  std::printf("\n-- a singular matrix is perturbed and flagged, not silently wrong --\n");
+  // Two identical rows/columns: rank deficient by construction.
+  const int n = 30;
+  std::vector<Eigen::Triplet<double>> t;
+  for (int i = 0; i < n; ++i) t.emplace_back(i, i, 2.0);
+  for (int i = 0; i + 1 < n; ++i) t.emplace_back(i + 1, i, 1.0);
+  SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  // Make column 5 a duplicate of column 4 (and symmetrically for the rows).
+  A.coeffRef(5, 5) = 0.0;
+  A.coeffRef(5, 4) = 0.0;
+  if (n > 6) A.coeffRef(6, 5) = 0.0;
+  A.makeCompressed();
+
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s;
+  s.compute(triangleOf(A, true));
+  // Either it perturbs and flags a bad solve, or it reports outright -- both are
+  // honest. What must NOT happen is Success with a large residual.
+  if (s.info() == Eigen::Success) {
+    VectorXd b = VectorXd::Random(n);
+    s.solve(b);
+    checkTrue(s.info() != Eigen::Success || s.solveResidual() < 1e-6,
+              "a singular system never reports Success with a bad residual");
+    lu_testing::note("replacedPivots=" + std::to_string((long long)s.replacedPivots()) +
+                     " solveResidual=" + std::to_string(s.solveResidual()));
+  } else {
+    checkTrue(true, "singular matrix reported at factorization time");
+  }
+
+  // An exactly singular indefinite matrix: a g x g Laplacian has 4 as an exact
+  // eigenvalue, so A - 4I is singular. Static pivoting will happily step over
+  // the zero pivot and produce a factorization of a nearby matrix -- what must
+  // not happen is solve() calling the resulting garbage a success.
+  SparseMatrix<double> L2 = laplacian2d(14, 14);
+  SparseMatrix<double> I2(L2.rows(), L2.cols());
+  I2.setIdentity();
+  SparseMatrix<double> singular = L2 - 4.0 * I2;
+  singular.makeCompressed();
+
+  Eigen::SupernodalLDLT<SparseMatrix<double>> s2;
+  s2.compute(triangleOf(singular, true));
+  if (s2.info() != Eigen::Success) {
+    checkTrue(true, "exactly singular matrix reported at factorization time");
+  } else {
+    const int n2 = static_cast<int>(singular.rows());
+    VectorXd xTrue = VectorXd::Random(n2);
+    VectorXd b = singular * xTrue;
+    VectorXd x = s2.solve(b);
+    const double resid = (singular * x - b).norm() / b.norm();
+    lu_testing::note("singular shift: replacedPivots=" +
+                     std::to_string((long long)s2.replacedPivots()) + " residual=" +
+                     std::to_string(resid));
+    checkTrue(s2.info() == Eigen::Success ? resid < 1e-6 : true,
+              "an exactly singular system is never Success with a bad residual");
+  }
 }
 
 void testAgainstSimplicialLdlt() {
@@ -459,7 +784,14 @@ int main() {
   std::printf("SupernodalLDLT correctness\n");
   testAccuracy();
   testTriangleIndependence();
-  testIndefiniteIsDeclined();
+  testPositiveDefiniteFastPathDeclines();
+  testIndefinite();
+  testSaddlePoint();
+  testInertiaAgainstEigenvalues();
+  testDeterminantSign();
+  testPivotingModesAgreeOnSpd();
+  testComplexHermitianIndefinite();
+  testSingularIsReported();
   testAgainstSimplicialLdlt();
   testDeterminant();
   testEquilibrationAndRefinement();

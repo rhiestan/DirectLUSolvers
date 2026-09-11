@@ -1,14 +1,14 @@
-// SupernodalLDLT -- a supernodal LDL^T factorization for symmetric positive
-// definite matrices.
+// SupernodalLDLT -- a supernodal LDL^T factorization for symmetric matrices,
+// positive definite or indefinite.
 //
 // WHAT IT IS FOR
 //
 // SupernodalLU and LeftRightLU factor a general matrix as L U. Handed a
 // SYMMETRIC one they still compute both factors, and U is the transpose of what
 // L already holds. This solver keeps only one of them: A = L D L^T with L unit
-// lower triangular and D diagonal, so both the stored factor and the flops that
-// build it are roughly half. The saving is structural rather than a tuning win
-// -- it is the redundant half of an LU of a symmetric matrix, not overhead.
+// lower triangular and D block diagonal, so both the stored factor and the flops
+// that build it are roughly half. The saving is structural rather than a tuning
+// win -- it is the redundant half of an LU of a symmetric matrix, not overhead.
 //
 // It is built on the SAME symbolic analysis as its two siblings
 // (SupernodalLUSymbolic.h: elimination tree, postorder, supernode partition with
@@ -18,42 +18,53 @@
 //
 // SCOPE -- READ THIS FIRST
 //
-// The matrix must be symmetric (Hermitian for complex scalars) AND POSITIVE
-// DEFINITE. Only one triangle is read, selected by the UpLo template parameter;
-// whatever is stored in the other one is ignored, so a caller who has only half
-// the matrix pays nothing to use it.
+// The matrix must be symmetric (Hermitian for complex scalars). It need NOT be
+// positive definite: D carries 1x1 and 2x2 blocks, chosen by the bounded
+// Bunch-Kaufman criterion, which is what makes an indefinite matrix tractable.
+// Saddle-point and KKT systems are exactly this case.
 //
-// An indefinite matrix is DECLINED, not approximated. LDL^T with 1x1 pivots is
-// unstable on an indefinite matrix -- the stable factorization needs 2x2 pivot
-// blocks (Bunch-Kaufman), which this solver does not implement. factorize()
-// therefore reports NumericalIssue naming the column whose pivot was not
-// positive, rather than returning a factor that happens to exist and does not
-// mean anything. Saddle-point and KKT systems are the common case: they are
-// symmetric and indefinite, so they belong in LeftRightLU until the 2x2 path
-// exists.
+// Only one triangle is read, selected by the UpLo template parameter; whatever
+// is in the other one is ignored, so a caller holding half the matrix pays
+// nothing to use it, and one holding all of it pays nothing either.
 //
-// Positive definiteness is not something the caller has to assert up front. The
-// pivot test IS the check, it costs nothing, and it is exact: a matrix that
-// factors here was positive definite (in the scaled arithmetic actually used).
+// THE INTERCHANGES STAY INSIDE A SUPERNODE, which is what keeps the symbolic
+// structure static. A 2x2 pivot needs a symmetric interchange, and that
+// interchange is confined to the dense diagonal block, so the Schur complement
+// the supernode sends out is unchanged by it:
+//
+//     L_R D L_R^H = A_R P^T (L_kk D L_kk^H)^-1 P A_R^H
+//                 = A_R P^T (P A_kk P^T)^-1 P A_R^H
+//                 = A_R A_kk^-1 A_R^H          <- P cancels
+//
+// So P is invisible outside the block. What it does cost is the ONE case where
+// the block runs out of room: a 2x2 pivot wanted at the last column of a
+// supernode has no second column to pair with, and growing the structure to find
+// one is what this design refuses to do. A perturbed 1x1 pivot is taken instead
+// and counted in straddlingPivots(), with refinement to clean up after it.
+//
+// Positive definiteness does not have to be asserted. setPivoting(None) is the
+// fast path that assumes it, and its pivot test IS the check -- it reports a
+// non-positive pivot rather than stepping over one. The default handles either
+// case, and inertia() then says which it was, exactly.
 //
 // WHAT IS NOT HERE YET, stated so it is not mistaken for an oversight:
 //
-//   * 2x2 pivots (symmetric indefinite / Bunch-Kaufman), and with them the
-//     inertia that would fall out of the pivot signs for free.
 //   * Intra-supernode parallelism. Factorization is dispatched over elimination-
 //     tree levels only, so the few enormous root separators run on one lane.
 //     SupernodalLU's measurements say that is where most of its parallel speedup
 //     comes from, so expect this solver to scale worse than that one until the
 //     chunking is ported, even though its serial work is smaller.
+//   * Symmetric weighted matching (Duff-Pralet). Bunch-Kaufman chooses pivots
+//     inside a supernode; a matching would choose a better diagonal before the
+//     ordering ever runs, which is what an indefinite matrix with a genuinely
+//     awkward diagonal wants.
 //   * matrixL() / vectorD() factor accessors.
 //
-// NO MATCHING, AND THAT IS NOT A GAP. The siblings permute rows to put large
-// entries on the diagonal (MC64/transversal). That is an UNSYMMETRIC row
-// permutation: applying it to a symmetric matrix destroys the symmetry this
-// solver exists to exploit, and an SPD matrix does not need it -- its diagonal
-// is already the largest entry in its row and column, and no pivoting is
-// required for stability. Symmetric weighted matching (Duff-Pralet) is the thing
-// an indefinite path would need, alongside the 2x2 pivots.
+// NO UNSYMMETRIC MATCHING, AND THAT IS NOT A GAP. The siblings permute rows to
+// put large entries on the diagonal (MC64/transversal). That is an UNSYMMETRIC
+// row permutation: applying it to a symmetric matrix destroys the symmetry this
+// solver exists to exploit. The symmetric analogue is the Duff-Pralet matching
+// noted above, not MC64 as the LU solvers use it.
 //
 // Usage:
 //   #include <SupernodalLDLT.h>
@@ -82,9 +93,38 @@
 
 namespace Eigen {
 
+namespace supernodal_ldlt {
+
+/** How each supernode's dense diagonal block is factored.
+ *
+ *   None          1x1 pivots taken in order, with no search. Correct only for a
+ *                 POSITIVE DEFINITE matrix, where the diagonal is guaranteed
+ *                 usable; a non-positive pivot is reported rather than stepped
+ *                 over. The cheapest path, and the one with no permutation to
+ *                 carry through the solve.
+ *   BunchKaufman  1x1 and 2x2 pivot blocks chosen by the bounded Bunch-Kaufman
+ *                 criterion, with SYMMETRIC interchanges confined to the block.
+ *                 This is what makes an INDEFINITE matrix tractable: a symmetric
+ *                 matrix can have an arbitrarily small diagonal and still be
+ *                 perfectly well conditioned, and a 2x2 block is the smallest
+ *                 pivot that is guaranteed to exist there.
+ */
+enum class Pivoting { None, BunchKaufman };
+
+/** Counts of positive, negative and zero eigenvalues (Sylvester's law of
+ *  inertia). Free from the signs of D once the factorization exists. */
+struct Inertia {
+  Index positive = 0;
+  Index negative = 0;
+  Index zero = 0;
+};
+
+}  // namespace supernodal_ldlt
+
 /** \class SupernodalLDLT
- * \brief Supernodal LDL^T factorization of a sparse symmetric positive definite
- *        matrix, sharing its symbolic analysis with SupernodalLU/LeftRightLU.
+ * \brief Supernodal LDL^T factorization of a sparse symmetric matrix, definite
+ *        or indefinite, sharing its symbolic analysis with
+ *        SupernodalLU/LeftRightLU.
  *
  * \tparam MatrixType_   A column-major Eigen::SparseMatrix<Scalar, ColMajor, StorageIndex>.
  * \tparam UpLo_         Which triangle of the input to read: Lower (default) or Upper.
@@ -134,8 +174,9 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
    *  with new values but the same pattern can skip it. */
   void analyzePattern(const MatrixType& matrix);
 
-  /** Numeric factorization. Reports NumericalIssue if the matrix turns out not
-   *  to be positive definite (see notPositiveDefiniteColumn()). */
+  /** Numeric factorization. Under setPivoting(None) this reports NumericalIssue
+   *  if the matrix turns out not to be positive definite -- see
+   *  notPositiveDefiniteColumn(). The default handles that case instead. */
   void factorize(const MatrixType& matrix);
 
   void compute(const MatrixType& matrix) {
@@ -159,9 +200,42 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   const std::string& lastErrorMessage() const { return m_lastError; }
 
   /** Internal column index whose pivot was not positive, or -1 if the last
-   *  factorization did not fail that way. Internal numbering: pass it through
-   *  permutation() to get back to the caller's column. */
+   *  factorization did not fail that way. Only Pivoting::None fails this way --
+   *  Bunch-Kaufman handles a non-positive pivot rather than reporting it.
+   *  Internal numbering: pass it through permutation() to reach the caller's. */
   Index notPositiveDefiniteColumn() const { return m_failColumn; }
+
+  /** How many 1x1 pivots were perturbed away from zero by the last factorize()
+   *  (see setStaticPivotThreshold). Always 0 under Pivoting::None, which reports
+   *  a bad pivot instead of stepping over it. A count near n means the diagonal
+   *  is unusable for this ordering and the answer should not be trusted without
+   *  checking solveResidual(). */
+  Index replacedPivots() const { return m_replacedPivots; }
+
+  /** Number of 2x2 pivot blocks the last factorization used. Zero on a positive
+   *  definite matrix; a positive count is the direct evidence that the matrix
+   *  was indefinite and needed them. */
+  Index pivotBlocks2x2() const { return m_pivot2x2Count; }
+
+  /** How many times a 2x2 pivot was wanted at the LAST column of a supernode's
+   *  diagonal block, where there is no second column to pair it with, and a
+   *  perturbed 1x1 pivot was taken instead.
+   *
+   *  This is the one place the static-structure bargain costs accuracy rather
+   *  than just time: a solver willing to grow its structure would delay the
+   *  column into the parent supernode. Here the count is reported so the trade
+   *  is visible, and refinement cleans up after it. A large count relative to
+   *  supernodeCount() suggests a smaller setMaxBlockSize() is making blocks end
+   *  in awkward places. */
+  Index straddlingPivots() const { return m_straddlingPivots; }
+
+  /** Counts of positive, negative and zero eigenvalues of A (Sylvester's law of
+   *  inertia), read off the signs of D. Free once the factorization exists.
+   *
+   *  Exact for a factorization that perturbed nothing. Where static pivoting
+   *  fired the inertia is that of the perturbed matrix, so read it next to
+   *  replacedPivots(). */
+  supernodal_ldlt::Inertia inertia() const { return m_inertia; }
 
   /** Stored scalars in L, counting its implicit unit diagonal and the explicit
    *  structural zeros amalgamation introduces. D adds n more. */
@@ -191,28 +265,70 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   Index iterativeRefinements() const { return m_lastRefinementIterations; }
 
   /** det(A), with the equilibration scaling divided back out. Overflows on
-   *  moderately sized systems -- prefer logAbsDeterminant(). */
+   *  moderately sized systems -- prefer logAbsDeterminant() with
+   *  determinantSign(). */
   Scalar determinant() const {
-    return Scalar(numext::exp(logAbsDeterminant()));  // D > 0, so det(A) > 0
+    return determinantSign() * Scalar(numext::exp(logAbsDeterminant()));
+  }
+
+  /** Sign of det(A): +1 or -1, or 0 if a pivot block was singular.
+   *
+   *  L is unit triangular and the symmetric interchanges are applied to both
+   *  sides, so neither contributes a sign -- det(A) has exactly the sign of
+   *  det(D), and the equilibration scaling is positive. Every 2x2 Bunch-Kaufman
+   *  block has a negative determinant by construction, so it contributes -1. */
+  Scalar determinantSign() const {
+    eigen_assert(m_factorized && "determinantSign() before a successful factorize()");
+    int sign = 1;
+    forEachPivotBlock([&](StorageIndex s, StorageIndex k, bool is2x2) {
+      const RealScalar d = pivotBlockDeterminant(s, k, is2x2);
+      if (d == RealScalar(0))
+        sign = 0;
+      else if (d < RealScalar(0))
+        sign = -sign;
+    });
+    return Scalar(sign);
   }
 
   /** log|det(A)| accumulated as a sum of logs, so it stays finite where
-   *  determinant() would overflow. det(A) = det(D) / det(Dscale)^2, and every
-   *  d is positive here, so there is no sign to carry. */
+   *  determinant() would overflow. A~ = S A S with a symmetric, positive
+   *  scaling, so log|det A| = log|det D| - 2 sum log S. */
   RealScalar logAbsDeterminant() const {
     eigen_assert(m_factorized && "logAbsDeterminant() before a successful factorize()");
     RealScalar acc(0);
-    for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
-      const ConstStridedPanel diag = diagBlock(s);
-      for (StorageIndex k = 0; k < m_supernodes[s].width(); ++k)
-        acc += numext::log(numext::real(diag(k, k)));
-    }
-    // A~ = S A S with a symmetric scaling S, so log|det A| = log|det A~| - 2 sum log S.
+    forEachPivotBlock([&](StorageIndex s, StorageIndex k, bool is2x2) {
+      acc += numext::log(numext::abs(pivotBlockDeterminant(s, k, is2x2)));
+    });
     for (StorageIndex i = 0; i < m_size; ++i) acc -= RealScalar(2) * numext::log(m_scale[i]);
     return acc;
   }
 
   // --- options --------------------------------------------------------------
+
+  /** How each dense diagonal block is factored; see supernodal_ldlt::Pivoting.
+   *  Default **BunchKaufman**, which handles indefinite matrices.
+   *
+   *  Pivoting::None is the positive-definite fast path: no pivot search, no
+   *  permutation to carry through the solve, and a non-positive pivot reported
+   *  rather than handled. Choose it when you already know the matrix is SPD and
+   *  have measured that the search costs you something. */
+  void setPivoting(supernodal_ldlt::Pivoting mode) { m_pivoting = mode; }
+  supernodal_ldlt::Pivoting pivoting() const { return m_pivoting; }
+
+  /** Magnitude below which a 1x1 pivot is replaced by a same-sign value of this
+   *  magnitude, so the factorization can continue past an (effectively) zero
+   *  pivot. By default chosen automatically each factorize() as
+   *  sqrt(eps) * max|A~_ij| of the equilibrated matrix: small enough to leave a
+   *  usable pivot alone, large enough to step over a zero. Pass 0 to disable,
+   *  which makes a zero pivot a reported failure instead.
+   *
+   *  Only Bunch-Kaufman perturbs; Pivoting::None reports. Perturbation is what
+   *  refinement then repairs -- see setRefineOnlyIfPerturbed. */
+  void setStaticPivotThreshold(const RealScalar& threshold) {
+    m_staticPivotThreshold = threshold;
+    m_thresholdIsAuto = false;
+  }
+  RealScalar staticPivotThreshold() const { return m_staticPivotThreshold; }
 
   /** Symmetric Ruiz equilibration A~ = S A S, on by default. Symmetric by
    *  construction -- one scaling applied on both sides -- because a two-sided
@@ -239,20 +355,28 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   void setMaxFactorNonzeros(Index limit) { m_maxFactorNonzeros = limit; }
   Index maxFactorNonzeros() const { return m_maxFactorNonzeros; }
 
-  /** Stationary iterative refinement steps, x += M^-1 (b - Ax). DEFAULT 0 -- off.
+  /** Stationary iterative refinement steps, x += M^-1 (b - Ax). Default 5, but
+   *  gated on perturbation -- see setRefineOnlyIfPerturbed.
    *
-   *  Unlike the LU siblings there is nothing here for refinement to repair: with
-   *  no pivoting and no static-pivot perturbation, an SPD factorization is
-   *  backward stable, so the first solve is already as good as the arithmetic
-   *  allows. Turn it on for an ill-conditioned system where the extra accuracy
-   *  is worth an O(nnz) matvec plus a triangular solve per step.
-   *
-   *  Note that stationary refinement is the right tool here only for small
-   *  corrections; the natural Krylov method for an SPD operator is conjugate
-   *  gradients, not the BiCGStab the unsymmetric siblings default to. */
+   *  Stationary refinement is the right tool here only for small corrections;
+   *  the natural Krylov method for a symmetric operator is conjugate gradients,
+   *  or MINRES when it is indefinite, not the BiCGStab the unsymmetric siblings
+   *  default to. */
   void setMaxIterativeRefinements(Index iters) { m_maxRefinementIterations = iters; }
   Index maxIterativeRefinements() const { return m_maxRefinementIterations; }
   void setRefinementTolerance(const RealScalar& tol) { m_refinementTolerance = tol; }
+
+  /** Run refinement only when the factorization actually perturbed a pivot
+   *  (replacedPivots() > 0). Default **true**.
+   *
+   *  An unperturbed LDL^T is backward stable, so there is nothing for refinement
+   *  to repair and the first solve is already as good as the arithmetic allows;
+   *  a perturbed one factored a slightly different matrix, and refinement is
+   *  what recovers the difference. Gating on that keeps a positive definite
+   *  solve at exactly the cost of the factor solve, while making the indefinite
+   *  path robust without being asked. Set false to always refine. */
+  void setRefineOnlyIfPerturbed(bool on) { m_refineOnlyIfPerturbed = on; }
+  bool refineOnlyIfPerturbed() const { return m_refineOnlyIfPerturbed; }
 
   /** Relative-residual ceiling above which solve() downgrades info() to
    *  NumericalIssue instead of returning a bad answer silently. Default 1e-6. */
@@ -318,14 +442,57 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
     m_amalgamationFillFraction = 0.3;
     m_maxBlockSize = 128;
     m_maxFactorNonzeros = 0;
-    m_maxRefinementIterations = 0;
+    m_maxRefinementIterations = 5;
+    m_refineOnlyIfPerturbed = true;
     m_refinementTolerance = NumTraits<RealScalar>::epsilon();
     m_solveFailureThreshold = RealScalar(1e-6);
     m_parallelSolve = true;
+    m_pivoting = supernodal_ldlt::Pivoting::BunchKaufman;
+    m_staticPivotThreshold = RealScalar(0);
+    m_thresholdIsAuto = true;
+    m_replacedPivots = 0;
+    m_pivot2x2Count = 0;
+    m_straddlingPivots = 0;
+    m_inertia = supernodal_ldlt::Inertia();
     m_lastSolveRelativeResidual = RealScalar(0);
     m_lastRefinementIterations = 0;
     m_nnzL = 0;
     m_isInitialized = false;
+  }
+
+  // --- D as a block diagonal of 1x1 and 2x2 pivots --------------------------
+  //
+  // A 1x1 pivot d sits at diag(k,k). A 2x2 pivot occupying local columns (k,k+1)
+  // stores its two diagonal entries at diag(k,k) and diag(k+1,k+1) and its
+  // off-diagonal at diag(k+1,k) -- the slot L's implicit unit diagonal leaves
+  // free, which is the LAPACK packed convention. m_pivotKind says which:
+  //   1 = a 1x1 pivot, 2 = the leading column of a 2x2, 0 = its trailing column.
+
+  bool is2x2Leader(StorageIndex internalColumn) const {
+    return m_pivotKind[static_cast<std::size_t>(internalColumn)] == 2;
+  }
+
+  /** Visit every pivot block once, as (supernode, local column, is2x2). */
+  template <typename F>
+  void forEachPivotBlock(F&& body) const {
+    for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
+      const Supernode& sn = m_supernodes[s];
+      for (StorageIndex k = 0; k < sn.width();) {
+        const bool two = is2x2Leader(sn.firstColumn + k);
+        body(s, k, two);
+        k += two ? 2 : 1;
+      }
+    }
+  }
+
+  /** det of one pivot block. For a 2x2 [[a, conj(c)],[c, b]] that is
+   *  a*b - |c|^2, which Bunch-Kaufman guarantees is negative. */
+  RealScalar pivotBlockDeterminant(StorageIndex s, StorageIndex k, bool is2x2) const {
+    const ConstStridedPanel diag = diagBlock(s);
+    if (!is2x2) return numext::real(diag(k, k));
+    const RealScalar a = numext::real(diag(k, k)), b = numext::real(diag(k + 1, k + 1));
+    const Scalar c = m_dOffDiag[static_cast<std::size_t>(m_supernodes[s].firstColumn + k)];
+    return a * b - numext::abs2(c);
   }
 
   supernodal_lu::symbolic::PartitionOptions partitionOptions() const {
@@ -360,11 +527,55 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   // runs concurrently across a level, so a shared scratch buffer would race.
   void applyUpdate(StorageIndex source, StorageIndex target, StorageIndex firstFacingBlock,
                    std::vector<StorageIndex>& destRowScratch);
-  void factorizeSupernode(StorageIndex s, bool& notPositiveDefinite, StorageIndex& failColumn);
-  void factorizeDiagonalBlock(StridedPanel diag, bool& notPositiveDefinite,
-                              StorageIndex& failColumn) const;
+
+  /** Per-supernode outcome of the numeric phase, kept in a disjoint slot per
+   *  supernode so a level can be factored concurrently without shared writes. */
+  struct SupernodeResult {
+    bool notPositiveDefinite = false;  // Pivoting::None only
+    bool singular = false;             // a zero pivot that perturbation was not allowed to fix
+    StorageIndex failColumn = 0;       // block-local on the way out, internal after
+    Index replaced = 0;
+    Index blocks2x2 = 0;
+    Index straddling = 0;
+  };
+
+  void factorizeSupernode(StorageIndex s, const RealScalar& staticPivot, SupernodeResult& result);
+  /** 1x1 pivots taken in order, no search. Positive definite input only. */
+  void factorizeDiagonalBlockUnpivoted(StridedPanel diag, signed char* pivotKind,
+                                       SupernodeResult& result) const;
+  /** Bounded Bunch-Kaufman: 1x1 and 2x2 pivots with symmetric interchanges
+   *  confined to the block, so the global symbolic structure is untouched. */
+  void factorizeDiagonalBlockBunchKaufman(StridedPanel diag, const RealScalar& staticPivot,
+                                          std::vector<StorageIndex>& perm, signed char* pivotKind,
+                                          Scalar* dOffDiag, SupernodeResult& result) const;
+
+  /** Symmetric interchange of local indices i < j within a diagonal block.
+   *  Swaps rows AND columns, so the block stays symmetric and only its lower
+   *  triangle is touched. */
+  void symmetricSwap(StridedPanel diag, StorageIndex i, StorageIndex j) const;
+
+  /** head := P_s head, the local symmetric interchange of supernode s, applied
+   *  to that supernode's own rows of the right-hand side. Its inverse is
+   *  unpermuteHead. Both are no-ops when nothing moved. */
+  template <typename Dest>
+  void permuteHead(StorageIndex s, Dest& head) const {
+    const std::vector<StorageIndex>& perm = m_diagPivot[s];
+    if (perm.empty()) return;
+    DenseMatrix tmp = head;
+    for (StorageIndex k = 0; k < static_cast<StorageIndex>(perm.size()); ++k)
+      head.row(k) = tmp.row(perm[k]);
+  }
+  template <typename Dest>
+  void unpermuteHead(StorageIndex s, Dest& head) const {
+    const std::vector<StorageIndex>& perm = m_diagPivot[s];
+    if (perm.empty()) return;
+    DenseMatrix tmp = head;
+    for (StorageIndex k = 0; k < static_cast<StorageIndex>(perm.size()); ++k)
+      head.row(perm[k]) = tmp.row(k);
+  }
 
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& x) const;
+
   template <typename Dest>
   void applyInverseL(Dest& y) const;
   template <typename Dest>
@@ -431,6 +642,21 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   std::vector<Scalar> m_lStorage;
   std::vector<std::size_t> m_lOffset;
 
+  // Per internal column: 1 = a 1x1 pivot, 2 = leading column of a 2x2, 0 = its
+  // trailing column. Under Pivoting::None every entry is 1.
+  std::vector<signed char> m_pivotKind;
+  // The off-diagonal entry of each 2x2 pivot, indexed by its LEADING internal
+  // column. It is held here rather than in the (k+1, k) slot of the diagonal
+  // block -- the packed LAPACK convention -- because that slot is also what
+  // triangularView<UnitLower>() reads as L(k+1, k), and for a 2x2 pivot L has a
+  // 2x2 identity there. Keeping D out of the block lets every triangular solve
+  // use the plain unit-lower view with nothing to mask.
+  std::vector<Scalar> m_dOffDiag;
+  // Per supernode, the local symmetric interchange chosen inside its diagonal
+  // block: perm[k] is the block-local index now sitting at position k. Empty
+  // when nothing moved, which is the common case and the cheap one.
+  std::vector<std::vector<StorageIndex>> m_diagPivot;
+
   std::vector<RealScalar> m_scale;  // symmetric equilibration, original numbering
   MatrixType m_originalMatrix;
 
@@ -439,6 +665,12 @@ class SupernodalLDLT : public SparseSolverBase<SupernodalLDLT<MatrixType_, UpLo_
   double m_amalgamationFillFraction;
   Index m_maxBlockSize, m_maxFactorNonzeros;
   Index m_maxRefinementIterations;
+  bool m_refineOnlyIfPerturbed;
+  supernodal_ldlt::Pivoting m_pivoting;
+  RealScalar m_staticPivotThreshold;
+  bool m_thresholdIsAuto;
+  Index m_replacedPivots, m_pivot2x2Count, m_straddlingPivots;
+  supernodal_ldlt::Inertia m_inertia;
   RealScalar m_refinementTolerance, m_solveFailureThreshold;
   mutable RealScalar m_lastSolveRelativeResidual;
   mutable Index m_lastRefinementIterations;
@@ -593,8 +825,8 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::computeEquilibrat
 // non-positive pivot means the matrix was not positive definite, which is
 // reported rather than stepped over.
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
-void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeDiagonalBlock(
-    StridedPanel diag, bool& notPositiveDefinite, StorageIndex& failColumn) const {
+void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeDiagonalBlockUnpivoted(
+    StridedPanel diag, signed char* pivotKind, SupernodeResult& result) const {
   const StorageIndex w = static_cast<StorageIndex>(diag.rows());
 
   for (StorageIndex j0 = 0; j0 < w; j0 += kDiagBlockSize) {
@@ -606,11 +838,12 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeDiagonal
     for (StorageIndex k = j0; k < panelEnd; ++k) {
       const RealScalar d = numext::real(diag(k, k));
       if (!(d > RealScalar(0))) {
-        notPositiveDefinite = true;
-        failColumn = k;
+        result.notPositiveDefinite = true;
+        result.failColumn = k;
         return;
       }
       diag(k, k) = Scalar(d);  // D is real even for a Hermitian input
+      pivotKind[k] = 1;
       const StorageIndex below = w - k - 1;
       if (below == 0) continue;
       diag.col(k).segment(k + 1, below) /= Scalar(d);
@@ -634,6 +867,193 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeDiagonal
   }
 }
 
+// Symmetric interchange of local indices i < j. Only the LOWER triangle of the
+// block is stored, so a swap of row i with row j and column i with column j
+// touches four disjoint regions, and the piece between i and j is REFLECTED
+// across the diagonal -- entry (m, i) and entry (j, m) are the same element of
+// the symmetric matrix seen from the two sides, which is why that stretch swaps
+// against the conjugate rather than straight across.
+//
+// Note the extent of (a): EVERY column left of i, not just the factored ones.
+// Those columns hold L where they are already factored and active values where
+// they are not, and both have to move -- a 2x2 pivot swaps at i = k+1 while
+// column k is still active and is part of the pivot being formed, so stopping at
+// the factored boundary would silently leave that column behind. (A 1x1 pivot
+// swaps at i = k, where the two extents coincide, which is what makes this easy
+// to get wrong and hard to notice.)
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::symmetricSwap(
+    StridedPanel diag, StorageIndex i, StorageIndex j) const {
+  if (i == j) return;
+  eigen_assert(i < j);
+  const StorageIndex w = static_cast<StorageIndex>(diag.rows());
+
+  // (a) every column left of i: L where factored, active values otherwise.
+  if (i > 0) diag.row(i).segment(0, i).swap(diag.row(j).segment(0, i));
+
+  // (b) the two diagonal entries (both real for a Hermitian block).
+  std::swap(diag(i, i), diag(j, j));
+
+  // (c) the reflected stretch strictly between i and j.
+  for (StorageIndex m = i + 1; m < j; ++m) {
+    const Scalar t = diag(m, i);
+    diag(m, i) = numext::conj(diag(j, m));
+    diag(j, m) = numext::conj(t);
+  }
+
+  // (d) the two column tails below j.
+  const StorageIndex below = w - j - 1;
+  if (below > 0)
+    diag.col(i).segment(j + 1, below).swap(diag.col(j).segment(j + 1, below));
+}
+
+// Bounded Bunch-Kaufman. At each step the choice is between a 1x1 pivot and a
+// 2x2 one, and the criterion bounds the growth of L either way -- which is the
+// whole point, because a symmetric matrix can have an arbitrarily small diagonal
+// and still be perfectly well conditioned, so "divide by the diagonal" is not an
+// option the way it is for a positive definite matrix.
+//
+// Deliberately UNBLOCKED. The blocked form (LAPACK's xSYTRF) exists because a
+// dense factorization has no other source of BLAS-3 work; here the block is
+// capped by setMaxBlockSize (128 by default) and the BLAS-3 work that matters is
+// the off-diagonal panel, so an unblocked kernel on a small block costs a worse
+// constant on a term that is not the bottleneck.
+template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
+void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeDiagonalBlockBunchKaufman(
+    StridedPanel diag, const RealScalar& staticPivot, std::vector<StorageIndex>& perm,
+    signed char* pivotKind, Scalar* dOffDiag, SupernodeResult& result) const {
+  const StorageIndex w = static_cast<StorageIndex>(diag.rows());
+  // (1 + sqrt(17)) / 8: the constant that minimises the bound on element growth.
+  const RealScalar alpha = (RealScalar(1) + numext::sqrt(RealScalar(17))) / RealScalar(8);
+
+  std::vector<StorageIndex> local(static_cast<std::size_t>(w));
+  for (StorageIndex k = 0; k < w; ++k) local[k] = k;
+  bool anySwap = false;
+
+  StorageIndex k = 0;
+  while (k < w) {
+    const StorageIndex below = w - k - 1;
+
+    // omega_k: the largest subdiagonal magnitude in column k, and where it is.
+    RealScalar omegaK(0);
+    StorageIndex r = k;
+    if (below > 0) {
+      Index rel = 0;
+      omegaK = diag.col(k).segment(k + 1, below).cwiseAbs().maxCoeff(&rel);
+      r = k + 1 + static_cast<StorageIndex>(rel);
+    }
+    const RealScalar absAkk = numext::abs(diag(k, k));
+
+    StorageIndex pivotSize = 1;
+    StorageIndex swapWith = k;
+    if (omegaK > RealScalar(0)) {
+      if (absAkk >= alpha * omegaK) {
+        pivotSize = 1;  // the diagonal is big enough on its own
+      } else {
+        // omega_r: the largest off-diagonal magnitude in row/column r, read from
+        // both sides of the diagonal because only the lower triangle is stored.
+        RealScalar omegaR(0);
+        for (StorageIndex m = k; m < r; ++m) omegaR = numext::maxi(omegaR, numext::abs(diag(r, m)));
+        if (r + 1 < w)
+          omegaR = numext::maxi(omegaR, diag.col(r).segment(r + 1, w - r - 1).cwiseAbs().maxCoeff());
+
+        if (absAkk * omegaR >= alpha * omegaK * omegaK)
+          pivotSize = 1;  // still fine at k once the whole row is accounted for
+        else if (numext::abs(diag(r, r)) >= alpha * omegaR)
+          pivotSize = 1, swapWith = r;  // r's diagonal is usable instead
+        else
+          pivotSize = 2, swapWith = r;  // neither is: take the 2x2 spanning k and r
+      }
+    }
+
+    // A 2x2 pivot needs a second column inside THIS block. At the last column
+    // there is none, and growing the structure to find one is exactly what this
+    // solver refuses to do -- so take a perturbed 1x1 instead and record it.
+    if (pivotSize == 2 && k + 1 >= w) {
+      pivotSize = 1;
+      swapWith = k;
+      ++result.straddling;
+    }
+
+    if (pivotSize == 1) {
+      if (swapWith != k) {
+        symmetricSwap(diag, k, swapWith);
+        std::swap(local[k], local[swapWith]);
+        anySwap = true;
+      }
+      Scalar d = diag(k, k);
+      const RealScalar absd = numext::abs(d);
+      if (staticPivot > RealScalar(0) && absd < staticPivot) {
+        // Bump to the threshold, keeping the sign: the inertia of the perturbed
+        // matrix should still reflect which side of zero the pivot was on.
+        d = (absd == RealScalar(0)) ? Scalar(staticPivot) : d * (staticPivot / absd);
+        diag(k, k) = d;
+        ++result.replaced;
+      }
+      if (d == Scalar(0)) {
+        result.singular = true;
+        result.failColumn = k;
+        return;
+      }
+      pivotKind[k] = 1;
+      if (below > 0) {
+        auto col = diag.col(k).segment(k + 1, below);
+        col /= d;
+        diag.block(k + 1, k + 1, below, below).template triangularView<Lower>() -=
+            (col * d) * col.adjoint();
+      }
+      k += 1;
+    } else {
+      // Bring r alongside k so the 2x2 occupies consecutive columns.
+      if (swapWith != k + 1) {
+        symmetricSwap(diag, k + 1, swapWith);
+        std::swap(local[k + 1], local[swapWith]);
+        anySwap = true;
+      }
+      // D = [[a, conj(c)], [c, b]]. Move c out of the block: the (k+1, k) slot is
+      // what the unit-lower view reads as L(k+1, k), and L is the identity across
+      // a 2x2 pivot, so it has to be left at zero.
+      const Scalar a = diag(k, k), c = diag(k + 1, k), b = diag(k + 1, k + 1);
+      dOffDiag[k] = c;
+      diag(k + 1, k) = Scalar(0);
+      const RealScalar det = numext::real(a) * numext::real(b) - numext::abs2(c);
+      if (det == RealScalar(0)) {
+        result.singular = true;
+        result.failColumn = k;
+        return;
+      }
+      pivotKind[k] = 2;
+      pivotKind[k + 1] = 0;
+      ++result.blocks2x2;
+
+      const StorageIndex below2 = w - k - 2;
+      if (below2 > 0) {
+        // L(k+2:, k:k+1) = A(k+2:, k:k+1) * D^-1, with
+        //   D^-1 = (1/det) [[b, -conj(c)], [-c, a]].
+        auto c0 = diag.col(k).segment(k + 2, below2);
+        auto c1 = diag.col(k + 1).segment(k + 2, below2);
+        DenseMatrix pair(below2, 2);
+        pair.col(0) = c0;
+        pair.col(1) = c1;
+        c0 = (pair.col(0) * Scalar(numext::real(b)) - pair.col(1) * c) / Scalar(det);
+        c1 = (pair.col(1) * Scalar(numext::real(a)) - pair.col(0) * numext::conj(c)) / Scalar(det);
+
+        // Trailing update A22 -= L21 D L21^H. L21 is (below2 x 2) and D is the
+        // 2x2 block, so forming D * L21^H once keeps this one small GEMM.
+        DenseMatrix dl(2, below2);
+        dl.row(0) = Scalar(numext::real(a)) * c0.adjoint() + numext::conj(c) * c1.adjoint();
+        dl.row(1) = c * c0.adjoint() + Scalar(numext::real(b)) * c1.adjoint();
+        DenseMatrix l21(below2, 2);
+        l21.col(0) = c0;
+        l21.col(1) = c1;
+        diag.block(k + 2, k + 2, below2, below2).template triangularView<Lower>() -= l21 * dl;
+      }
+      k += 2;
+    }
+  }
+  if (anySwap) perm = std::move(local);  // empty => identity
+}
+
 // Subtract one source supernode's Schur contribution from a target.
 //
 // The LU form of this walks BOTH an L-side and a U-side; here the source sends
@@ -651,6 +1071,8 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
 
   const StridedPanel srcLower = lowerPanel(source);
   const StridedPanel srcDiag = diagBlock(source);
+  const signed char* srcPivotKind = m_pivotKind.data() + static_cast<std::size_t>(src.firstColumn);
+  const Scalar* srcDOffDiag = m_dOffDiag.data() + static_cast<std::size_t>(src.firstColumn);
   StridedPanel targetDiag = diagBlock(target);
   StridedPanel targetLower = lowerPanel(target);
 
@@ -673,7 +1095,19 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
     const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
 
     DenseMatrix dl = srcLower.block(colBlock.panelOffset, 0, cc, wSrc).adjoint();  // wSrc x cc
-    for (StorageIndex q = 0; q < wSrc; ++q) dl.row(q) *= srcDiag(q, q);
+    for (StorageIndex q = 0; q < wSrc;) {
+      if (srcPivotKind[q] != 2) {
+        dl.row(q) *= srcDiag(q, q);
+        q += 1;
+      } else {
+        // D = [[a, conj(c)], [c, b]] mixes the two rows rather than scaling them.
+        const Scalar a = srcDiag(q, q), c = srcDOffDiag[q], b = srcDiag(q + 1, q + 1);
+        const DenseMatrix pair = dl.middleRows(q, 2);
+        dl.row(q) = Scalar(numext::real(a)) * pair.row(0) + numext::conj(c) * pair.row(1);
+        dl.row(q + 1) = c * pair.row(0) + Scalar(numext::real(b)) * pair.row(1);
+        q += 2;
+      }
+    }
 
     // facing rows -> the target's diagonal block. rb starts at cb: the pairs with
     // rb < cb would land strictly above the diagonal, which is not stored.
@@ -702,25 +1136,59 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
 
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
 void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeSupernode(
-    StorageIndex s, bool& notPositiveDefinite, StorageIndex& failColumn) {
+    StorageIndex s, const RealScalar& staticPivot, SupernodeResult& result) {
   std::vector<StorageIndex> destRowScratch;  // per-call: this runs concurrently
   for (const UpdateSource& u : m_updateSources[s])
     applyUpdate(u.sourceSupernode, s, u.facingRowBlock, destRowScratch);
 
+  const Supernode& sn = m_supernodes[s];
+  const StorageIndex w = sn.width();
+  signed char* pivotKind = m_pivotKind.data() + static_cast<std::size_t>(sn.firstColumn);
+  Scalar* dOffDiag = m_dOffDiag.data() + static_cast<std::size_t>(sn.firstColumn);
   StridedPanel diag = diagBlock(s);
-  factorizeDiagonalBlock(diag, notPositiveDefinite, failColumn);
-  if (notPositiveDefinite) {
-    failColumn += m_supernodes[s].firstColumn;  // block-local -> internal index
+
+  if (m_pivoting == supernodal_ldlt::Pivoting::None)
+    factorizeDiagonalBlockUnpivoted(diag, pivotKind, result);
+  else
+    factorizeDiagonalBlockBunchKaufman(diag, staticPivot, m_diagPivot[s], pivotKind, dOffDiag,
+                                       result);
+  if (result.notPositiveDefinite || result.singular) {
+    result.failColumn += sn.firstColumn;  // block-local -> internal index
     return;
   }
 
+  if (sn.offDiagonalRowCount == 0) return;
+  StridedPanel lower = lowerPanel(s);
+
+  // The block's symmetric interchange permutes its COLUMNS, and the panel's
+  // columns are the same set, so they move with it. Its ROWS are other equations
+  // entirely and do not: that is exactly why the Schur complement this supernode
+  // sends out is unaffected by the local permutation.
+  const std::vector<StorageIndex>& perm = m_diagPivot[s];
+  if (!perm.empty()) {
+    DenseMatrix permuted(lower.rows(), w);
+    for (StorageIndex k = 0; k < w; ++k) permuted.col(k) = lower.col(perm[k]);
+    lower = permuted;
+  }
+
   // A_Rk = L_Rk D_kk L_kk^H, so L_Rk = A_Rk L_kk^-H D_kk^-1: one right-solve
-  // against the unit upper triangle, then a column scaling by D.
-  const StorageIndex w = m_supernodes[s].width();
-  if (m_supernodes[s].offDiagonalRowCount > 0) {
-    StridedPanel lower = lowerPanel(s);
-    diag.template triangularView<UnitLower>().adjoint().template solveInPlace<OnTheRight>(lower);
-    for (StorageIndex q = 0; q < w; ++q) lower.col(q) /= diag(q, q);
+  // against the unit upper triangle, then a right-multiply by D^-1 that has to
+  // treat a 2x2 pivot as a block rather than two scalars.
+  diag.template triangularView<UnitLower>().adjoint().template solveInPlace<OnTheRight>(lower);
+  for (StorageIndex q = 0; q < w;) {
+    if (pivotKind[q] != 2) {
+      lower.col(q) /= diag(q, q);
+      q += 1;
+    } else {
+      const Scalar a = diag(q, q), c = dOffDiag[q], b = diag(q + 1, q + 1);
+      const RealScalar det = numext::real(a) * numext::real(b) - numext::abs2(c);
+      const DenseMatrix pair = lower.middleCols(q, 2);
+      // [x0 x1] * D^-1 with D^-1 = (1/det) [[b, -conj(c)], [-c, a]].
+      lower.col(q) = (pair.col(0) * Scalar(numext::real(b)) - pair.col(1) * c) / Scalar(det);
+      lower.col(q + 1) =
+          (pair.col(1) * Scalar(numext::real(a)) - pair.col(0) * numext::conj(c)) / Scalar(det);
+      q += 2;
+    }
   }
 }
 
@@ -732,6 +1200,10 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   m_factorized = false;
   m_failColumn = -1;
+  m_replacedPivots = 0;
+  m_pivot2x2Count = 0;
+  m_straddlingPivots = 0;
+  m_inertia = supernodal_ldlt::Inertia();
   m_lastError.clear();
   m_info = Success;
   if (m_size == 0) {
@@ -761,6 +1233,21 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
   m_originalMatrix = matrix;  // kept for the residual check and refinement
   computeEquilibration(matrix);
 
+  // Resolve the static-pivot threshold against the SCALED matrix, since that is
+  // what gets factored. Pivoting::None never perturbs -- it reports instead --
+  // so the threshold is only meaningful under Bunch-Kaufman.
+  RealScalar staticPivot = m_staticPivotThreshold;
+  if (m_thresholdIsAuto) {
+    RealScalar maxAbs(0);
+    for (StorageIndex j = 0; j < m_size; ++j)
+      for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
+        const StorageIndex i = static_cast<StorageIndex>(it.index());
+        if (!inputTriangleHolds(i, j)) continue;
+        maxAbs = numext::maxi(maxAbs, numext::abs(it.value()) * m_scale[i] * m_scale[j]);
+      }
+    staticPivot = numext::sqrt(NumTraits<RealScalar>::epsilon()) * maxAbs;
+  }
+
   // 1) lay out and zero the single panel arena.
   m_lOffset.assign(supernodeNbr, 0);
   std::size_t total = 0;
@@ -772,6 +1259,9 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
     total += (w + r) * w;
   }
   m_lStorage.assign(total, Scalar(0));
+  m_pivotKind.assign(static_cast<std::size_t>(m_size), 1);
+  m_dOffDiag.assign(static_cast<std::size_t>(m_size), Scalar(0));
+  m_diagPivot.assign(supernodeNbr, std::vector<StorageIndex>());
 
   // 2) scatter the scaled values of the stored triangle into the panels. Each
   //    entry is normalized to the LOWER triangle of the INTERNAL numbering --
@@ -806,43 +1296,67 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorize(const M
   // 3) left-looking supernodal factorization over elimination-tree levels: every
   //    supernode in a level writes only its own panel, so a level runs
   //    concurrently and levels run in order.
-  std::vector<char> badPerSupernode(supernodeNbr, 0);
-  std::vector<StorageIndex> failPerSupernode(supernodeNbr, 0);
+  std::vector<SupernodeResult> results(static_cast<std::size_t>(supernodeNbr));
   bool bad = false;
   for (const std::vector<StorageIndex>& group : m_levelGroups) {
     const Index groupSize = static_cast<Index>(group.size());
     m_executor.parallelFor(Index(0), groupSize, [&](Index k) {
       const StorageIndex s = group[static_cast<std::size_t>(k)];
-      bool localBad = false;
-      StorageIndex localFail = 0;
-      factorizeSupernode(s, localBad, localFail);
-      badPerSupernode[s] = localBad ? 1 : 0;
-      failPerSupernode[s] = localFail;
+      factorizeSupernode(s, staticPivot, results[s]);
     });
     for (StorageIndex s : group)
-      if (badPerSupernode[s]) bad = true;
+      if (results[s].notPositiveDefinite || results[s].singular) bad = true;
     if (bad) break;  // the factor is unusable; stop launching further levels
   }
 
   if (bad) {
-    StorageIndex failed = 0;
-    for (StorageIndex s = 0; s < supernodeNbr; ++s)
-      if (badPerSupernode[s]) {
-        failed = failPerSupernode[s];
-        break;
-      }
-    m_failColumn = Index(failed);
-    char buf[512];
-    std::snprintf(buf, sizeof(buf),
-                  "SupernodalLDLT: the matrix is not positive definite -- the pivot at internal "
-                  "column %lld is not positive. An indefinite symmetric matrix (a saddle-point or "
-                  "KKT system, say) needs 2x2 pivot blocks, which this solver does not implement; "
-                  "use LeftRightLU for it.",
-                  static_cast<long long>(failed));
+    const SupernodeResult* failure = nullptr;
+    for (StorageIndex s = 0; s < supernodeNbr && !failure; ++s)
+      if (results[s].notPositiveDefinite || results[s].singular) failure = &results[s];
+    m_failColumn = Index(failure->failColumn);
+    char buf[600];
+    if (failure->notPositiveDefinite)
+      std::snprintf(buf, sizeof(buf),
+                    "SupernodalLDLT: the matrix is not positive definite -- the pivot at internal "
+                    "column %lld is not positive, and setPivoting(Pivoting::None) asked for the "
+                    "positive definite fast path. Use the default Pivoting::BunchKaufman, which "
+                    "handles indefinite matrices with 2x2 pivot blocks.",
+                    static_cast<long long>(failure->failColumn));
+    else
+      std::snprintf(buf, sizeof(buf),
+                    "SupernodalLDLT: singular pivot block at internal column %lld, which "
+                    "perturbation was not allowed to repair (setStaticPivotThreshold is 0). The "
+                    "matrix is numerically singular in the scaled arithmetic actually used.",
+                    static_cast<long long>(failure->failColumn));
     m_lastError = buf;
     m_info = NumericalIssue;
     return;
   }
+
+  for (const SupernodeResult& r : results) {
+    m_replacedPivots += r.replaced;
+    m_pivot2x2Count += r.blocks2x2;
+    m_straddlingPivots += r.straddling;
+  }
+
+  // Inertia, by Sylvester's law: congruence preserves the signs, so the signs of
+  // D are the signs of A's eigenvalues. A Bunch-Kaufman 2x2 block always has a
+  // negative determinant, hence exactly one eigenvalue of each sign -- which is
+  // also an invariant worth asserting rather than assuming.
+  forEachPivotBlock([&](StorageIndex s, StorageIndex k, bool is2x2) {
+    const RealScalar det = pivotBlockDeterminant(s, k, is2x2);
+    if (is2x2) {
+      eigen_assert(det < RealScalar(0) && "a 2x2 Bunch-Kaufman block must have negative determinant");
+      ++m_inertia.positive;
+      ++m_inertia.negative;
+    } else if (det > RealScalar(0)) {
+      ++m_inertia.positive;
+    } else if (det < RealScalar(0)) {
+      ++m_inertia.negative;
+    } else {
+      ++m_inertia.zero;
+    }
+  });
 
   m_nnzL = 0;
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
@@ -887,6 +1401,10 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::forwardSolveSuper
     }
   }
   auto head = y.middleRows(tn.firstColumn, tn.width());
+  // The factor's diagonal block is P^T L_kk, so solving with it means permuting
+  // first. Panel contributions above needed no permutation: they live in
+  // un-permuted global rows, which is what keeps P_s local to this supernode.
+  permuteHead(t, head);
   diagBlock(t).template triangularView<UnitLower>().solveInPlace(head);
 }
 
@@ -907,6 +1425,9 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::backwardSolveSupe
     head.noalias() -= lower.middleRows(block.panelOffset, hb).adjoint() * y.middleRows(block.firstRow, hb);
   }
   diagBlock(s).template triangularView<UnitLower>().adjoint().solveInPlace(head);
+  // Undo the local interchange, so this supernode's rows are back in global
+  // coordinates before any lower-numbered supernode reads them through its panel.
+  unpermuteHead(s, head);
 }
 
 template <typename MatrixType, int UpLo, typename OrderingType, typename Executor>
@@ -931,6 +1452,7 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyInverseL(Des
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
     auto head = y.middleRows(sn.firstColumn, sn.width());
+    permuteHead(s, head);
     diagBlock(s).template triangularView<UnitLower>().solveInPlace(head);
     const ConstStridedPanel lower = lowerPanel(s);
     for (StorageIndex b = 0; b < sn.rowBlockCount; ++b) {
@@ -948,7 +1470,23 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyInverseD(Des
   for (StorageIndex s = 0; s < supernodeNbr; ++s) {
     const Supernode& sn = m_supernodes[s];
     const ConstStridedPanel diag = diagBlock(s);
-    for (StorageIndex k = 0; k < sn.width(); ++k) y.row(sn.firstColumn + k) /= diag(k, k);
+    const signed char* kind = m_pivotKind.data() + static_cast<std::size_t>(sn.firstColumn);
+    for (StorageIndex k = 0; k < sn.width();) {
+      if (kind[k] != 2) {
+        y.row(sn.firstColumn + k) /= diag(k, k);
+        k += 1;
+      } else {
+        // Solve the 2x2 system rather than dividing twice: D^-1 = (1/det) [[b, -conj(c)], [-c, a]].
+        const Scalar a = diag(k, k), c = m_dOffDiag[sn.firstColumn + k], b = diag(k + 1, k + 1);
+        const RealScalar det = numext::real(a) * numext::real(b) - numext::abs2(c);
+        const DenseMatrix pair = y.middleRows(sn.firstColumn + k, 2);
+        y.row(sn.firstColumn + k) =
+            (Scalar(numext::real(b)) * pair.row(0) - numext::conj(c) * pair.row(1)) / Scalar(det);
+        y.row(sn.firstColumn + k + 1) =
+            (Scalar(numext::real(a)) * pair.row(1) - c * pair.row(0)) / Scalar(det);
+        k += 2;
+      }
+    }
   }
 }
 
@@ -997,10 +1535,13 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::_solve_impl(const
   DenseMatrix solution(m_size, rhs.cols());
   solveTriangular(rhs, solution);
 
-  // Optional stationary refinement. Off by default: with no pivoting and no
-  // perturbation there is nothing here to repair (see setMaxIterativeRefinements).
+  // Stationary refinement, gated on perturbation by default: an unperturbed
+  // LDL^T is backward stable and there is nothing to repair, so a positive
+  // definite solve costs exactly the factor solve and nothing more.
   m_lastRefinementIterations = 0;
-  if (m_maxRefinementIterations > 0 && m_size > 0) {
+  const bool refine =
+      m_maxRefinementIterations > 0 && (!m_refineOnlyIfPerturbed || m_replacedPivots > 0);
+  if (refine && m_size > 0) {
     const RealScalar rhsNorm = rhs.norm();
     DenseMatrix product(rhs.rows(), rhs.cols()), residual, correction(m_size, rhs.cols());
     RealScalar bestNorm = NumTraits<RealScalar>::highest();
