@@ -334,7 +334,12 @@ behave identically because they drive the same code:
   allocating the arena.
 - **`setMaxIterativeRefinements(Index)`** (default `5`, gated by `setRefineOnlyIfPerturbed`) —
   stationary refinement. Stationary and not Krylov, unlike the siblings — see
-  [the measurement](#a-krylov-refinement-option). Two iterations reach machine precision.
+  [the measurement](#a-krylov-refinement-option). Two iterations reach machine precision, so the
+  default of 5 is headroom rather than a working figure.
+- **`setRefinementTolerance(RealScalar)`** (default machine epsilon) — the relative residual at
+  which refinement stops. Refinement also stops on its own when a step fails to improve on the
+  best residual so far, which is what keeps a factorization too far from `A` from making the
+  answer worse rather than better.
 - **`setSolveFailureThreshold(RealScalar)`** (default `1e-6`) — `solve()` measures the true
   relative residual against the original operator and downgrades `info()` rather than return a
   bad answer silently. `solveResidual()` reports the measured value.
