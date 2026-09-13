@@ -21,14 +21,14 @@
 // loop makes):
 //
 //   matrix        n     PointBlockLU fill / time   LeftRightLU fill / time   ratio
-//   setfos      1015        4,080 /   0.03 ms      116,786 /  2.06 ms       69x
-//   bayer05     3268       77,462 /   1.25 ms      456,036 / 13.41 ms       10.7x
-//   gemat11     4929       79,614 /   1.52 ms      131,156 /  3.32 ms        2.2x
-//   tomography   500       46,540 /   2.39 ms      180,154 /  4.52 ms        1.9x
-//   sherman1    1000       32,916 /   0.84 ms       40,884 /  0.84 ms        1.0x
-//   laoss_3     4180      731,852 /  44.0 ms     1,210,476 / 24.9 ms         0.57x
-//   YaleB_10NN  2414    1,232,024 / 258.1 ms     1,638,482 / 80.2 ms         0.31x
-//   setfos_2    3048    1,935,546 / 452.8 ms     2,360,714 / 100.7 ms        0.22x
+//   setfos      1015        4,080 /   0.04 ms      116,602 /  1.76 ms       44x
+//   bayer05     3268       77,462 /   1.26 ms       58,036 /  4.33 ms        3.4x
+//   gemat11     4929       79,614 /   1.54 ms      121,294 /  2.90 ms        1.9x
+//   tomography   500       46,540 /   2.13 ms      164,836 /  4.55 ms        2.1x
+//   sherman1    1000       32,916 /   0.73 ms       40,884 /  0.87 ms        1.2x
+//   laoss_3     4180      731,852 /  37.4 ms     1,210,476 / 23.8 ms         0.64x
+//   YaleB_10NN  2414    1,232,024 / 229.1 ms     1,638,482 / 82.4 ms         0.36x
+//   setfos_2    3048    1,935,546 / 402.6 ms     2,349,388 / 102.1 ms        0.25x
 //
 // The crossover sits near 100k stored scalars in the factor. Below it this
 // solver wins by a lot; above it, use LeftRightLU.

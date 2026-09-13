@@ -65,8 +65,8 @@ Practical guidance:
   machine precision, in less time and less fill). It is off by default because it is a 2×-fill
   regression on a matrix that does not need it.
 - **Start with `LeftRightLU`** for anything else. It takes any pattern, matches `SupernodalLU`
-  on symmetric-pattern matrices, and is far ahead of it on unsymmetric ones (`gemat11` 9.1 ms
-  against 1415 ms).
+  on symmetric-pattern matrices, and is far ahead of it on unsymmetric ones (`gemat11` 8.2 ms
+  against 1476 ms).
 - **Use `PointBlockLU` when the factor stays sparse** — below roughly 100k stored scalars it is
   the fastest solver here and often the most accurate, because it never perturbs a pivot. Above
   that its scalar kernels lose to supernodal ones.

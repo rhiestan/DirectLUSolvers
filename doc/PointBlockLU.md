@@ -25,20 +25,23 @@ for (/* each Newton step */) {
 matrices". Symmetrizing an unsymmetric pattern can cost enormous fill, and avoiding that is
 what this solver buys; but a scalar column algorithm runs at roughly a fifth of the throughput
 of a supernodal one, so once the factor densifies the fill advantage is spent and
-`LeftRightLU` wins. Measured 2026-08-26, single-threaded, best of 5, COLAMD ordering,
+`LeftRightLU` wins. Measured 2026-09-13, single-threaded, best of 5, COLAMD ordering,
 `bench_solvers` (PointBlockLU timed on its **replay** — the call the target workload actually
 makes; its `analyze` column is paid once):
 
 | matrix | n | PointBlockLU fill / replay+solve | LeftRightLU fill / factor+solve | `Eigen::SparseLU` |
 |---|---:|---:|---:|---:|
-| `setfos` | 1015 | **4,080** / **0.03 ms** | 116,602 / 1.77 ms | 4,080 / 0.14 ms |
-| `bayer05` | 3268 | 77,462 / **1.22 ms** | **58,036** / 4.43 ms | 126,396 / 5.28 ms |
-| `gemat11` | 4929 | **79,614** / **1.45 ms** | 121,294 / 3.19 ms | 86,476 / 4.44 ms |
-| `tomography` | 500 | **46,540** / **1.94 ms** | 164,836 / 4.56 ms | 91,650 / 5.52 ms |
-| `sherman1` | 1000 | **32,916** / **0.66 ms** | 40,884 / 0.88 ms | 31,900 / 1.11 ms |
-| `laoss_3` | 4180 | 731,852 / 33.1 ms | 1,210,476 / **24.6 ms** | 731,852 / 33.0 ms |
-| `YaleB_10NN` | 2414 | 1,232,024 / 217.3 ms | 1,638,482 / **83.9 ms** | 1,226,238 / 112.5 ms |
-| `setfos_2` | 3048 | 1,935,546 / 358.7 ms | 2,349,388 / **104.4 ms** | 1,935,897 / 112.7 ms |
+| `setfos` | 1015 | **4,080** / **0.04 ms** | 116,602 / 1.76 ms | 4,080 / 0.14 ms |
+| `bayer05` | 3268 | 77,462 / **1.26 ms** | **58,036** / 4.33 ms | 126,396 / 5.24 ms |
+| `gemat11` | 4929 | **79,614** / **1.54 ms** | 121,294 / 2.90 ms | 86,476 / 4.33 ms |
+| `tomography` | 500 | **46,540** / **2.13 ms** | 164,836 / 4.55 ms | 91,650 / 5.50 ms |
+| `sherman1` | 1000 | **32,916** / **0.73 ms** | 40,884 / 0.87 ms | 31,900 / 1.11 ms |
+| `laoss_3` | 4180 | 731,852 / 37.4 ms | 1,210,476 / **23.8 ms** | 731,852 / 32.5 ms |
+| `YaleB_10NN` | 2414 | 1,232,024 / 229.1 ms | 1,638,482 / **82.4 ms** | 1,226,238 / 111.8 ms |
+| `setfos_2` | 3048 | 1,935,546 / 402.6 ms | 2,349,388 / **102.1 ms** | 1,935,897 / 111.2 ms |
+
+Every row is the shipping configuration, so the `solve` half of each includes the residual check
+each solver runs by default — see [What it costs](#what-it-costs) for what that is worth here.
 
 `bayer05` is the one row where `LeftRightLU` carries *less* fill than `PointBlockLU`: it is
 reducible, so [block triangular form](LeftRightLU.md#whats-different-from-supernodallu) leaves
@@ -51,13 +54,13 @@ fastest solver in this project — on `setfos`, `gemat11`, `sherman1`, `tomograp
 `bayer05` it beats `Eigen::SparseLU` and MKL PARDISO outright. Above it, use `LeftRightLU`.
 
 It is often more *accurate* too, because it never perturbs a pivot: on `gemat11` its solve
-error is 8.9e-13 against `LeftRightLU`'s 4.3e-08, on `tomography` 6.8e-14 against 7.2e-09,
-and on the near-singular `bayer05` 1.1e-03 against `Eigen::SparseLU`'s 8.4e+00.
+error is 8.8e-13 against `LeftRightLU`'s 4.3e-08, on `tomography` 6.8e-14 against 7.2e-09,
+and on the near-singular `bayer05` 1.1e-03 against `Eigen::SparseLU`'s 8.3e+00.
 
 Equilibration iterates to convergence rather than a fixed sweep count, which matters at this
 scale: the sweep is O(nnz) and runs on every replay, so a fixed eight sweeps was 80% of
 `setfos`'s entire replay (98 µs against 19 µs with scaling off). It now costs one or two
-sweeps on a well-scaled matrix, and the replay is 20 µs.
+sweeps on a well-scaled matrix, and the replay is 24 µs.
 
 ## Why PointBlockLU is not parallel
 
@@ -156,14 +159,15 @@ allowing element growth, and the price was previously invisible — measured on 
 
 ### What it costs
 
-The factorization is untouched — the crossover table above still holds. Measured on this
-project's testdata, best of 20, as a percentage of the phase it is added to:
+The factorization algorithm is untouched — the crossover table above still holds. Two things are
+added: an O(nnz) copy of `A` per `factorize()`, and an O(nnz) matrix-vector product per `solve()`.
+Measured 2026-09-13, min of 5, as a percentage of the phase each is added to:
 
-| | `setfos` | `bayer05` | `gemat11` | `tomography` | `sherman1` | `laoss_3` | `setfos_2` |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| copy of `A` per `factorize()` | 2.4% | 0.7% | 0.6% | 0.3% | 0.1% | 0.1% | 0.1% |
-| residual check per `solve()` | 30% | 28% | 32% | 33% | 14% | ~0% | 62% |
-| **replay + solve together** | **+12%** | **+2.8%** | **+2.6%** | **+1.1%** | **+0.8%** | **~0%** | **+0.4%** |
+| | `setfos` | `bayer05` | `gemat11` | `tomography` | `sherman1` | `laoss_3` | `YaleB_10NN` | `setfos_2` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| copy of `A` per `factorize()` | 2.1% | 0.5% | 0.6% | 0.3% | 0.1% | 0.1% | 0.0% | 0.1% |
+| residual check per `solve()` | 29% | 23% | 27% | 30% | 13% | 8.5% | 2.2% | 20% |
+| **replay + solve together** | **+11.8%** | **+2.0%** | **+2.2%** | **+0.9%** | **+0.7%** | **+0.2%** | **+0.0%** | **+0.2%** |
 
 The replay needs a copy of `A` because `solve()` is handed neither the matrix nor anything
 equivalent — the factors describe the *equilibrated* `A~`, not the matrix the caller asked about.
@@ -171,6 +175,18 @@ The copy is a value `memcpy` whenever the pattern is the one already held, which
 is every call after the first. The worst row is `setfos`, the smallest and sparsest matrix, where
 the whole Newton iteration goes from 38 µs to 43 µs; everywhere else the cost is under 3%.
 `setSolveFailureThreshold(0)` removes the per-solve half of it.
+
+**How those numbers were taken, because the obvious method gives the wrong answer.** Each column
+above compares two code paths compiled into the *same* executable — the residual check against
+`setSolveFailureThreshold(0)` in the same binary, and the copy timed in place. That is deliberate.
+Timing this phase in a build *before* the change and a build *after* it does not work here: adding
+~400 lines to this header relocates the hot replay loop, and the resulting layout shift is larger
+than the thing being measured. Interleaved before/after runs of `bench_solvers` put the replay
+12-15% **slower**; the same interleaved experiment in a small single-solver probe put it 12-13%
+**faster**; the true added work is the sub-1% copy in the table. Both cross-binary answers are
+layout artifacts. Where a measurement has to span two builds, check the rows the change cannot
+have touched first — here `Eigen::SparseLU` and `SupernodalLU` stayed within ±1%, which is what
+says the machine was steady and the movement was in the compiled layout.
 
 ## Deltas from the other two solvers
 
