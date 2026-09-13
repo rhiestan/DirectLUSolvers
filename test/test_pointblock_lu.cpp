@@ -17,6 +17,8 @@
 #include <Eigen/OrderingMethods>
 #include <Eigen/SparseCore>
 
+#include <cmath>
+#include <complex>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -248,6 +250,308 @@ void testDeterminant() {
   }
 }
 
+// ---------------------------------------------------------------------------
+//  Reliability: does the solver know how much of its own answer to believe?
+// ---------------------------------------------------------------------------
+//
+// Finding a pivot in every column is the coarse half of that question, and the
+// tests above cover it. This section covers the fine half: partial pivoting can
+// succeed in every column and still return an answer with no correct digit in
+// it, because the matrix was ill-conditioned rather than singular. The residual
+// cannot see that case -- it is small either way -- which is exactly why the
+// condition estimate and the forward error exist.
+
+// Upper bidiagonal, 1 on the diagonal and `superdiagonal` above it. With -2 the
+// inverse has entries 2^(j-i), so kappa_1 = 3 * (2^n - 1) in closed form: a
+// yardstick dialled purely by n, with no rounding in the "true" value to argue
+// about. With -1.7 the same shape rounds at every operation, which is what makes
+// the backward error nonzero and lets kappa actually amplify it.
+SpMat bidiagonal(int n, double superdiagonal) {
+  std::vector<Eigen::Triplet<double>> t;
+  for (int j = 0; j < n; ++j) {
+    t.emplace_back(j, j, 1.0);
+    if (j > 0) t.emplace_back(j - 1, j, superdiagonal);
+  }
+  SpMat A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+// The true 1-norm condition number, densely. The O(n^3) reference, small n only.
+double denseCondition1(const SpMat& A) {
+  const Eigen::MatrixXd dense = Eigen::MatrixXd(A);
+  const Eigen::MatrixXd inv = dense.inverse();
+  double normA = 0, normInv = 0;
+  for (Eigen::Index j = 0; j < dense.cols(); ++j) {
+    normA = (std::max)(normA, dense.col(j).cwiseAbs().sum());
+    normInv = (std::max)(normInv, inv.col(j).cwiseAbs().sum());
+  }
+  return normA * normInv;
+}
+
+VectorXd irrationalSolution(Eigen::Index n) {
+  VectorXd x(n);
+  for (Eigen::Index i = 0; i < n; ++i) x[i] = 1.0 + 0.1 * std::sin(3.0 * double(i));
+  return x;
+}
+
+// std::to_string renders 2e-14 as "0.000000", which is exactly the range every
+// number in this section lives in.
+std::string sci(double v) {
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%.3e", v);
+  return std::string(buf);
+}
+
+void testConditionEstimate() {
+  std::printf("\n-- condition estimate against a known kappa --\n");
+  // Hager's algorithm is a LOWER bound, so `est <= exact` is the load-bearing
+  // invariant: an estimator that overshoots reports a matrix as worse
+  // conditioned than it is, which is a different and equally real bug.
+  //
+  // The lower gate is what tests the ADJOINT solve, and it is not slack. The
+  // estimator's first probe never touches A^H and on this matrix returns roughly
+  // exact/n on its own -- 2.5% of the true value at n=40. Only the A^H step
+  // lifts it to the exact vertex, so anything above half the true value can only
+  // have come from a correct adjoint.
+  for (int n : {2, 5, 10, 20, 30, 40}) {
+    const SpMat A = bidiagonal(n, -2.0);
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(A);
+    const double exact = (n == 1) ? 1.0 : 3.0 * (std::pow(2.0, n) - 1.0);
+    const double est = s.conditionEstimate();
+    const std::string tag = "kappa n=" + std::to_string(n);
+    lu_testing::check(est <= exact * (1.0 + 1e-9), tag + ": a lower bound", est / exact);
+    lu_testing::check(est >= exact * 0.5, tag + ": tight, so A^H is right", est / exact);
+    lu_testing::checkTrue(s.conditionEstimateSolves() > 0, tag + ": solves were actually spent");
+  }
+  for (int n : {8, 16, 32, 64}) {
+    const SpMat A = lu_testing::randomUnsymmetricPattern(n, 0.3, 7u + unsigned(n));
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(A);
+    if (s.info() != Eigen::Success) continue;
+    const double exact = denseCondition1(A);
+    lu_testing::check(s.conditionEstimate() <= exact * (1.0 + 1e-9),
+                      "kappa vs dense inverse n=" + std::to_string(n) + ": a lower bound",
+                      s.conditionEstimate() / exact);
+  }
+  {  // Cached until the next factorization, and honest about having none.
+    const SpMat A = bidiagonal(16, -2.0);
+    Eigen::PointBlockLU<SpMat> fresh;
+    lu_testing::checkTrue(std::isinf(fresh.conditionEstimate()),
+                          "un-factorized: kappa is infinite, not zero");
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(A);
+    const double first = s.conditionEstimate();
+    const Eigen::Index spent = s.conditionEstimateSolves();
+    lu_testing::checkTrue(s.conditionEstimate() == first && s.conditionEstimateSolves() == spent,
+                          "a second call is cached, not recomputed");
+    s.factorize(A);
+    lu_testing::checkTrue(s.conditionEstimateSolves() == 0,
+                          "factorize() invalidates the cached estimate");
+  }
+}
+
+void testErrorBoundsCatchWhatTheResidualCannot() {
+  std::printf("\n-- an answer that is backward stable and still worthless --\n");
+  // THE case this whole section exists for. At n=80 the bidiagonal's kappa is
+  // ~1e19: the computed x is the exact solution of a system a rounding error
+  // away from A, so its residual is ~1e-14 and every residual check on earth
+  // passes it -- and it is wrong by a factor of 70.
+  const int n = 80;
+  const SpMat A = bidiagonal(n, -1.7);
+  const VectorXd xTrue = irrationalSolution(n);
+  const VectorXd b = A * xTrue;
+
+  Eigen::PointBlockLU<SpMat> plain;
+  plain.compute(A);
+  const VectorXd x = plain.solve(b);
+  const double trueError = (x - xTrue).norm() / xTrue.norm();
+  lu_testing::check(trueError > 1.0, "the answer really is worthless", trueError);
+  lu_testing::check(plain.solveResidual() < 1e-9, "and its residual is tiny anyway",
+                    plain.solveResidual());
+  lu_testing::checkTrue(plain.info() == Eigen::Success,
+                        "so the residual check alone passes it -- as documented");
+
+  Eigen::PointBlockLU<SpMat> bounded;
+  bounded.setErrorBounds(true);
+  bounded.compute(A);
+  const VectorXd xb = bounded.solve(b);
+  lu_testing::check(bounded.lastBackwardError() < 1e-12,
+                    "error bounds agree it is backward stable", bounded.lastBackwardError());
+  lu_testing::checkTrue(bounded.info() == Eigen::NumericalIssue,
+                        "and STILL report NumericalIssue -- the gap is closed");
+  lu_testing::checkTrue(bounded.lastCorrectDigits() == 0, "zero correct digits claimed");
+  lu_testing::checkTrue(!bounded.lastErrorMessage().empty(), "and it says why");
+  lu_testing::note("n=80: kappa=" + sci(bounded.conditionEstimate()) + " resid=" +
+                   sci(plain.solveResidual()) + " true error=" + sci(trueError));
+  (void)xb;
+
+  // The other half of the contract: a well-conditioned system must NOT be
+  // downgraded, or the check is just noise.
+  const SpMat W = lu_testing::upwind2d(12, 12);
+  const VectorXd wTrue = irrationalSolution(W.rows());
+  Eigen::PointBlockLU<SpMat> good;
+  good.setErrorBounds(true);
+  good.compute(W);
+  const VectorXd wx = good.solve(VectorXd(W * wTrue));
+  lu_testing::checkTrue(good.info() == Eigen::Success, "a well-conditioned system is left alone");
+  lu_testing::check(good.lastCorrectDigits() >= 10, "and claims double-precision digits",
+                    double(good.lastCorrectDigits()));
+  lu_testing::check((wx - wTrue).norm() / wTrue.norm() < 1e-12, "which it deserves",
+                    (wx - wTrue).norm() / wTrue.norm());
+}
+
+void testDefaultPathPaysOnlyForTheResidual() {
+  std::printf("\n-- what the default path does and does not spend --\n");
+  const SpMat A = lu_testing::upwind2d(10, 10);
+  const VectorXd xTrue = irrationalSolution(A.rows());
+  const VectorXd b = A * xTrue;
+  {
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(A);
+    const VectorXd x = s.solve(b);
+    lu_testing::checkTrue(s.conditionEstimateSolves() == 0,
+                          "no triangular solve is spent on kappa unless asked");
+    lu_testing::checkTrue(std::isnan(s.lastBackwardError()) && std::isnan(s.lastForwardError()),
+                          "no error bounds are computed unless asked");
+    lu_testing::checkTrue(s.lastCorrectDigits() == -1, "and none are claimed");
+    lu_testing::check(std::isfinite(s.solveResidual()), "but the residual IS measured by default",
+                      s.solveResidual());
+    lu_testing::checkTrue(std::isnan(s.growthFactor()) || s.growthFactor() > 0,
+                          "growthFactor() answers after a factorization");
+    (void)x;
+  }
+  {  // Opting out must opt out of the work, not just the verdict.
+    Eigen::PointBlockLU<SpMat> s;
+    s.setSolveFailureThreshold(0.0);
+    s.compute(A);
+    const VectorXd x = s.solve(b);
+    lu_testing::checkTrue(std::isnan(s.solveResidual()),
+                          "threshold 0 skips the residual entirely");
+    lu_testing::checkTrue(s.info() == Eigen::Success, "and leaves info() alone");
+    lu_testing::check((x - xTrue).norm() / xTrue.norm() < 1e-12,
+                      "the answer is unchanged either way", (x - xTrue).norm() / xTrue.norm());
+  }
+  {  // And the gate must actually be able to fire.
+    Eigen::PointBlockLU<SpMat> s;
+    s.setSolveFailureThreshold(1e-300);  // no honest solve can meet this
+    s.compute(A);
+    const VectorXd x = s.solve(b);
+    lu_testing::checkTrue(s.info() == Eigen::NumericalIssue,
+                          "a threshold nothing can meet does downgrade info()");
+    lu_testing::checkTrue(s.lastErrorMessage().find("solveResidual") != std::string::npos,
+                          "and the message points at the number that failed");
+    (void)x;
+  }
+}
+
+void testGrowthFactorTracksPivotThreshold() {
+  std::printf("\n-- growth factor: what earns a relaxed pivot threshold --\n");
+  // setPivotThreshold() below 1.0 buys less fill by allowing element growth.
+  // That is a documented trade, and growthFactor() is what makes the price
+  // visible instead of leaving it to be discovered as a wrong answer.
+  const SpMat A = lu_testing::weakDiagonal(200, 11u);
+  const VectorXd xTrue = VectorXd::Ones(A.rows());
+  const VectorXd b = A * xTrue;
+  double strictGrowth = 0, relaxedGrowth = 0;
+  Eigen::Index strictFill = 0, relaxedFill = 0;
+  for (double t : {1.0, 1e-8}) {
+    Eigen::PointBlockLU<SpMat> s;
+    s.setPivotThreshold(t);
+    s.compute(A);
+    if (s.info() != Eigen::Success) {
+      lu_testing::fail("weakDiagonal declined at pivot threshold " + sci(t));
+      return;
+    }
+    const VectorXd x = s.solve(b);
+    (t == 1.0 ? strictGrowth : relaxedGrowth) = s.growthFactor();
+    (t == 1.0 ? strictFill : relaxedFill) = s.nnzL() + s.nnzU();
+    lu_testing::note("threshold " + sci(t) + ": growth=" + sci(s.growthFactor()) + " fill=" +
+                     std::to_string((long long)(s.nnzL() + s.nnzU())) + " error=" +
+                     sci((x - xTrue).norm() / xTrue.norm()));
+  }
+  lu_testing::check(strictGrowth < 10.0, "strict partial pivoting keeps growth near 1",
+                    strictGrowth);
+  lu_testing::check(relaxedGrowth > 100.0 * strictGrowth,
+                    "relaxing the threshold shows up as growth", relaxedGrowth / strictGrowth);
+  lu_testing::checkTrue(relaxedFill < strictFill, "which is what bought the lower fill");
+}
+
+void testReplayRefreshesTheResidualCheck() {
+  std::printf("\n-- a replay measures the NEW matrix, not the recorded one --\n");
+  // The residual check needs a copy of A, and the replay path refreshes that
+  // copy by value memcpy rather than sparse assignment. If that refresh were
+  // ever skipped, every replayed solve would be scored against the matrix from
+  // the first factorization -- a wrong residual, and the one place this whole
+  // feature could go quietly wrong.
+  const SpMat A = lu_testing::randomUnsymmetricPattern(80, 0.25, 3u);
+  const SpMat B = perturbed(A, 0.3);
+  const double drift = (Eigen::MatrixXd(A) - Eigen::MatrixXd(B)).norm() / Eigen::MatrixXd(A).norm();
+  lu_testing::check(drift > 0.05, "the two matrices really do differ", drift);
+
+  const VectorXd xTrue = irrationalSolution(A.rows());
+  Eigen::PointBlockLU<SpMat> s;
+  s.analyzePattern(A);
+  s.factorize(A);
+  const VectorXd xa = s.solve(VectorXd(A * xTrue));
+  lu_testing::check(s.solveResidual() < 1e-12, "first factorization: residual measured vs A",
+                    s.solveResidual());
+  lu_testing::check((xa - xTrue).norm() / xTrue.norm() < 1e-9, "and the answer is right",
+                    (xa - xTrue).norm() / xTrue.norm());
+
+  s.factorize(B);
+  lu_testing::checkTrue(s.refactorizations() > 0, "the second factorize really replayed");
+  const VectorXd xb = s.solve(VectorXd(B * xTrue));
+  // Against a stale copy of A this residual would land near `drift`, not at eps.
+  lu_testing::check(s.solveResidual() < 1e-12, "replay: residual measured vs B, not A",
+                    s.solveResidual());
+  lu_testing::checkTrue(s.info() == Eigen::Success, "so the replay is not falsely flagged");
+  lu_testing::check((xb - xTrue).norm() / xTrue.norm() < 1e-9, "and its answer is right too",
+                    (xb - xTrue).norm() / xTrue.norm());
+}
+
+void testComplexScalars() {
+  std::printf("\n-- complex scalars (the adjoint conjugates, or kappa is wrong) --\n");
+  typedef std::complex<double> Complex;
+  typedef Eigen::SparseMatrix<Complex> SpCplx;
+  const int n = 24;
+  std::vector<Eigen::Triplet<Complex>> t;
+  for (int j = 0; j < n; ++j) {
+    t.emplace_back(j, j, Complex(1.0, 0.3));
+    if (j > 0) t.emplace_back(j - 1, j, Complex(-1.4, 0.6));
+    if (j + 1 < n) t.emplace_back(j + 1, j, Complex(0.2, -0.1));
+  }
+  SpCplx A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+
+  const Eigen::MatrixXcd dense = Eigen::MatrixXcd(A), inv = dense.inverse();
+  double normA = 0, normInv = 0;
+  for (int j = 0; j < n; ++j) {
+    normA = (std::max)(normA, dense.col(j).cwiseAbs().sum());
+    normInv = (std::max)(normInv, inv.col(j).cwiseAbs().sum());
+  }
+  const double exact = normA * normInv;
+
+  Eigen::PointBlockLU<SpCplx> s;
+  s.setErrorBounds(true);
+  s.compute(A);
+  const Eigen::VectorXcd xTrue = Eigen::VectorXcd::Ones(n);
+  const Eigen::VectorXcd x = s.solve(Eigen::VectorXcd(A * xTrue));
+  lu_testing::check(s.conditionEstimate() <= exact * (1.0 + 1e-9), "complex kappa: a lower bound",
+                    s.conditionEstimate() / exact);
+  // A plain transpose instead of the adjoint lands far off here; half the true
+  // value is only reachable with the conjugation in place.
+  lu_testing::check(s.conditionEstimate() >= exact * 0.5, "complex kappa: tight, so A^H conjugates",
+                    s.conditionEstimate() / exact);
+  lu_testing::checkTrue(s.info() == Eigen::Success, "well-conditioned complex system passes");
+  lu_testing::check((x - xTrue).norm() / xTrue.norm() < 1e-12, "complex answer is right",
+                    (x - xTrue).norm() / xTrue.norm());
+  lu_testing::check(s.growthFactor() < 10.0, "and complex growth is benign", s.growthFactor());
+}
+
 void testTestdata() {
   std::printf("\n-- testdata corpus (skipped when testdata/ is absent) --\n");
   int seen = 0;
@@ -287,6 +591,12 @@ int main() {
   testReplayRejection();
   testDegenerate();
   testDeterminant();
+  testConditionEstimate();
+  testErrorBoundsCatchWhatTheResidualCannot();
+  testDefaultPathPaysOnlyForTheResidual();
+  testGrowthFactorTracksPivotThreshold();
+  testReplayRefreshesTheResidualCheck();
+  testComplexScalars();
   testTestdata();
   return lu_testing::summarize("test_pointblock_lu");
 }

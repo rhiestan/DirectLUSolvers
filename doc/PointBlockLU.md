@@ -111,6 +111,67 @@ below `setMinPivotRatio()` (default 1e-8) of the magnitude it had when the plan 
 That check is what makes replaying safe as the caller's values drift;
 `setForceFullFactorization(true)` disables replaying altogether.
 
+## How much of the answer you may believe
+
+Declining a singular matrix is the coarse half of that question. The fine half is that partial
+pivoting can find a pivot in every column and still return an answer with **no correct digit in
+it** — because the matrix was ill-conditioned rather than singular, and a residual cannot see
+the difference. The bidiagonal `[1, -1.7]` at n=80 is the clean demonstration, and it is pinned
+in `test_pointblock_lu.cpp`:
+
+| | value |
+|---|---:|
+| κ₁(A), `conditionEstimate()` | 1.05e+19 |
+| relative residual, `solveResidual()` | 2.2e-14 |
+| backward error, `lastBackwardError()` | 2.0e-16 |
+| **true relative error** | **73** |
+
+The answer is backward stable — it is the exact solution of a system a rounding error away from
+`A` — and it is wrong by a factor of 70. Three accessors close that gap, in increasing cost:
+
+**`solveResidual()`, on by default.** `solve()` measures `‖b − Ax‖ / ‖b‖` against the original
+`A` and downgrades `info()` to `NumericalIssue` past `setSolveFailureThreshold()` (default 1e-6,
+the same as `LeftRightLU`; `0` disables the check and the work with it). This is the contract the
+[README](../README.md) states for all three solvers.
+
+**`setErrorBounds(true)`, off by default.** Adds the Oettli–Prager backward error and a
+Hager–Higham condition estimate to every `solve()`, and downgrades `info()` when the forward-error
+estimate reaches 1 — no digit supported — *even though the residual check passed*. That is the
+n=80 row above, and it is the only setting that catches it. `lastCorrectDigits()` reports the
+count directly.
+
+**`conditionEstimate()`, `componentwiseBackwardError()`, `growthFactor()`, à la carte.** All lazy
+and cached until the next `factorize()`; each costs nothing until called.
+`conditionEstimate()` is exact on the closed-form yardstick `κ₁ = 3·(2ⁿ−1)` and a strict lower
+bound elsewhere, as Hager's algorithm guarantees. Unlike `LeftRightLU`'s it describes **`A`
+itself** rather than a statically perturbed stand-in, because this solver never replaces a pivot.
+
+`growthFactor()` is what earns a relaxed `setPivotThreshold()`. That knob buys less fill by
+allowing element growth, and the price was previously invisible — measured on `weakDiagonal(200)`:
+
+| `setPivotThreshold()` | growth | fill | forward error |
+|---|---:|---:|---:|
+| 1.0 (strict partial pivoting) | 1.9 | 2141 | 1.4e-15 |
+| 1e-8 | 5.4e+05 | 1698 | 4.5e-11 |
+
+### What it costs
+
+The factorization is untouched — the crossover table above still holds. Measured on this
+project's testdata, best of 20, as a percentage of the phase it is added to:
+
+| | `setfos` | `bayer05` | `gemat11` | `tomography` | `sherman1` | `laoss_3` | `setfos_2` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| copy of `A` per `factorize()` | 2.4% | 0.7% | 0.6% | 0.3% | 0.1% | 0.1% | 0.1% |
+| residual check per `solve()` | 30% | 28% | 32% | 33% | 14% | ~0% | 62% |
+| **replay + solve together** | **+12%** | **+2.8%** | **+2.6%** | **+1.1%** | **+0.8%** | **~0%** | **+0.4%** |
+
+The replay needs a copy of `A` because `solve()` is handed neither the matrix nor anything
+equivalent — the factors describe the *equilibrated* `A~`, not the matrix the caller asked about.
+The copy is a value `memcpy` whenever the pattern is the one already held, which in a Newton loop
+is every call after the first. The worst row is `setfos`, the smallest and sparsest matrix, where
+the whole Newton iteration goes from 38 µs to 43 µs; everywhere else the cost is under 3%.
+`setSolveFailureThreshold(0)` removes the per-solve half of it.
+
 ## Deltas from the other two solvers
 
 - **Structurally singular input is declined, not patched.** An unsymmetric LU needs a pivot in
@@ -126,7 +187,13 @@ That check is what makes replaying safe as the caller's values drift;
   where an unscaled pivot comparison is meaningless.
 - **`setPivotThreshold(t)`** (default 1.0 = strict partial pivoting) keeps the structural
   diagonal as pivot when `|a_kk| >= t * max|a_ik|`. Lower values mean less fill and a pivot
-  sequence that survives refactorization better, at some stability cost.
+  sequence that survives refactorization better, at some stability cost — `growthFactor()` is
+  what makes that cost visible, see [How much of the answer you may
+  believe](#how-much-of-the-answer-you-may-believe).
+- **`conditionEstimate()` describes `A`, not a perturbed stand-in.** `LeftRightLU`'s estimate
+  describes the operator static pivoting actually inverts, so it can read *better* than the true
+  κ(A) on a matrix whose pivots were bumped, and `replacedPivots()` is what says whether that
+  happened. This solver never replaces a pivot, so the question does not arise.
 - The default ordering is **COLAMD**, not `PointBlockOrdering` — see the note in
   [PointBlockOrdering](PointBlockOrdering.md).
 

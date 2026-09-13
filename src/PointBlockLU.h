@@ -41,6 +41,26 @@
 // those columns in from the transpose; their answer on that matrix carries a
 // relative error of 0.62 either way.
 //
+// HOW MUCH OF THE ANSWER YOU MAY BELIEVE. Declining a singular matrix is the
+// coarse half of that question; the fine half is that partial pivoting can find
+// a pivot in every column and still hand back an answer with no correct digit in
+// it, because the matrix was ill-conditioned rather than singular. So solve()
+// measures the relative residual ||b - Ax|| / ||b|| against the ORIGINAL A and
+// downgrades info() to NumericalIssue past solveFailureThreshold() (default
+// 1e-6), exactly as LeftRightLU does -- one sparse matrix-vector product, which
+// is O(nnz) on a path whose own cost is O(nnz(L) + nnz(U)). setErrorBounds(true)
+// adds the Oettli-Prager backward error and a Hager-Higham condition estimate on
+// top, which is what separates "backward stable and accurate" from "backward
+// stable and worthless"; it is off by default because it costs a handful of
+// extra triangular solves per factorization. conditionEstimate(),
+// componentwiseBackwardError() and growthFactor() are also available a la carte
+// and compute nothing until called.
+//
+// None of this touches the FACTORIZATION, which is where the crossover table
+// above was measured: a replay costs one extra O(nnz) copy of the input values
+// (the residual check needs A, and solve() is not handed it), and everything
+// else is either in the solve or on demand.
+//
 // ORDERING. The default is COLAMD, and the table above uses it. Note that
 // PointBlockOrdering -- despite the shared name, which refers to the target
 // matrix class rather than to the ordering -- is a poor default HERE: it ranks
@@ -120,8 +140,11 @@
 #include <Eigen/SparseCore>
 
 #include <algorithm>
+#include <limits>
 #include <string>
 #include <vector>
+
+#include "LeftRightLUConditionEstimate.h"
 
 namespace Eigen {
 namespace point_block {
@@ -217,7 +240,12 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   inline Index rows() const { return m_size; }
   inline Index cols() const { return m_size; }
 
-  /** Status of the last operation. */
+  /** Status of the last operation. After factorize() this is Success unless the
+   *  factorization broke down (structurally or numerically singular). After
+   *  solve() it is downgraded to NumericalIssue if the computed solution failed
+   *  the honesty check: non-finite, a relative residual above
+   *  solveFailureThreshold(), or -- with errorBounds() on -- a forward-error
+   *  estimate that supports no digit of the answer. */
   ComputationInfo info() const { return m_info; }
   bool isFactorized() const { return m_factorized; }
   const std::string& lastErrorMessage() const { return m_lastError; }
@@ -281,6 +309,101 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   Scalar determinantSign() const;
   Scalar determinant() const;
 
+  // --- reliability of the computed solution ---------------------------------
+  //
+  // A pivot in every column says the factorization did not break down. It does
+  // NOT say the answer is worth anything: the residual check below is the part
+  // that acts on that difference by default, and the error bounds under it are
+  // the part that distinguishes "this answer solves a nearby system AND is
+  // accurate" from "this answer solves a nearby system and is still wrong".
+  // See LeftRightLUConditionEstimate.h, whose helpers all of this is built on.
+
+  /** Relative-residual ceiling ||b - A x|| / ||b|| above which solve() reports
+   *  NumericalIssue. Default 1e-6, matching LeftRightLU; 0 disables the check
+   *  (and with it the one O(nnz) matrix-vector product solve() would spend). */
+  void setSolveFailureThreshold(const RealScalar& tol) { m_solveFailureThreshold = tol; }
+  RealScalar solveFailureThreshold() const { return m_solveFailureThreshold; }
+
+  /** The relative residual measured by the last solve(), NaN if the check is
+   *  disabled or no solve has run. */
+  RealScalar solveResidual() const { return m_lastSolveRelativeResidual; }
+
+  /** Compute the error bounds inside every solve() and let info() act on them.
+   *  OFF by default, deliberately: it adds a condition estimate (once per
+   *  factorization, a handful of triangular solves) and an O(nnz) backward
+   *  error (once per solve) to a solver whose whole reason to exist is that the
+   *  solve is cheap.
+   *
+   *  With it on, solve() fills lastBackwardError()/lastForwardError() and
+   *  downgrades info() when the forward-error estimate reaches 1 -- no digit of
+   *  the answer is supported -- even though the residual check passed. That
+   *  combination is the signature of an ill-conditioned system, and a residual
+   *  cannot see it. */
+  void setErrorBounds(bool on) { m_errorBounds = on; }
+  bool errorBounds() const { return m_errorBounds; }
+
+  /** Backward/forward error of the last solve(). NaN unless errorBounds() was on. */
+  RealScalar lastBackwardError() const { return m_lastBackwardError; }
+  RealScalar lastForwardError() const { return m_lastForwardError; }
+
+  /** Correct digits supported for the last solve(), -1 unless errorBounds() was on. */
+  int lastCorrectDigits() const {
+    return (numext::isfinite)(m_lastForwardError) ? digitsFromForwardError(m_lastForwardError) : -1;
+  }
+
+  /** \returns a Hager-Higham estimate of kappa_1(A) = ||A||_1 ||A^{-1}||_1,
+   *  computed from the existing factors and cached until the next factorize().
+   *
+   *  Costs a handful of triangular solves the FIRST time it is called after a
+   *  factorization (10 is the algorithm's ceiling) and nothing thereafter. It is
+   *  a lower bound -- see LeftRightLUConditionEstimate.h. Unlike LeftRightLU's,
+   *  it describes A itself rather than a statically perturbed stand-in, because
+   *  this solver never replaces a pivot. Returns infinity if not factorized. */
+  RealScalar conditionEstimate() const;
+
+  /** Triangular solves spent on the cached condition estimate, 0 if never asked. */
+  Index conditionEstimateSolves() const { return m_conditionSolves; }
+
+  /** \returns the Oettli-Prager componentwise relative backward error of \a x as
+   *  a solution of A x = \a b -- EXACT, not an estimate, and O(nnz). Near
+   *  machine epsilon means no method could have done better in this precision. */
+  template <typename RhsT, typename SolT>
+  RealScalar componentwiseBackwardError(const RhsT& b, const SolT& x) const {
+    return left_right_lu::componentwiseBackwardError(m_originalMatrix, b, x);
+  }
+
+  /** \returns kappa * omega, clamped to 1: a first-order bound on
+   *  ||x - x_exact|| / ||x_exact||. Meaningless once it approaches 1, which is
+   *  exactly the case where it is telling you not to trust the answer. */
+  template <typename RhsT, typename SolT>
+  RealScalar estimatedForwardError(const RhsT& b, const SolT& x) const {
+    return left_right_lu::estimateForwardError(conditionEstimate(),
+                                               componentwiseBackwardError(b, x));
+  }
+
+  /** \returns how many decimal digits of \a x the forward-error estimate
+   *  supports, floored at 0. */
+  template <typename RhsT, typename SolT>
+  int estimatedCorrectDigits(const RhsT& b, const SolT& x) const {
+    return digitsFromForwardError(estimatedForwardError(b, x));
+  }
+
+  /** \returns the element growth factor of the last factorization,
+   *  max(max|L|, max|U|) / max|A~| on the equilibrated matrix.
+   *
+   *  The classic signal that elimination went wrong. Growth near 1 says the
+   *  factorization was benign; growth of 1e+10 says entries exploded during
+   *  elimination and the factors cannot be trusted however healthy the pivots
+   *  looked. It is the check that earns setPivotThreshold() below 1.0: relaxing
+   *  the pivot test buys less fill by allowing exactly this, and growthFactor()
+   *  is what says whether the trade was paid for.
+   *
+   *  Fully lazy -- one O(nnz) pass over the input and one O(fill) pass over the
+   *  factors, the first time it is called after a factorization, then nothing.
+   *  Costs zero if never asked, which is why it is not accumulated in the pivot
+   *  loop. Returns NaN if not factorized. */
+  RealScalar growthFactor() const;
+
  private:
   void init() {
     m_size = 0;
@@ -293,14 +416,69 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
     m_equilibrate = true;
     m_forceFull = false;
     m_minPivotRatio = RealScalar(1e-8);
+    m_solveFailureThreshold = RealScalar(1e-6);
+    m_errorBounds = false;
+    m_inputHeld = false;
     m_isInitialized = false;
+    invalidateSolveStatus();
+    invalidateFactorDiagnostics();
+  }
+
+  // Cleared by every factorize(): these describe one set of factors.
+  void invalidateFactorDiagnostics() {
+    m_conditionValid = false;
+    m_conditionEstimate = NumTraits<RealScalar>::quiet_NaN();
+    m_conditionSolves = 0;
+    m_growthValid = false;
+    m_growthFactor = NumTraits<RealScalar>::quiet_NaN();
+  }
+  // Cleared by every factorize() too: stale numbers from an earlier solve()
+  // would read as measurements of this one.
+  void invalidateSolveStatus() const {
+    m_lastSolveRelativeResidual = NumTraits<RealScalar>::quiet_NaN();
+    m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
+    m_lastForwardError = NumTraits<RealScalar>::quiet_NaN();
   }
 
   void computeScaling(const MatrixType& matrix);
+  void storeInput(const MatrixType& matrix);
   bool fullFactorize(const MatrixType& matrix);
   bool replayFactorize(const MatrixType& matrix);
   void replayColumn(const MatrixType& matrix, StorageIndex k, Scalar* work, bool& reject);
   void sortFactorColumns();
+
+  // The triangular solve proper, for ONE right-hand side. Templated on the
+  // accessors rather than taking buffers so that _solve_impl reads the caller's
+  // expression in place (no staging copy on the hot path) while the condition
+  // estimator can feed the same code a plain dense vector.
+  //   getB(i)     -> entry i of the rhs, in ORIGINAL row numbering
+  //   setX(j, v)  -> entry j of the solution, in ORIGINAL column numbering
+  // `work` is scratch of length m_size, in PIVOTAL numbering.
+  template <typename GetB, typename SetX>
+  void solveColumn(GetB getB, SetX setX, Scalar* work) const;
+  // The same for A^H, which is what Hager's algorithm needs alongside A.
+  template <typename GetB, typename SetX>
+  void solveColumnAdjoint(GetB getB, SetX setX, Scalar* work) const;
+
+  template <typename RhsT, typename SolT>
+  void recordSolveStatus(const RhsT& b, const SolT& x) const;
+  // Only ever called when errorBounds() is on -- this is the whole reason the
+  // default solve path stays one matrix-vector product more than the factors.
+  template <typename RhsT, typename SolT>
+  void recordErrorBounds(const RhsT& b, const SolT& x) const;
+
+  /** Decimal digits supported by a forward-error estimate, floored at 0 and
+   *  capped at the scalar type's own precision: claiming 20 digits of a double
+   *  because the estimate underflowed would be worse than claiming none. */
+  static int digitsFromForwardError(const RealScalar& ferr) {
+    if (!(numext::isfinite)(ferr)) return 0;
+    const int cap = std::numeric_limits<RealScalar>::digits10;
+    if (!(ferr > RealScalar(0))) return cap;
+    using std::log10;
+    const RealScalar d = -log10(ferr);
+    if (!(d > RealScalar(0))) return 0;
+    return (d >= RealScalar(cap)) ? cap : static_cast<int>(d);
+  }
 
   // Depth-first reachability over the graph of the L columns built so far,
   // starting from the pattern of one column of A. Returns `top`: the reachable
@@ -311,11 +489,28 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   OrderingType m_orderingFunctor;
 
   StorageIndex m_size;
-  ComputationInfo m_info;
-  std::string m_lastError;
+  // Mutable because solve() is const and is where the honesty check lives: a
+  // solve that fails its residual check has to be able to say so.
+  mutable ComputationInfo m_info;
+  mutable std::string m_lastError;
   bool m_analyzed, m_factorized, m_planRecorded, m_equilibrate, m_forceFull;
   Index m_refactorizations;
   RealScalar m_pivotThreshold, m_minPivotRatio;
+
+  // Reliability. m_originalMatrix is the copy solve() needs to form a residual
+  // against the matrix the caller actually asked about -- solve() is not handed
+  // one, and the factors describe the EQUILIBRATED matrix, not this one.
+  MatrixType m_originalMatrix;
+  bool m_inputHeld;
+  RealScalar m_solveFailureThreshold;
+  bool m_errorBounds;
+  mutable RealScalar m_lastSolveRelativeResidual;
+  mutable RealScalar m_lastBackwardError, m_lastForwardError;
+  mutable RealScalar m_conditionEstimate;
+  mutable bool m_conditionValid;
+  mutable Index m_conditionSolves;
+  mutable RealScalar m_growthFactor;
+  mutable bool m_growthValid;
 
   PermutationType m_colPermutation;  // indices()(k) = original column eliminated k-th
   PermutationType m_rowPermutation;  // indices()(i) = pivotal position of original row i
@@ -352,6 +547,9 @@ void PointBlockLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& ma
   m_planRecorded = false;
   m_refactorizations = 0;
   m_isInitialized = false;
+  m_inputHeld = false;
+  invalidateFactorDiagnostics();
+  invalidateSolveStatus();
 
   const StorageIndex n = m_size;
   m_colOf.resize(static_cast<std::size_t>(n));
@@ -382,6 +580,40 @@ void PointBlockLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& ma
   m_marker.assign(static_cast<std::size_t>(n), StorageIndex(-1));
   m_analyzed = true;
   m_isInitialized = true;
+}
+
+// ---------------------------------------------------------------------------
+//  the caller's own matrix, kept for the residual check
+// ---------------------------------------------------------------------------
+
+// solve() has to form b - A x against the matrix that was ASKED about, and it is
+// handed neither that matrix nor anything equivalent: the factors describe the
+// equilibrated, permuted A~. So factorize() keeps a copy.
+//
+// The copy is the one cost this reliability work adds to the replay path, so it
+// is a value memcpy rather than a sparse assignment whenever the pattern is the
+// one already held -- which in a Newton loop is every call after the first. The
+// index arrays are compared rather than assumed identical: the values would
+// otherwise be married to the wrong pattern, and a residual computed against the
+// wrong A is worse than no residual at all.
+template <typename MatrixType, typename OrderingType>
+void PointBlockLU<MatrixType, OrderingType>::storeInput(const MatrixType& matrix) {
+  const bool sameShape = m_inputHeld && matrix.isCompressed() && m_originalMatrix.isCompressed() &&
+                         m_originalMatrix.rows() == matrix.rows() &&
+                         m_originalMatrix.cols() == matrix.cols() &&
+                         m_originalMatrix.nonZeros() == matrix.nonZeros();
+  if (sameShape &&
+      std::equal(matrix.outerIndexPtr(), matrix.outerIndexPtr() + matrix.outerSize() + 1,
+                 m_originalMatrix.outerIndexPtr()) &&
+      std::equal(matrix.innerIndexPtr(), matrix.innerIndexPtr() + matrix.nonZeros(),
+                 m_originalMatrix.innerIndexPtr())) {
+    std::copy(matrix.valuePtr(), matrix.valuePtr() + matrix.nonZeros(),
+              m_originalMatrix.valuePtr());
+    return;
+  }
+  m_originalMatrix = matrix;
+  m_originalMatrix.makeCompressed();
+  m_inputHeld = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,11 +738,14 @@ void PointBlockLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix)
   m_info = Success;
   m_lastError.clear();
   m_factorized = false;
+  invalidateFactorDiagnostics();
+  invalidateSolveStatus();
   if (m_size == 0) {
     m_factorized = true;
     return;
   }
 
+  storeInput(matrix);
   computeScaling(matrix);
 
   // Replay the recorded plan when there is one. A rejected replay (a pivot that
@@ -750,6 +985,76 @@ bool PointBlockLU<MatrixType, OrderingType>::replayFactorize(const MatrixType& m
 //  solve
 // ---------------------------------------------------------------------------
 
+// A = Dr^-1 Pr^-1 L U Pc^-1 Dc^-1, so A^-1 = Dc Pc U^-1 L^-1 Pr Dr.
+template <typename MatrixType, typename OrderingType>
+template <typename GetB, typename SetX>
+void PointBlockLU<MatrixType, OrderingType>::solveColumn(GetB getB, SetX setX, Scalar* w) const {
+  const StorageIndex n = m_size;
+  for (StorageIndex i = 0; i < n; ++i)  // w = Pr Dr b; every entry written, no clear needed
+    w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])] =
+        getB(i) * m_rowScale[static_cast<std::size_t>(i)];
+
+  for (StorageIndex k = 0; k < n; ++k) {  // unit lower triangular, diagonal first
+    const Scalar xk = w[static_cast<std::size_t>(k)];
+    if (xk == Scalar(0)) continue;
+    const StorageIndex end = m_lPtr[static_cast<std::size_t>(k) + 1];
+    for (StorageIndex p = m_lPtr[static_cast<std::size_t>(k)] + 1; p < end; ++p)
+      w[static_cast<std::size_t>(m_lRow[static_cast<std::size_t>(p)])] -=
+          m_lVal[static_cast<std::size_t>(p)] * xk;
+  }
+  for (StorageIndex k = n - 1; k >= 0; --k) {  // upper triangular, diagonal last
+    const StorageIndex begin = m_uPtr[static_cast<std::size_t>(k)];
+    const StorageIndex end = m_uPtr[static_cast<std::size_t>(k) + 1];
+    w[static_cast<std::size_t>(k)] /= m_uVal[static_cast<std::size_t>(end - 1)];
+    const Scalar xk = w[static_cast<std::size_t>(k)];
+    if (xk != Scalar(0))
+      for (StorageIndex p = begin; p + 1 < end; ++p)
+        w[static_cast<std::size_t>(m_uRow[static_cast<std::size_t>(p)])] -=
+            m_uVal[static_cast<std::size_t>(p)] * xk;
+    if (k == 0) break;  // StorageIndex may be unsigned
+  }
+  for (StorageIndex k = 0; k < n; ++k) {  // x = Dc Pc w
+    const StorageIndex j = m_colOf[static_cast<std::size_t>(k)];
+    setX(j, w[static_cast<std::size_t>(k)] * m_colScale[static_cast<std::size_t>(j)]);
+  }
+}
+
+// (A^-1)^H = Dr Pr^T L^-H U^-H Pc^T Dc, the scalings being real and diagonal.
+// Both triangular solves run as DOT PRODUCTS rather than the axpy form above:
+// row k of U^H is column k of U, which is exactly what the compressed columns
+// already hold, so no transposed copy of the factors is needed.
+template <typename MatrixType, typename OrderingType>
+template <typename GetB, typename SetX>
+void PointBlockLU<MatrixType, OrderingType>::solveColumnAdjoint(GetB getB, SetX setX,
+                                                                Scalar* w) const {
+  const StorageIndex n = m_size;
+  for (StorageIndex k = 0; k < n; ++k) {  // w = Pc^T Dc v
+    const StorageIndex j = m_colOf[static_cast<std::size_t>(k)];
+    w[static_cast<std::size_t>(k)] = getB(j) * m_colScale[static_cast<std::size_t>(j)];
+  }
+  for (StorageIndex k = 0; k < n; ++k) {  // U^H is lower triangular: forward
+    const StorageIndex begin = m_uPtr[static_cast<std::size_t>(k)];
+    const StorageIndex end = m_uPtr[static_cast<std::size_t>(k) + 1];
+    Scalar s = w[static_cast<std::size_t>(k)];
+    for (StorageIndex p = begin; p + 1 < end; ++p)
+      s -= numext::conj(m_uVal[static_cast<std::size_t>(p)]) *
+           w[static_cast<std::size_t>(m_uRow[static_cast<std::size_t>(p)])];
+    w[static_cast<std::size_t>(k)] = s / numext::conj(m_uVal[static_cast<std::size_t>(end - 1)]);
+  }
+  for (StorageIndex k = n - 1; k >= 0; --k) {  // L^H is unit upper triangular: backward
+    const StorageIndex end = m_lPtr[static_cast<std::size_t>(k) + 1];
+    Scalar s = w[static_cast<std::size_t>(k)];
+    for (StorageIndex p = m_lPtr[static_cast<std::size_t>(k)] + 1; p < end; ++p)
+      s -= numext::conj(m_lVal[static_cast<std::size_t>(p)]) *
+           w[static_cast<std::size_t>(m_lRow[static_cast<std::size_t>(p)])];
+    w[static_cast<std::size_t>(k)] = s;
+    if (k == 0) break;  // StorageIndex may be unsigned
+  }
+  for (StorageIndex i = 0; i < n; ++i)  // r = Dr Pr^T w
+    setX(i, w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])] *
+                m_rowScale[static_cast<std::size_t>(i)]);
+}
+
 template <typename MatrixType, typename OrderingType>
 template <typename Rhs, typename Dest>
 void PointBlockLU<MatrixType, OrderingType>::_solve_impl(const MatrixBase<Rhs>& b,
@@ -757,39 +1062,165 @@ void PointBlockLU<MatrixType, OrderingType>::_solve_impl(const MatrixBase<Rhs>& 
   eigen_assert(m_factorized && "PointBlockLU: solve() called before a successful factorize()");
   const StorageIndex n = m_size;
   x.derived().resize(n, b.cols());
+  invalidateSolveStatus();
   if (n == 0) return;
 
-  // L U y = Pr Dr b, then z = Pc y, then x = Dc z.
   std::vector<Scalar> w(static_cast<std::size_t>(n));
-  for (Index rhs = 0; rhs < b.cols(); ++rhs) {
-    for (StorageIndex i = 0; i < n; ++i)
-      w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])] =
-          b.derived().coeff(i, rhs) * m_rowScale[static_cast<std::size_t>(i)];
+  for (Index rhs = 0; rhs < b.cols(); ++rhs)
+    solveColumn([&](StorageIndex i) { return b.derived().coeff(i, rhs); },
+                [&](StorageIndex j, const Scalar& v) { x.derived().coeffRef(j, rhs) = v; },
+                w.data());
 
-    for (StorageIndex k = 0; k < n; ++k) {  // unit lower triangular, diagonal first
-      const Scalar xk = w[static_cast<std::size_t>(k)];
-      if (xk == Scalar(0)) continue;
-      const StorageIndex end = m_lPtr[static_cast<std::size_t>(k) + 1];
-      for (StorageIndex p = m_lPtr[static_cast<std::size_t>(k)] + 1; p < end; ++p)
-        w[static_cast<std::size_t>(m_lRow[static_cast<std::size_t>(p)])] -=
-            m_lVal[static_cast<std::size_t>(p)] * xk;
-    }
-    for (StorageIndex k = n - 1; k >= 0; --k) {  // upper triangular, diagonal last
-      const StorageIndex begin = m_uPtr[static_cast<std::size_t>(k)];
-      const StorageIndex end = m_uPtr[static_cast<std::size_t>(k) + 1];
-      w[static_cast<std::size_t>(k)] /= m_uVal[static_cast<std::size_t>(end - 1)];
-      const Scalar xk = w[static_cast<std::size_t>(k)];
-      if (xk != Scalar(0))
-        for (StorageIndex p = begin; p + 1 < end; ++p)
-          w[static_cast<std::size_t>(m_uRow[static_cast<std::size_t>(p)])] -=
-              m_uVal[static_cast<std::size_t>(p)] * xk;
-      if (k == 0) break;  // StorageIndex may be unsigned
-    }
-    for (StorageIndex k = 0; k < n; ++k) {
-      const StorageIndex j = m_colOf[static_cast<std::size_t>(k)];
-      x.derived().coeffRef(j, rhs) = w[static_cast<std::size_t>(k)] * m_colScale[static_cast<std::size_t>(j)];
-    }
+  // The honesty check. Everything above is the arithmetic this solver always
+  // did; what follows is one sparse matrix-vector product on top, and it is what
+  // stops a factorization that merely FOUND a pivot in every column from passing
+  // off an answer with no correct digit in it.
+  const bool gateOnResidual = m_solveFailureThreshold > RealScalar(0);
+  if (gateOnResidual || m_errorBounds) {
+    typedef Matrix<Scalar, Dynamic, Dynamic> DenseMatrix;
+    const DenseMatrix rhsDense = b;
+    const DenseMatrix solution = x.derived();
+    recordSolveStatus(rhsDense, solution);
+    if (m_errorBounds) recordErrorBounds(rhsDense, solution);
   }
+}
+
+template <typename MatrixType, typename OrderingType>
+template <typename RhsT, typename SolT>
+void PointBlockLU<MatrixType, OrderingType>::recordSolveStatus(const RhsT& b,
+                                                               const SolT& x) const {
+  // A solve after a failed factorize() is already outside the contract (there is
+  // an assert for it). Say nothing rather than overwrite the factorization's own
+  // diagnosis, which is the more useful message of the two.
+  if (!m_factorized) return;
+  typedef Matrix<Scalar, Dynamic, Dynamic> DenseMatrix;
+  const RealScalar bnorm = b.norm();
+  // Product first, subtraction second -- deliberately NOT the fused `b - A*x`,
+  // which Eigen evaluates in a different order and therefore rounds
+  // differently. Matching LeftRightLU's order here keeps the two solvers'
+  // residuals comparable on the knife-edge matrices where that distinction is
+  // the whole point of measuring.
+  DenseMatrix r = m_originalMatrix * x;
+  r = b - r;
+  const RealScalar resNorm = r.norm();
+  const RealScalar rel = (bnorm > RealScalar(0)) ? resNorm / bnorm : resNorm;
+  m_lastSolveRelativeResidual = rel;
+
+  const bool finite = x.allFinite() && (numext::isfinite)(rel);
+  const bool usable =
+      finite && (!(m_solveFailureThreshold > RealScalar(0)) || rel <= m_solveFailureThreshold);
+  if (usable) {
+    m_info = Success;
+    return;
+  }
+  m_info = NumericalIssue;
+  m_lastError = finite ? "PointBlockLU: solve produced a large residual (see solveResidual()); "
+                         "the matrix is likely too ill-conditioned for this factorization."
+                       : "PointBlockLU: solve produced a non-finite solution; the factorization "
+                         "cannot be used on this right-hand side.";
+}
+
+template <typename MatrixType, typename OrderingType>
+template <typename RhsT, typename SolT>
+void PointBlockLU<MatrixType, OrderingType>::recordErrorBounds(const RhsT& b,
+                                                               const SolT& x) const {
+  m_lastBackwardError = left_right_lu::componentwiseBackwardError(m_originalMatrix, b, x);
+  m_lastForwardError =
+      left_right_lu::estimateForwardError(conditionEstimate(), m_lastBackwardError);
+
+  // The case this exists to catch: the residual check passed -- the answer IS
+  // the exact solution of a nearby system -- and yet the conditioning leaves no
+  // digit of it standing. A residual alone cannot tell those apart, which is the
+  // whole reason to compute a forward error.
+  if (m_info == Success && !(m_lastForwardError < RealScalar(1))) {
+    m_info = NumericalIssue;
+    m_lastError =
+        "PointBlockLU: the solve is backward stable (see lastBackwardError()) but the estimated "
+        "condition number (see conditionEstimate()) leaves no correct digits in the answer -- "
+        "the system is too ill-conditioned to be solved usefully in this precision.";
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  condition estimation and element growth
+// ---------------------------------------------------------------------------
+
+template <typename MatrixType, typename OrderingType>
+typename PointBlockLU<MatrixType, OrderingType>::RealScalar
+PointBlockLU<MatrixType, OrderingType>::conditionEstimate() const {
+  if (m_conditionValid) return m_conditionEstimate;
+  m_conditionValid = true;
+  m_conditionSolves = 0;
+
+  // Order matters: a default-constructed solver also has m_size == 0, and
+  // answering "0" for it would read as a perfectly conditioned matrix rather
+  // than as "there is no factorization to ask about".
+  if (!m_factorized) {
+    m_conditionEstimate = NumTraits<RealScalar>::infinity();
+    return m_conditionEstimate;
+  }
+  if (m_size == 0) {
+    m_conditionEstimate = RealScalar(0);
+    return m_conditionEstimate;
+  }
+  const RealScalar anorm = left_right_lu::oneNorm(m_originalMatrix);
+  if (!(anorm > RealScalar(0))) {
+    // A zero matrix has no finite condition number, and saying "0" here would
+    // read as perfectly conditioned.
+    m_conditionEstimate = NumTraits<RealScalar>::infinity();
+    return m_conditionEstimate;
+  }
+
+  typedef Matrix<Scalar, Dynamic, 1> Vector;
+  std::vector<Scalar> work(static_cast<std::size_t>(m_size));
+  const RealScalar invNorm = left_right_lu::oneNormEstimate<Scalar>(
+      Index(m_size),
+      [&](const Vector& v, Vector& r) {
+        r.resize(m_size);
+        solveColumn([&](StorageIndex i) { return v[i]; },
+                    [&](StorageIndex j, const Scalar& s) { r[j] = s; }, work.data());
+      },
+      [&](const Vector& v, Vector& r) {
+        r.resize(m_size);
+        // Conjugate transpose for complex scalars: Hager's sign vector is
+        // v/|v|, which pairs with A^H, not A^T.
+        solveColumnAdjoint([&](StorageIndex i) { return v[i]; },
+                           [&](StorageIndex j, const Scalar& s) { r[j] = s; }, work.data());
+      },
+      &m_conditionSolves);
+
+  m_conditionEstimate =
+      (numext::isfinite)(invNorm) ? anorm * invNorm : NumTraits<RealScalar>::infinity();
+  return m_conditionEstimate;
+}
+
+template <typename MatrixType, typename OrderingType>
+typename PointBlockLU<MatrixType, OrderingType>::RealScalar
+PointBlockLU<MatrixType, OrderingType>::growthFactor() const {
+  if (m_growthValid) return m_growthFactor;
+  m_growthValid = true;
+  m_growthFactor = NumTraits<RealScalar>::quiet_NaN();
+  if (!m_factorized || m_size == 0) return m_growthFactor;
+
+  // max|A~| over the EQUILIBRATED matrix, which is the one the factors describe.
+  // Recomputed here rather than accumulated in the pivot loop: it is one O(nnz)
+  // pass either way, and doing it here means the replay pays nothing at all for
+  // a diagnostic most callers never ask for.
+  RealScalar maxScaled(0);
+  for (StorageIndex j = 0; j < m_size; ++j)
+    for (typename MatrixType::InnerIterator it(m_originalMatrix, j); it; ++it) {
+      const StorageIndex i = internal::convert_index<StorageIndex>(it.index());
+      maxScaled = numext::maxi(maxScaled, numext::abs(it.value()) *
+                                              m_rowScale[static_cast<std::size_t>(i)] *
+                                              m_colScale[static_cast<std::size_t>(j)]);
+    }
+  if (!(maxScaled > RealScalar(0))) return m_growthFactor;
+
+  RealScalar peak(0);
+  for (const Scalar& v : m_lVal) peak = numext::maxi(peak, numext::abs(v));
+  for (const Scalar& v : m_uVal) peak = numext::maxi(peak, numext::abs(v));
+  m_growthFactor = peak / maxScaled;
+  return m_growthFactor;
 }
 
 // ---------------------------------------------------------------------------
