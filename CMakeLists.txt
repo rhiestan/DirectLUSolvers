@@ -333,6 +333,9 @@ elseif(MSVC)
   target_compile_options(test_extended_residual PRIVATE /fp:strict)
 endif()
 add_dlu_test(test_pointblock_lu SOURCE test/test_pointblock_lu.cpp LABELS "quick;correctness")
+# Rank-revealing multifrontal QR. Dependency-free: every reference is a dense
+# Eigen SVD or pivoted QR of a generated matrix.
+add_dlu_test(test_multifrontal_qr SOURCE test/test_multifrontal_qr.cpp LABELS "quick;correctness")
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 
 # The reader's own unit tests are instant; the registry sweep that follows them
@@ -477,6 +480,12 @@ add_dlu_test(bench_solvers SOURCE test/bench_solvers.cpp
              ARGS --quick --reps 1 --threads 1,4 LABELS "benchmark"
              LINK ${DLU_COMPARE_LINK})
 dlu_test_runtime_path(bench_solvers "${DLU_MKL_BIN}")
+
+# MultifrontalQR against Eigen::SparseQR, one matrix and solver per run (see the
+# source for the CSV columns). Not a CTest entry: Eigen::SparseQR alone takes
+# minutes on some corpus matrices, so the driver loop applies a wall-clock limit.
+add_executable(bench_multifrontal_qr test/bench_multifrontal_qr.cpp)
+target_link_libraries(bench_multifrontal_qr PRIVATE dlu_test_common)
 
 # The regression suite also has a synthetic-only mode that needs no testdata and
 # runs in well under a second -- worth having in the "quick" set so the fill

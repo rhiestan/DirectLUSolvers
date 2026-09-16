@@ -1,0 +1,3 @@
+// Eigen-style umbrella include for the MultifrontalQR module.
+// Usage:  #include <MultifrontalQR>   (with DirectLUSolvers/src on the include path)
+#include "MultifrontalQR.h"

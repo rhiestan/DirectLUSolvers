@@ -26,6 +26,7 @@ external dependency (METIS, oneTBB, OpenMP, MKL) is an opt-in header or an opt-i
 | [LeftRightLU](doc/LeftRightLU.md) | PARDISO-style sibling: barrier-free dynamic scheduler, in-block complete pivoting, block triangular form, and direct support for unsymmetric nonzero patterns. |
 | [PointBlockLU](doc/PointBlockLU.md) | Scalar left-looking Gilbert–Peierls with partial pivoting and refactorization replay — no symmetrization at all. Fastest of the LU solvers while the factor stays sparse. |
 | [SupernodalLDLT](doc/SupernodalLDLT.md) | Supernodal `LDL^T` for **symmetric** matrices, definite or indefinite (Bunch–Kaufman 2×2 pivots): reads one triangle, stores one factor, and reports inertia. Half the arena and about twice the factorization speed of running an LU on the same matrix. |
+| [MultifrontalQR](doc/MultifrontalQR.md) | Rank-revealing multifrontal sparse QR for any shape: equilibrated rank decision, **verified** by the smallest singular values of R11 and repaired with an SVD-decided deferred block; least-squares, minimum-norm and double-double-refined solutions. 3–3600x faster than `Eigen::SparseQR` on the SuiteSparse corpus (median 38x), and correct where `SparseQR` reports rank 622 of a full-rank 6316 or rank 2 of 2025. |
 | [RobustLU](doc/RobustLU.md) | The fallback ladder: one solver that escalates through strategies when the first fails, and reports what it tried and why it stopped. |
 | [PointBlockOrdering](doc/PointBlockOrdering.md) | Fill-reducing ordering on the *node* graph, for matrices with several unknowns per grid point. |
 | [HeaderOnlyMetis](doc/HeaderOnlyMetis.md) | `Eigen::HeaderOnlyMetisOrdering` — nested dissection, bit-identical to `METIS_NodeND`, with nothing to link; plus a deterministic parallel variant. |
@@ -74,6 +75,13 @@ Practical guidance:
   option surface; reach for it when your pattern is symmetric anyway and you want tree-parallel
   BLAS-3 factorization.
 - **Use [`RobustLU`](doc/RobustLU.md) when you cannot inspect the matrix yourself** — it takes the `LDL^T` shortcut when the matrix turns out symmetric and the factorization is unambiguously good, and otherwise runs `LeftRightLU`, measures the backward error, and escalates to MC64 matching, true partial pivoting, or a rank-revealing QR only when the diagnosis calls for it. On this project's SuiteSparse tier it costs 19 of 33 matrices exactly one factorization, rescues 6 that would otherwise fail — two of them by reporting a **rank** and a least-squares answer where no LU exists — and stops with a diagnosis on the rest rather than thrashing.
+- **Use [`MultifrontalQR`](doc/MultifrontalQR.md) when the question is the rank, or the system is
+  not square or not regular** — least squares, underdetermined, singular, or so ill-conditioned
+  that the numerically meaningful answer is a truncated one. It decides the rank on an
+  equilibrated matrix, *checks* the decision against the smallest singular values of R11 (and
+  repairs it when Heath's column-norm rule is fooled), and returns the minimum-norm solution by
+  default. On this project's corpus its rank matches a dense SVD at the same threshold. For a
+  regular square system an LU solver is cheaper.
 - **Ordering usually matters more than the solver.** On large well-separated 3D systems nested
   dissection is worth ~2x the fill of AMD; use [`HeaderOnlyMetisOrdering`](doc/HeaderOnlyMetis.md)
   if you would rather not link METIS.
@@ -137,6 +145,8 @@ solver.factorize(A2);
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
 | `src/RobustLU.h` | [`Eigen::RobustLU`](doc/RobustLU.md) — the fallback ladder over `LeftRightLU` and `PointBlockLU`, with an attempt log. |
 | `src/RobustLU` | Umbrella header, `#include <RobustLU>`. |
+| `src/MultifrontalQR.h` | [`Eigen::MultifrontalQR`](doc/MultifrontalQR.md) — rank-revealing multifrontal QR with verified rank, least-squares and minimum-norm solutions. Eigen only. |
+| `src/MultifrontalQR` | Umbrella header, `#include <MultifrontalQR>`. |
 | `src/SupernodalLDLT.h` | [`Eigen::SupernodalLDLT`](doc/SupernodalLDLT.md) — supernodal `LDL^T` for symmetric matrices, definite or indefinite. Reads one triangle, stores one factor, reports inertia. Eigen only. |
 | `src/SupernodalLDLT` | Umbrella header, `#include <SupernodalLDLT>`. |
 | `src/SupernodalLDLTMatching.h` | Symmetric weighted matching (Duff–Pralet): reads a maximum transversal as a set of 2×2 pivot candidates rather than as a row permutation (`SupernodalLDLT::setMatching`). |
@@ -158,6 +168,8 @@ solver.factorize(A2);
 | `test/test_condition_estimate.cpp` | Condition estimation and error bounds: the estimator against closed-form and dense references, the backward error against its defining properties, and the promise that a default solve pays nothing for either. |
 | `test/test_extended_residual.cpp` | Error-free transformations, the compensated residual, and the forward-vs-backward error claim — on integer systems, so there is an exact answer to converge to. |
 | `test/test_robust_lu.cpp` | The ladder's four properties: it costs one factorization when the first rung works, escalates when it does not, stops immediately when no rung can help, and never claims a success it cannot back up. |
+| `test/test_multifrontal_qr.cpp` | `MultifrontalQR` against dense Eigen references (SVD, pivoted QR): square/tall/wide, real and complex, exact and hidden (Kahan) rank deficiency, 450 random graph matrices whose rank must equal the SVD's, bad scaling, extended-precision refinement on an exact right-hand side, and serial/parallel bit-identity. |
+| `test/bench_multifrontal_qr.cpp` | One matrix, one solver (`mfqr`, `mfqr-noverify`, `eigen`) per run, CSV out — so a driver loop can time-limit `Eigen::SparseQR`. |
 | `test/test_parallel_lu.cpp` | Parallel-vs-serial agreement + speedup, using `StdThreadExecutor`. |
 | `test/test_matrixmarket.cpp` | Unit tests for the shared MatrixMarket reader and the pattern helpers. |
 | `test/test_mc64.cpp` | MC64 optimality against a brute-force oracle, the dual-scaling property, and integration through both solvers. |

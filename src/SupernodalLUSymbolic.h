@@ -177,6 +177,22 @@ struct PartitionOptions {
   Index maxZeroRows = 4;       // ... or one adding at most this many zero rows
   double fillFraction = 0.3;   // ... or this fraction of the rows already carried
   Index maxBlockSize = 128;    // cap supernode width (0 = unlimited)
+
+  // Cumulative-zero amalgamation, used INSTEAD of the three per-step rules above
+  // when enabled. Those rules judge each merge by the zeros it adds on its own,
+  // so along a chain elimination tree (every banded matrix) each step passes and
+  // only maxBlockSize stops the growth -- which a solver that stores the whole
+  // front densely, and wants no width cap, cannot afford. This rule instead
+  // bounds the explicit zeros of the WHOLE merged supernode as a fraction of its
+  // dense storage, with a looser bound for narrow supernodes (CHOLMOD's relaxed
+  // amalgamation thresholds): merge when the width stays <= zeroRuleSmall, or
+  // the zero fraction stays below zeroFraction[0] up to width zeroRuleMedium,
+  // below zeroFraction[1] up to zeroRuleLarge, and below zeroFraction[2] beyond.
+  bool cumulativeZeroRule = false;
+  Index zeroRuleSmall = 4;
+  Index zeroRuleMedium = 16;
+  Index zeroRuleLarge = 48;
+  double zeroFraction[3] = {0.5, 0.1, 0.05};
 };
 
 // Fused symbolic-factorization + supernode-partition pass: per-column symbolic
@@ -254,6 +270,11 @@ void computeSupernodePartition(StorageIndex n,
   s0.lastColumn = 0;
   supernodes.push_back(s0);
   StorageIndex currentStart = 0;
+  // Running explicit-zero count of the open supernode, for cumulativeZeroRule.
+  // Stored entries of a supernode [s, e] are sum_c (e - c + |struct(e)|); true
+  // entries are sum_c |struct(c)|. Extending e to e+1 adds (1 + |struct(e+1)| -
+  // |struct(e)|) zeros to each of the w existing columns and none to the new one.
+  double runningZeros = 0.0;
 
   for (StorageIndex j = 0; j < n; ++j) {
     // --- symbolic fill of column j: merge already-sorted tails, no sort ---
@@ -310,13 +331,33 @@ void computeSupernodePartition(StorageIndex n,
         const StorageIndex childWidth = j - currentStart;
         const StorageIndex existingRows = rowsBeyond(structPrev, j);
         const StorageIndex deltaRows = rowsBeyond(structJ, j) - existingRows;
-        // Absolute rule (governs sparse matrices: few rows, so the fraction term
-        // is tiny) OR a RELATIVE rule: accept the merge when the extra zero rows
-        // are a small fraction of the rows the supernode already carries.
-        const bool merge =
-            (static_cast<Index>(childWidth) < options.relaxedSize) ||
-            (static_cast<Index>(deltaRows) <= options.maxZeroRows) ||
-            (static_cast<double>(deltaRows) <= options.fillFraction * static_cast<double>(existingRows));
+        bool merge;
+        if (options.cumulativeZeroRule) {
+          const double w = static_cast<double>(childWidth);
+          const double countJ = static_cast<double>(rowsBeyond(structJ, j)) + 1.0;
+          const double countPrev = static_cast<double>(rowsBeyond(structPrev, j - 1)) + 1.0;
+          const double zeros = runningZeros + w * (1.0 + countJ - countPrev);
+          const double width = w + 1.0;
+          const double stored = width * (width - 1.0) / 2.0 + width * countJ;
+          const double fraction = zeros / stored;
+          const Index newWidth = static_cast<Index>(childWidth) + 1;
+          if (newWidth <= options.zeroRuleSmall)
+            merge = true;
+          else if (newWidth <= options.zeroRuleMedium)
+            merge = fraction < options.zeroFraction[0];
+          else if (newWidth <= options.zeroRuleLarge)
+            merge = fraction < options.zeroFraction[1];
+          else
+            merge = fraction < options.zeroFraction[2];
+          if (merge) runningZeros = zeros;
+        } else {
+          // Absolute rule (governs sparse matrices: few rows, so the fraction term
+          // is tiny) OR a RELATIVE rule: accept the merge when the extra zero rows
+          // are a small fraction of the rows the supernode already carries.
+          merge = (static_cast<Index>(childWidth) < options.relaxedSize) ||
+                  (static_cast<Index>(deltaRows) <= options.maxZeroRows) ||
+                  (static_cast<double>(deltaRows) <= options.fillFraction * static_cast<double>(existingRows));
+        }
         start = !merge;
       }
       // Splitting: force a boundary once the running supernode hits
@@ -338,6 +379,7 @@ void computeSupernodePartition(StorageIndex n,
         s.lastColumn = j;
         supernodes.push_back(s);
         currentStart = j;
+        runningZeros = 0.0;
       } else {
         supernodes.back().lastColumn = j;
       }
