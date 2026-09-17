@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "LeftRightLU.h"
+#include "MultifrontalQR.h"
 #include "PointBlockLU.h"
 #include "RobustLU.h"
 #include "SupernodalLDLT.h"
@@ -101,6 +102,7 @@ Row measure(const std::string& cat, const std::string& mat, const std::string& s
     r.err = one.err;
     r.resid = one.resid;
     r.fill = one.fill;
+    if (!one.note.empty()) r.note = one.note;
   }
   r.ok = true;
   return r;
@@ -304,6 +306,39 @@ Row runSparseQR(int reps, const std::string& cat, const std::string& mat, const 
   });
 }
 
+// MultifrontalQR: rank-revealing QR with the default Auto engine (scalar or
+// multifrontal, chosen from the symbolic nnz(R)). Fill is nnz(R).
+template <typename SpMat, typename Vec>
+Row runMultifrontalQR(int reps, const std::string& cat, const std::string& mat, const SpMat& A, const Vec& b,
+                      const Vec& xTrue) {
+  return measure(cat, mat, "MultifrontalQR", A.rows(), A.nonZeros(), reps, [&](Row& one) {
+    Eigen::MultifrontalQR<SpMat> s;
+    const auto t0 = Clock::now();
+    s.analyzePattern(A);
+    const auto t1 = Clock::now();
+    s.factorize(A);
+    const auto t2 = Clock::now();
+    if (s.info() != Eigen::Success) {
+      one.note = "factorize failed: " + s.lastErrorMessage();
+      return false;
+    }
+    const Vec x = s.solve(b);
+    const auto t3 = Clock::now();
+    one.analyzeMs = ms(t0, t1);
+    one.factorMs = ms(t1, t2);
+    one.solveMs = ms(t2, t3);
+    one.err = (x - xTrue).norm() / xTrue.norm();
+    one.resid = (A * x - b).norm() / b.norm();
+    one.fill = static_cast<long long>(s.nnzR());
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s rank %lld/%lld%s",
+                  s.engineUsed() == Eigen::multifrontal_qr::Engine::Scalar ? "scalar" : "multifrontal",
+                  (long long)s.rank(), (long long)A.cols(), s.rankIsVerified() ? " verified" : "");
+    one.note = buf;
+    return true;
+  });
+}
+
 template <typename SpMat, typename Vec>
 Row runSimplicialLDLT(int reps, const std::string& cat, const std::string& mat, const SpMat& A,
                       const Vec& b, const Vec& xTrue) {
@@ -376,9 +411,10 @@ void printRow(const Row& r) {
   std::printf("  %-26s %9.3f %9.3f %8.3f %9.3f  %9.2e %9.2e", r.solver.c_str(), r.analyzeMs,
               r.factorMs, r.solveMs, r.total(), r.err, r.resid);
   if (r.fill >= 0)
-    std::printf(" %12lld\n", r.fill);
+    std::printf(" %12lld", r.fill);
   else
-    std::printf(" %12s\n", "-");
+    std::printf(" %12s", "-");
+  std::printf("  %s\n", r.note.c_str());
 }
 
 // True iff A(i,j) == A(j,i) (not just structurally, numerically) for every
@@ -465,6 +501,7 @@ void runMatrix(const std::string& path, const std::string& category, int reps) {
 
   rows.push_back(runSparseLU(reps, category, mat, A, b, xTrue));
   rows.push_back(runSparseQR(reps, category, mat, A, b, xTrue));
+  rows.push_back(runMultifrontalQR(reps, category, mat, A, b, xTrue));
 
   if (valSym) {
     rows.push_back(runSimplicialLDLT(reps, category, mat, A, b, xTrue));
@@ -601,7 +638,7 @@ int main(int argc, char** argv) {
   std::printf("  samples dir: %s\n", dir.c_str());
   std::printf("  reps (best-of, after a warm-up): %d\n", reps);
   std::printf("  xTrue/b are synthesized (b = A*xTrue); the paired _rhs.mtx files are not used.\n");
-  std::printf("  fill = nnzL+nnzU as each solver reports it (SparseQR: nnz(R) only).\n");
+  std::printf("  fill = nnzL+nnzU as each solver reports it (SparseQR, MultifrontalQR: nnz(R) only).\n");
 
   if (!fs::exists(dir)) {
     std::printf("samples dir does not exist: %s\n", dir.c_str());
