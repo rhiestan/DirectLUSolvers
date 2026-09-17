@@ -16,6 +16,18 @@
 //   factorize      : scatter values -> left-looking supernodal numeric factorization
 //   solve          : block forward (L) and backward (U) substitution
 //
+// What is checked at the boundaries (in release builds too, none of it relies
+// on eigen_assert):
+//   * analyzePattern() declines a non-square matrix (InvalidInput) and retires
+//     any previous factorization (isFactorized() becomes false).
+//   * factorize() declines (InvalidInput) a call before analyzePattern(), a
+//     matrix of another size than the analyzed one, a non-finite value, and a
+//     nonzero outside the analyzed pattern.
+//   * A solve without a successful factorization -- through solve(), the
+//     transpose()/adjoint() views or the matrixL()/matrixU() proxies -- returns
+//     NaN with NumericalIssue; the determinant queries return NaN.
+//   * solve() judges its residual per right-hand side; the worst column decides.
+//
 // This Source Code Form is licensed under the Mozilla Public License v.2.0,
 // matching the surrounding Eigen code it integrates with.
 
@@ -29,6 +41,9 @@
 #include <cmath>
 #include <cstdio>
 #include <iterator>
+#include <limits>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include "SupernodalLUSupport.h"
@@ -78,8 +93,7 @@ class SupernodalLUTransposeView
 
   template <typename Rhs, typename Dest>
   void _solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
-    eigen_assert(m_solver && m_solver->isFactorized() &&
-                 "the matrix must be factorized first");
+    eigen_assert(m_solver && "the view must be attached to a solver");
     m_solver->template _solve_transposed_impl<Conjugate>(b, x);
   }
 
@@ -163,18 +177,25 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   inline Index cols() const { return m_size; }
 
   /** \returns the status of the last operation. After compute()/factorize() this
-   *  is Success unless the factorization broke down (singular). After solve() it
-   *  is downgraded to NumericalIssue if the computed solution failed the honesty
-   *  check (non-finite, or relative residual above solveFailureThreshold()) — so
-   *  a usable-looking result is never silently returned for an unsolvable system.
+   *  is Success unless the factorization broke down (singular: NumericalIssue) or
+   *  the input was declined (InvalidInput: a non-square matrix, a non-finite
+   *  value, or a factorize() matrix of another size or with a nonzero outside the
+   *  pattern analyzePattern() saw). After solve() it is downgraded to
+   *  NumericalIssue if the computed solution failed the honesty check
+   *  (non-finite, or relative residual above solveFailureThreshold()) — so a
+   *  usable-looking result is never silently returned for an unsolvable system.
    *  A subsequent solve() with a good right-hand side restores Success. */
   ComputationInfo info() const { return m_info; }
 
-  /** \returns true once a numeric factorization has completed successfully. This
-   *  is the guard for solve(); unlike info() it is NOT affected by a failed
-   *  solve, so the factors stay usable for further right-hand sides. */
+  /** \returns true while a successful numeric factorization of the analyzed
+   *  pattern is available. This is the guard for solve(): a solve without one
+   *  (never factorized, factorization declined or singular, or analyzePattern()
+   *  called since) returns NaN with NumericalIssue instead of reading factors
+   *  that do not exist. Unlike info() it is NOT affected by a failed solve, so
+   *  the factors stay usable for further right-hand sides. */
   bool isFactorized() const { return m_factorized; }
 
+  /** Describes the last failure; empty after a successful operation. */
   const std::string& lastErrorMessage() const { return m_lastError; }
 
   /** Row permutation mapping original rows to the internal (factored) numbering.
@@ -233,7 +254,9 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   RealScalar solveFailureThreshold() const { return m_solveFailureThreshold; }
 
   /** The relative residual ||b - A x|| / ||b|| measured by the last solve(),
-   *  against the original (unscaled) matrix. */
+   *  against the original (unscaled) matrix. With several right-hand sides
+   *  this is the largest of the per-column ratios, so it describes the worst
+   *  column rather than an average the largest column would dominate. */
   RealScalar solveResidual() const { return m_lastSolveRelativeResidual; }
 
   /** Amalgamation (relaxed supernodes): merge fundamental supernodes along
@@ -402,16 +425,28 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   }
 
   /** \returns the determinant of the original matrix A. The factored matrix is
-   *  the equilibrated A~ = Dr*A*Dc, so det(A) = det(A~) / (prod Dr * prod Dc). */
+   *  the equilibrated A~ = Dr*A*Dc, so det(A) = det(A~) / (prod Dr * prod Dc).
+   *
+   *  Both products are accumulated as mantissa * 2^exponent, so the result
+   *  overflows or underflows only when det(A) itself is outside the
+   *  representable range -- not because a running product of pivots or of
+   *  scaling factors passed through it on the way (a diagonal alternating
+   *  1e5 and 1e-5 has determinant 1, and a plain product sees inf long before
+   *  the end). When any pivot was replaced by static pivoting, this is the
+   *  determinant of the perturbed operator that was factored, not of A. */
   Scalar determinant() const {
-    Scalar det(1);
+    if (!m_factorized) return Scalar(NumTraits<RealScalar>::quiet_NaN());
+    Scalar mantissa(1);
+    long exponent = 0;
     for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
       const ConstStridedPanel diag = diagBlock(s);
-      for (Index k = 0; k < diag.rows(); ++k) det *= diag(k, k);
+      for (Index k = 0; k < diag.rows(); ++k) accumulateScaled(diag(k, k), mantissa, exponent);
     }
     // m_factorizationSign folds in the parity of the matching row permutation and
     // of all in-block pivot swaps, so the sign of det(A) is correct.
-    return m_factorizationSign * det / m_scalingDeterminant;
+    mantissa *= m_factorizationSign / Scalar(m_scalingMantissa);
+    exponent -= m_scalingExponent;
+    return scaleByPowerOfTwo(mantissa, exponent);
   }
 
   /** \returns log|det(A)|, accumulated as a sum of logs so it stays finite where
@@ -423,10 +458,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
    *  i.e. inf). Anything comparing determinants at that size is comparing
    *  infinities. Pair with determinantSign() for the full value.
    *
-   *  Note this recomputes the equilibration correction as a sum of logs rather
-   *  than dividing by m_scalingDeterminant, because that product overflows for
-   *  exactly the same reason the determinant does. */
+   *  The equilibration correction is a sum of logs as well, for the same
+   *  reason. */
   RealScalar logAbsDeterminant() const {
+    if (!m_factorized) return NumTraits<RealScalar>::quiet_NaN();
     RealScalar acc(0);
     for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
       const ConstStridedPanel diag = diagBlock(s);
@@ -441,8 +476,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
 
   /** \returns the sign of det(A) -- +/-1 for real scalars, a unit-modulus phase
    *  for complex ones, or 0 if any pivot came out exactly zero. Pairs with
-   *  logAbsDeterminant(). */
+   *  logAbsDeterminant(). All three determinant queries return NaN while no
+   *  successful factorization is available (see isFactorized()). */
   Scalar determinantSign() const {
+    if (!m_factorized) return Scalar(NumTraits<RealScalar>::quiet_NaN());
     Scalar sign = m_factorizationSign;
     for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
       const ConstStridedPanel diag = diagBlock(s);
@@ -465,7 +502,10 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
    *    solver.matrixU().solveInPlace(y);            // U y = ...
    *    VectorXd x = solver.colsPermutation().transpose() * y;
    *  \endcode
-   *  with P A P^T = L U. */
+   *  with P A P^T = L U (of the equilibrated matrix when equilibration() is
+   *  on: scale b by rowScaling() first and x by colScaling() after). Without a
+   *  successful factorization the solve fills its argument with NaN and sets
+   *  info() to NumericalIssue, like solve(). */
   struct SupernodalLUMatrixLReturnType {
     explicit SupernodalLUMatrixLReturnType(const SupernodalLU& solver) : m_solver(solver) {}
     Index rows() const { return m_solver.rows(); }
@@ -563,6 +603,50 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     return ConstContiguousPanel(m_uStorage.data() + m_uOffset[s], sn.width(), sn.offDiagonalRowCount);
   }
 
+  // Overflow-free running product for determinant(): keeps mantissa * 2^exponent
+  // with |mantissa| renormalized into [0.5, 1) after every factor, so the
+  // magnitude lives in `exponent` and no intermediate can overflow or underflow.
+  // A zero factor leaves mantissa at 0, which is the right answer.
+  static void accumulateScaled(const Scalar& factor, Scalar& mantissa, long& exponent) {
+    mantissa *= factor;
+    const RealScalar mag = numext::abs(mantissa);
+    if (!(mag > RealScalar(0)) || !(numext::isfinite)(mag)) return;
+    int e = 0;
+    std::frexp(mag, &e);
+    mantissa = scaleByPowerOfTwo(mantissa, -e);
+    exponent += e;
+  }
+  // mantissa * 2^exponent, scaling the real and imaginary parts separately so a
+  // complex scalar needs no complex ldexp. Overflows to inf (or underflows to 0)
+  // exactly when the true value is outside the representable range.
+  static Scalar scaleByPowerOfTwo(const Scalar& mantissa, long exponent) {
+    const int e = static_cast<int>(numext::maxi(long(-2 * std::numeric_limits<RealScalar>::max_exponent),
+                                                numext::mini(long(2 * std::numeric_limits<RealScalar>::max_exponent), exponent)));
+    return scaleByPowerOfTwoImpl(mantissa, e, std::integral_constant<bool, NumTraits<Scalar>::IsComplex>());
+  }
+  static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::false_type) { return std::ldexp(m, e); }
+  static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::true_type) {
+    return Scalar(std::ldexp(numext::real(m), e), std::ldexp(numext::imag(m), e));
+  }
+
+  // A solve without a successful factorization has nothing to solve with: the
+  // arenas may belong to an earlier matrix of another size, or to a
+  // factorization that was declined or broke down. Reading them would be
+  // memory-unsafe, so the solve is refused -- NaN answer, NumericalIssue --
+  // rather than asserted away, because the same call in a release build must
+  // not crash. Returns true when the factors are usable.
+  template <typename Dest>
+  bool declineWithoutFactors(MatrixBase<Dest>& x) const {
+    if (m_factorized) return true;
+    x.setConstant(Scalar(NumTraits<RealScalar>::quiet_NaN()));
+    m_lastSolveRelativeResidual = NumTraits<RealScalar>::quiet_NaN();
+    m_lastRefinementIterations = 0;
+    m_info = NumericalIssue;
+    if (m_lastError.empty())
+      m_lastError = "SupernodalLU: solve() called without a successful factorization.";
+    return false;
+  }
+
   void init() {
     m_size = 0;
     m_analysisDone = false;
@@ -590,7 +674,8 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     m_matchingIsPerfect = true;
     m_matchSign = 1;
     m_factorizationSign = Scalar(1);
-    m_scalingDeterminant = RealScalar(1);
+    m_scalingMantissa = RealScalar(1);
+    m_scalingExponent = 0;
     m_nnzL = 0;
     m_nnzU = 0;
   }
@@ -708,13 +793,16 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
     });
   }
 
-  // Panel position of off-diagonal internal row `r` within supernode `s`.
-  // The supernode's off-diagonal rows are partitioned into sorted, non-overlapping
-  // row blocks; within a block the position is panelOffset + (r - firstRow). A
-  // binary search over the (few) row blocks replaces a per-supernode hash map:
-  // less memory, contiguous access, and `r` is always a genuine off-diagonal row
-  // of `s` at every call site. See pastix_algorithms.md (offset arithmetic).
-  StorageIndex rowPanelPosition(StorageIndex s, StorageIndex r) const {
+  // Panel position of off-diagonal internal row `r` within supernode `s`, or -1
+  // when `r` is not an off-diagonal row of `s` at all. The supernode's
+  // off-diagonal rows are partitioned into sorted, non-overlapping row blocks;
+  // within a block the position is panelOffset + (r - firstRow). A binary
+  // search over the (few) row blocks replaces a per-supernode hash map: less
+  // memory, contiguous access. See pastix_algorithms.md (offset arithmetic).
+  // The numeric phase relies on the -1: it is how a factorize() input whose
+  // pattern has grown since analyzePattern() is caught instead of scattered
+  // past the panel.
+  StorageIndex findRowPanelPosition(StorageIndex s, StorageIndex r) const {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex first = sn.firstRowBlock;
     StorageIndex lo = 0, hi = sn.rowBlockCount;
@@ -725,10 +813,17 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
       else
         hi = mid;
     }
+    if (lo >= sn.rowBlockCount) return StorageIndex(-1);
     const RowBlock& block = m_rowBlocks[first + lo];
-    eigen_assert(lo < sn.rowBlockCount && block.firstRow <= r && r <= block.lastRow &&
-                 "rowPanelPosition: row is not an off-diagonal row of this supernode");
+    if (r < block.firstRow || r > block.lastRow) return StorageIndex(-1);
     return block.panelOffset + (r - block.firstRow);
+  }
+  // Same lookup for a row that is known to be in the structure (every
+  // structural query inside the factorization).
+  StorageIndex rowPanelPosition(StorageIndex s, StorageIndex r) const {
+    const StorageIndex pos = findRowPanelPosition(s, r);
+    eigen_assert(pos >= 0 && "rowPanelPosition: row is not an off-diagonal row of this supernode");
+    return pos;
   }
 
   // factor one supernode in place: pull its Schur updates, do the unpivoted LU
@@ -867,10 +962,12 @@ class SupernodalLU : public SparseSolverBase<SupernodalLU<MatrixType_, OrderingT
   MatrixType m_originalMatrix;
 
   // equilibration: A~ = diag(m_rowScale) * A * diag(m_colScale), both in the
-  // original numbering. m_scalingDeterminant = prod(m_rowScale) * prod(m_colScale).
+  // original numbering. prod(m_rowScale) * prod(m_colScale) is kept as
+  // m_scalingMantissa * 2^m_scalingExponent (see determinant()).
   std::vector<RealScalar> m_rowScale;
   std::vector<RealScalar> m_colScale;
-  RealScalar m_scalingDeterminant;
+  RealScalar m_scalingMantissa;
+  long m_scalingExponent;
 
   bool m_analysisDone;
   bool m_factorized;            // a successful numeric factorization is available
@@ -932,7 +1029,20 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::buildSymmetricAdjacency(
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const MatrixType& matrix) {
-  eigen_assert(matrix.rows() == matrix.cols() && "SupernodalLU requires a square matrix");
+  // Whatever factorization existed belonged to the previous pattern: its arenas
+  // and permutation maps are about to be replaced, so it must not be solved with
+  // (a solve on the old arenas through the new maps reads out of bounds).
+  m_factorized = false;
+  m_analysisDone = false;
+  m_replacedPivots = 0;
+  m_nnzL = 0;
+  m_nnzU = 0;
+  m_lastError.clear();
+  if (matrix.rows() != matrix.cols()) {
+    m_info = InvalidInput;
+    m_lastError = "SupernodalLU: the matrix must be square.";
+    return;
+  }
   m_size = static_cast<StorageIndex>(matrix.rows());
   const StorageIndex n = m_size;
 
@@ -1405,11 +1515,39 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storag
 
 template <typename MatrixType, typename OrderingType, typename Executor>
 void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType& matrix) {
-  eigen_assert(m_analysisDone && "analyzePattern must be called before factorize");
   const StorageIndex supernodeNbr = static_cast<StorageIndex>(m_supernodes.size());
   m_replacedPivots = 0;
   m_factorized = false;
   m_info = Success;
+  m_lastError.clear();
+
+  // The numeric phase scatters every entry into a slot the symbolic phase laid
+  // out, and reads the permutation maps by original row and column. Without an
+  // analysis there are no slots; a matrix of another size would index past the
+  // maps; a non-finite value would poison the equilibration (0 * inf) and then
+  // every factor it touches, and the factorization has no zero pivot to trip
+  // on -- NaN compares false to everything -- so it would report Success over
+  // a NaN factor. All three are declined up front. Pattern mismatches are
+  // caught in the scatter below.
+  if (!m_analysisDone) {
+    m_info = InvalidInput;
+    m_lastError = "SupernodalLU: factorize() called before analyzePattern(); call analyzePattern() "
+                  "(or compute()) first.";
+    return;
+  }
+  if (matrix.rows() != Index(m_size) || matrix.cols() != Index(m_size)) {
+    m_info = InvalidInput;
+    m_lastError = "SupernodalLU: factorize() received a matrix of a different size than the one "
+                  "analyzePattern() saw; call analyzePattern() (or compute()) on the new matrix.";
+    return;
+  }
+  for (StorageIndex j = 0; j < m_size; ++j)
+    for (typename MatrixType::InnerIterator it(matrix, j); it; ++it)
+      if (!(numext::isfinite)(numext::abs(it.value()))) {
+        m_info = InvalidInput;
+        m_lastError = "SupernodalLU: the matrix contains a non-finite (inf or NaN) value.";
+        return;
+      }
 
   // Fail-fast fill guard: abort BEFORE allocating the factor arenas if the
   // symbolic structure predicts a factor larger than the configured limit. This
@@ -1441,9 +1579,13 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
 
   // row/column equilibration: factor the scaled matrix A~ = Dr*A*Dc.
   computeEquilibration(matrix);
-  m_scalingDeterminant = RealScalar(1);
-  for (StorageIndex i = 0; i < m_size; ++i)
-    m_scalingDeterminant *= m_rowScale[i] * m_colScale[i];
+  {
+    Scalar mantissa(1);
+    m_scalingExponent = 0;
+    for (StorageIndex i = 0; i < m_size; ++i)
+      accumulateScaled(Scalar(m_rowScale[i] * m_colScale[i]), mantissa, m_scalingExponent);
+    m_scalingMantissa = numext::real(mantissa);
+  }
 
   // resolve the effective static-pivot threshold. When automatic, scale it to
   // the SCALED matrix magnitude (sqrt(eps) * max|A~_ij|, SuperLU_DIST style).
@@ -1480,7 +1622,15 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
   // 2) scatter the (permuted) values of A into the panels. Write straight into
   //    the arenas by computed offset (column-major, L-panel leading dimension =
   //    width+offDiag; the diagonal block occupies its first `width` rows).
-  for (StorageIndex j = 0; j < m_size; ++j) {
+  //
+  //    Every entry must land in a slot the symbolic phase created: an entry
+  //    with no slot means this matrix has a nonzero where the analyzed one had
+  //    none. That is a caller error (analyzePattern() must see the pattern
+  //    factorize() gets), but writing past a panel over it would corrupt the
+  //    arenas, so it is reported instead. Entries the analyzed pattern had and
+  //    this matrix lacks are simply zeros and need no check.
+  bool patternMismatch = false;
+  for (StorageIndex j = 0; j < m_size && !patternMismatch; ++j) {
     const StorageIndex jj = m_toInternal[j];
     const StorageIndex columnSupernode = m_supernodeOfColumn[jj];
     const Supernode& cs = m_supernodes[columnSupernode];
@@ -1498,18 +1648,33 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
         const std::size_t row = static_cast<std::size_t>(ii) - csFirst;
         m_lStorage[m_lOffset[columnSupernode] + col * csStride + row] += value;
       } else if (ii > jj) {  // below-diagonal: L off-diagonal panel (rows >= width)
+        const StorageIndex pos = findRowPanelPosition(columnSupernode, ii);
+        if (pos < 0) {
+          patternMismatch = true;
+          break;
+        }
         const std::size_t col = static_cast<std::size_t>(jj) - csFirst;
-        const std::size_t pos = static_cast<std::size_t>(rowPanelPosition(columnSupernode, ii));
-        m_lStorage[m_lOffset[columnSupernode] + col * csStride + csWidth + pos] += value;
+        m_lStorage[m_lOffset[columnSupernode] + col * csStride + csWidth + static_cast<std::size_t>(pos)] +=
+            value;
       } else {  // above-diagonal: U off-diagonal panel of the row's supernode
         const StorageIndex rowSupernode = m_supernodeOfColumn[ii];
         const Supernode& rs = m_supernodes[rowSupernode];
         const std::size_t rsWidth = static_cast<std::size_t>(rs.width());
-        const std::size_t pos = static_cast<std::size_t>(rowPanelPosition(rowSupernode, jj));
+        const StorageIndex pos = findRowPanelPosition(rowSupernode, jj);
+        if (pos < 0) {
+          patternMismatch = true;
+          break;
+        }
         const std::size_t row = static_cast<std::size_t>(ii) - static_cast<std::size_t>(rs.firstColumn);
-        m_uStorage[m_uOffset[rowSupernode] + pos * rsWidth + row] += value;
+        m_uStorage[m_uOffset[rowSupernode] + static_cast<std::size_t>(pos) * rsWidth + row] += value;
       }
     }
+  }
+  if (patternMismatch) {
+    m_info = InvalidInput;
+    m_lastError = "SupernodalLU: factorize() received a matrix with a nonzero outside the pattern "
+                  "analyzePattern() saw; call analyzePattern() (or compute()) on the new matrix.";
+    return;
   }
 
   // 3) left-looking supernodal factorization, scheduled by elimination-tree
@@ -1643,7 +1808,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorize(const MatrixTyp
 template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Rhs, typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
-  eigen_assert(m_factorized && "the matrix must be factorized first");
+  if (!declineWithoutFactors(x)) return;
   const Index nrhs = b.cols();
 
   const DenseMatrix rhs = b;            // materialize the right-hand side
@@ -1830,18 +1995,30 @@ template <typename ApplyA>
 void SupernodalLU<MatrixType, OrderingType, Executor>::recordSolveStatus(const DenseMatrix& rhs,
                                                                          const DenseMatrix& solution,
                                                                          ApplyA applyA) const {
-  const RealScalar rhsNorm = rhs.norm();
   DenseMatrix product(rhs.rows(), rhs.cols());
   applyA(solution, product);
-  const RealScalar resNorm = (rhs - product).norm();
-  // Relative residual; for a zero right-hand side fall back to the absolute one.
-  const RealScalar relResid = (rhsNorm > RealScalar(0)) ? resNorm / rhsNorm : resNorm;
+  // The residual is judged one right-hand side at a time and the WORST column
+  // decides. Every column is an independent system, and a single Frobenius
+  // ratio over the whole block would let one column with a large right-hand
+  // side hide any number of small ones that came out as garbage (a column of
+  // norm 1e9 solved to 1e-16 next to one of norm 1 solved to nothing at all
+  // still averages to 1e-9). For a zero right-hand side fall back to the
+  // absolute residual of that column.
+  RealScalar relResid(0);
+  for (Index c = 0; c < rhs.cols(); ++c) {
+    const RealScalar rhsNorm = rhs.col(c).norm();
+    const RealScalar resNorm = (rhs.col(c) - product.col(c)).norm();
+    const RealScalar colResid = (rhsNorm > RealScalar(0)) ? resNorm / rhsNorm : resNorm;
+    // max that propagates NaN (numext::maxi would drop it)
+    if (!(colResid <= relResid)) relResid = colResid;
+  }
   m_lastSolveRelativeResidual = relResid;
 
   const bool usable = solution.allFinite() && (numext::isfinite)(relResid) &&
                       relResid <= m_solveFailureThreshold;
   if (usable) {
     m_info = Success;
+    m_lastError.clear();
   } else {
     m_info = NumericalIssue;
     m_lastError =
@@ -1858,6 +2035,7 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::SupernodalLUMatrixLReturnType::solveInPlace(
     MatrixBase<Dest>& x) const {
+  if (!m_solver.declineWithoutFactors(x)) return;
   m_solver.applyInverseL(x.derived());
 }
 
@@ -1865,6 +2043,7 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::SupernodalLUMatrixUReturnType::solveInPlace(
     MatrixBase<Dest>& x) const {
+  if (!m_solver.declineWithoutFactors(x)) return;
   m_solver.applyInverseU(x.derived());
 }
 
@@ -1956,7 +2135,7 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Rhs, typename Dest>
 void SupernodalLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(const MatrixBase<Rhs>& b,
                                                                     MatrixBase<Dest>& x) const {
-  eigen_assert(m_factorized && "the matrix must be factorized first");
+  if (!declineWithoutFactors(x)) return;
   const Index nrhs = b.cols();
 
   const DenseMatrix rhs = b;

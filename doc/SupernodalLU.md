@@ -186,7 +186,9 @@ operation they describe has run at least once.
 - **`setSolveFailureThreshold(RealScalar tol)`** (default `1e-6`) — after refinement, `solve()`
   measures the *true* relative residual against the original (unscaled) `A` and sets `info()` to
   `NumericalIssue` — instead of silently returning a bad answer — if that residual exceeds `tol`
-  or the solution is non-finite. `solveResidual() -> RealScalar` reports the measured value. A
+  or the solution is non-finite. With several right-hand sides the residual is measured per
+  column and the worst column decides. `solveResidual() -> RealScalar` reports the measured
+  value (the worst column's). A
   subsequent `solve()` with a well-conditioned right-hand side against the *same* factorization
   restores `info() == Success`; use `isFactorized()`, not `info()`, to check whether the factors
   themselves are still usable (a bad solve doesn't poison later ones).
@@ -338,13 +340,15 @@ operation they describe has run at least once.
 
 ### Diagnostics & queries
 
-- **`info() -> ComputationInfo`** — `Success`, or `NumericalIssue` if factorization broke down
+- **`info() -> ComputationInfo`** — `Success`; `NumericalIssue` if factorization broke down
   (a static pivot of exactly zero even after all robustness measures) or the last `solve()`
-  failed its honesty check.
-- **`isFactorized() -> bool`** — true once a numeric factorization has succeeded; unlike
-  `info()`, unaffected by a subsequently failed `solve()`. Use this to decide whether the
-  factors are still usable.
-- **`lastErrorMessage() -> const std::string&`** — human-readable detail for the last failure.
+  failed its honesty check; `InvalidInput` if the input was declined before anything was
+  factored (see [Input validation and failure reporting](#input-validation-and-failure-reporting)).
+- **`isFactorized() -> bool`** — true while a successful numeric factorization of the analyzed
+  pattern is available; unlike `info()`, unaffected by a subsequently failed `solve()`. Use this
+  to decide whether the factors are still usable. `analyzePattern()` clears it.
+- **`lastErrorMessage() -> const std::string&`** — human-readable detail for the last failure;
+  empty after a successful `factorize()` or `solve()`.
 - **`rows()` / `cols() -> Index`** — matrix dimension.
 - **`rowsPermutation()` / `colsPermutation() -> const PermutationType&`** — the row and column
   permutations between original and internal numbering. They differ whenever matching reorders
@@ -368,7 +372,12 @@ operation they describe has run at least once.
 - **`widestLevel() -> Index`** — supernodes in the widest level, an upper bound on the useful
   concurrency of plain level-parallelism (see [Parallelism](Parallelism.md)).
 - **`determinant() -> Scalar`** — `det(A)`, correctly divides out the equilibration scaling and
-  folds in the sign of the matching permutation and every in-block pivot swap.
+  folds in the sign of the matching permutation and every in-block pivot swap. Both the pivot
+  product and the scaling product are accumulated as *mantissa × 2^exponent*, so the result is
+  `inf` or `0` only when `det(A)` itself is outside the representable range — not because a
+  running product passed through it (a diagonal alternating `1e5` and `1e-5` has determinant
+  exactly 1 either way). When static pivoting replaced a pivot, this is the determinant of the
+  perturbed operator that was actually factored. `NaN` while `isFactorized()` is false.
 - **`logAbsDeterminant() -> RealScalar`** / **`determinantSign() -> Scalar`** — `log|det(A)|`
   accumulated as a sum of logs, plus the sign (±1 for real scalars, a unit-modulus phase for
   complex, `0` on a zero pivot). **Prefer these over `determinant()` above a few hundred rows:**
@@ -393,6 +402,38 @@ operation they describe has run at least once.
   Eigen::VectorXd x = solver.transpose().solve(b);   // solver must be non-const
   ```
 
+## Input validation and failure reporting
+
+The solver checks its inputs and its own state at every entry point, so a misuse is reported
+rather than turned into an out-of-bounds read of the factor arenas. The rules are the same in
+release builds; nothing below relies on `eigen_assert`.
+
+- **`analyzePattern()`** declines a non-square matrix (`InvalidInput`). It always retires the
+  previous factorization: `isFactorized()` becomes false, because the old arenas belong to the
+  old structure and the new permutation maps would index them out of bounds.
+- **`factorize()`** declines, with `InvalidInput` and a `lastErrorMessage()` naming the cause:
+  a call before `analyzePattern()`; a matrix of another size than the analyzed one; a matrix
+  with an `inf` or `NaN` value (a NaN factor has no zero pivot to trip on and would otherwise
+  be reported as `Success`); and a matrix with a nonzero *outside the analyzed pattern* — the
+  documented refactorize workflow requires the same pattern, and an entry with no slot in the
+  symbolic structure is caught in the scatter instead of being written past a panel. Entries the
+  analyzed pattern had and the new matrix lacks are simply zeros and are fine. A nonzero that
+  lands in a fill slot of the analyzed structure is factored normally.
+- **A solve without a successful factorization** — never factorized, factorization declined or
+  singular, or `analyzePattern()` called since — fills the result with `NaN`, sets
+  `NumericalIssue` and a message, and returns. This covers `solve()`, `transpose().solve()`,
+  `adjoint().solve()` and the `matrixL()`/`matrixU()` proxies. The determinant queries return
+  `NaN` in the same state.
+- **The residual gate is per column.** With several right-hand sides, every column is an
+  independent system and `solve()` judges the *worst* column: `solveResidual()` is the largest
+  per-column `||b_c - A x_c|| / ||b_c||` (absolute residual for an all-zero column), and
+  `NumericalIssue` is raised if any column exceeds `solveFailureThreshold()`. A single ratio
+  over the whole block would let one column with a large right-hand side hide any number of
+  small ones that came out as garbage — a column of norm `1e9` solved to `1e-16` next to one of
+  norm 1 solved to nothing at all still averages to `1e-9`.
+- **`lastErrorMessage()` describes the last failure only**: a successful `factorize()` or
+  `solve()` clears it.
+
 ## Examples
 
 ### 1. Basic solve, multiple right-hand sides
@@ -413,8 +454,9 @@ if (solver.info() != Eigen::Success) {
 }
 Eigen::VectorXd x = solver.solve(b);
 if (solver.info() != Eigen::Success) {
-  // solve() measured ||b - Ax||/||b|| > solveFailureThreshold() (default 1e-6),
-  // or got a non-finite answer -- treat x as untrustworthy.
+  // solve() measured ||b - Ax||/||b|| > solveFailureThreshold() (default 1e-6;
+  // per column when b has several), or got a non-finite answer -- treat x as
+  // untrustworthy.
   std::cerr << "solve reported residual " << solver.solveResidual() << "\n";
 } else {
   use(x);

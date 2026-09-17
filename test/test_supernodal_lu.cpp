@@ -11,7 +11,9 @@
 #include <Eigen/SparseLU>
 
 #include <cmath>
+#include <complex>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -293,6 +295,298 @@ void testMultipleRhs() {
   check(resid < 1e-8, "multiple RHS (4 cols)", resid);
 }
 
+// --------------------------------------------------------------------------
+//  Input validation, state and reporting
+// --------------------------------------------------------------------------
+//
+// Everything below is about what the solver does at its boundaries: a solve
+// with no factors to solve with, an input it cannot factor, a determinant whose
+// intermediate products leave the representable range, and a multi-column
+// solve where one column hides the others. None of it involves the numerics of
+// a healthy solve, so a wrong answer here is a wrong contract, not a rounding
+// question, and every check is exact.
+
+using lu_testing::checkTrue;
+typedef SparseMatrix<double> SpMat;
+typedef SparseMatrix<std::complex<double>> SpMatC;
+
+// Two disconnected copies of a grid: no elimination order can create fill
+// between them, so a coupling entry added later is guaranteed to lie outside
+// the analyzed structure.
+SpMat twoComponents(int gx, int gy) {
+  const SpMat L = laplacian2d(gx, gy);
+  const int m = static_cast<int>(L.rows());
+  std::vector<Eigen::Triplet<double>> t;
+  for (int j = 0; j < L.outerSize(); ++j)
+    for (SpMat::InnerIterator it(L, j); it; ++it) {
+      t.emplace_back(it.row(), j, it.value());
+      t.emplace_back(m + it.row(), m + j, it.value());
+    }
+  SpMat A(2 * m, 2 * m);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+// A refused solve must hand back NaN and NumericalIssue, never numbers.
+bool refused(const Eigen::SupernodalLU<SpMat>& s, const VectorXd& x) {
+  return s.info() == Eigen::NumericalIssue && x.size() > 0 && !x.allFinite() && !s.lastErrorMessage().empty();
+}
+
+// analyzePattern() on a new matrix must retire the factors of the old one:
+// the arenas belong to the old structure and the maps to the new, so a solve in
+// between would read out of bounds. It is refused; factorize() then restores
+// a working solver.
+void testReanalysisRetiresFactors() {
+  for (int larger = 0; larger < 2; ++larger) {
+    const SpMat A = larger ? laplacian2d(4, 4) : laplacian2d(10, 10);
+    const SpMat B = larger ? laplacian2d(30, 30) : laplacian2d(4, 4);
+    const int nb = static_cast<int>(B.rows());
+    const char* tag = larger ? "re-analysis (larger)" : "re-analysis (smaller)";
+    Eigen::SupernodalLU<SpMat> s;
+    s.compute(A);
+    s.analyzePattern(B);
+    checkTrue(!s.isFactorized() && s.info() == Eigen::Success,
+              std::string(tag) + ": analyzePattern() retires the old factors");
+    const VectorXd x = s.solve(VectorXd::Ones(nb));
+    checkTrue(refused(s, x), std::string(tag) + ": solve before factorize() is refused");
+    checkTrue(std::isnan(s.determinant()) && std::isnan(s.logAbsDeterminant()) &&
+                  std::isnan(s.determinantSign()),
+              std::string(tag) + ": determinant queries are NaN without factors");
+    s.factorize(B);
+    const VectorXd xTrue = VectorXd::Random(nb);
+    const VectorXd x2 = s.solve(B * xTrue);
+    const double err = (x2 - xTrue).norm() / xTrue.norm();
+    check(s.info() == Eigen::Success && err < 1e-10, std::string(tag) + ": factorize() then solve", err);
+  }
+}
+
+// Every way of reaching solve() without factors: never analyzed, analyzed only,
+// declined by the fill guard, singular, and through the transposed view and the
+// L/U proxies. All refuse instead of reading arenas that do not exist.
+void testSolveWithoutFactors() {
+  const SpMat A = laplacian2d(6, 6);
+  const int n = static_cast<int>(A.rows());
+  {
+    Eigen::SupernodalLU<SpMat> s;
+    s.factorize(A);
+    checkTrue(s.info() == Eigen::InvalidInput && !s.isFactorized(),
+              "factorize() before analyzePattern() is declined");
+  }
+  {
+    Eigen::SupernodalLU<SpMat> s;
+    s.analyzePattern(A);
+    const VectorXd x = s.solve(VectorXd::Ones(n));
+    checkTrue(refused(s, x), "solve() after analyzePattern() only is refused");
+    const VectorXd xt = s.transpose().solve(VectorXd::Ones(n));
+    checkTrue(refused(s, xt), "transpose().solve() without factors is refused");
+    VectorXd y = VectorXd::Ones(n);
+    s.matrixL().solveInPlace(y);
+    checkTrue(refused(s, y), "matrixL().solveInPlace() without factors is refused");
+    y.setOnes();
+    s.matrixU().solveInPlace(y);
+    checkTrue(refused(s, y), "matrixU().solveInPlace() without factors is refused");
+  }
+  {
+    Eigen::SupernodalLU<SpMat> s;
+    s.setMaxFactorNonzeros(10);
+    s.compute(A);
+    checkTrue(s.info() == Eigen::NumericalIssue && !s.isFactorized(), "fill guard declines");
+    const VectorXd x = s.solve(VectorXd::Ones(n));
+    checkTrue(refused(s, x), "solve() after a declined factorize is refused");
+    s.setMaxFactorNonzeros(0);
+    s.factorize(A);
+    checkTrue(s.info() == Eigen::Success && s.isFactorized() && s.lastErrorMessage().empty(),
+              "a successful factorize clears the fill-guard message");
+  }
+  {
+    SpMat Z(5, 5);
+    Z.makeCompressed();
+    Eigen::SupernodalLU<SpMat> s;
+    s.compute(Z);  // max|A| = 0: the automatic threshold is 0 and the zero pivot is fatal
+    checkTrue(s.info() == Eigen::NumericalIssue && !s.isFactorized(), "zero matrix: singular");
+    const VectorXd x = s.solve(VectorXd::Ones(5));
+    checkTrue(refused(s, x), "solve() after a singular factorization is refused");
+  }
+}
+
+// Inputs factorize() cannot take: a non-square matrix, a non-finite value, a
+// matrix of another size than analyzePattern() saw, and one with a nonzero
+// outside the analyzed pattern. Each is declined with InvalidInput, nothing is
+// factored, and compute() on the same solver recovers.
+void testInvalidInput() {
+  {
+    SpMat R(4, 3);
+    R.insert(0, 0) = 1;
+    R.insert(1, 1) = 1;
+    R.insert(2, 2) = 1;
+    R.insert(3, 0) = 1;
+    R.makeCompressed();
+    Eigen::SupernodalLU<SpMat> s;
+    s.compute(R);
+    checkTrue(s.info() == Eigen::InvalidInput && !s.isFactorized(), "non-square matrix is declined");
+  }
+  for (int kind = 0; kind < 2; ++kind) {
+    SpMat A = laplacian2d(6, 6);
+    const int n = static_cast<int>(A.rows());
+    A.coeffRef(7, 7) = kind == 0 ? std::numeric_limits<double>::infinity()
+                                 : std::numeric_limits<double>::quiet_NaN();
+    Eigen::SupernodalLU<SpMat> s;
+    s.compute(A);
+    const char* tag = kind == 0 ? "inf" : "NaN";
+    checkTrue(s.info() == Eigen::InvalidInput && !s.isFactorized(),
+              std::string("a matrix with an ") + tag + " value is declined");
+    const VectorXd x = s.solve(VectorXd::Ones(n));
+    checkTrue(refused(s, x), std::string("solve() after the ") + tag + " decline is refused");
+    A.coeffRef(7, 7) = 4.0;
+    s.compute(A);
+    const VectorXd xTrue = VectorXd::Random(n);
+    const double err = (s.solve(A * xTrue) - xTrue).norm() / xTrue.norm();
+    check(s.info() == Eigen::Success && s.lastErrorMessage().empty() && err < 1e-10,
+          std::string("compute() recovers after the ") + tag + " decline", err);
+  }
+  {
+    Eigen::SupernodalLU<SpMat> s;
+    s.analyzePattern(laplacian2d(6, 6));
+    s.factorize(laplacian2d(7, 7));
+    checkTrue(s.info() == Eigen::InvalidInput && !s.isFactorized(),
+              "factorize() with a matrix of another size is declined");
+  }
+  {
+    const SpMat A = twoComponents(8, 4);
+    const int n = static_cast<int>(A.rows());
+    Eigen::SupernodalLU<SpMat> s;
+    for (int lower = 0; lower < 2; ++lower) {
+      s.analyzePattern(A);  // the recovery compute() below analyzes the grown pattern
+      SpMat C = A;
+      if (lower)
+        C.coeffRef(n - 1, 0) = 1.0;
+      else
+        C.coeffRef(0, n - 1) = 1.0;
+      C.makeCompressed();
+      s.factorize(C);
+      const char* tag = lower ? "below" : "above";
+      checkTrue(s.info() == Eigen::InvalidInput && !s.isFactorized(),
+                std::string("factorize() with a nonzero outside the pattern (") + tag +
+                    " the diagonal) is declined");
+      const VectorXd x = s.solve(VectorXd::Ones(n));
+      checkTrue(refused(s, x), std::string("solve() after the pattern decline (") + tag + ") is refused");
+      s.compute(C);
+      const VectorXd xTrue = VectorXd::Random(n);
+      const double err = (s.solve(C * xTrue) - xTrue).norm() / xTrue.norm();
+      check(s.info() == Eigen::Success && err < 1e-10,
+            std::string("compute() on the grown pattern (") + tag + ") solves it", err);
+    }
+  }
+}
+
+// determinant() must survive intermediate overflow and underflow: the pivots of
+// a diagonal alternating 1e5 and 1e-5 multiply to 1, but a running product of
+// 400 of them passes through 1e200 (or 1e-200) on the way.
+void testDeterminantRange() {
+  const int n = 400;
+  SpMat A(n, n), B(n, n);
+  for (int i = 0; i < n; ++i) {
+    A.insert(i, i) = (i % 2 == 0) ? 1e-5 : 1e5;   // overflow first
+    B.insert(i, i) = (i < n / 2) ? 1e-5 : 1e5;    // underflow first
+  }
+  A.makeCompressed();
+  B.makeCompressed();
+  for (int equilibrate = 0; equilibrate < 2; ++equilibrate) {
+    Eigen::SupernodalLU<SpMat> sa, sb;
+    sa.setEquilibration(equilibrate == 1);
+    sb.setEquilibration(equilibrate == 1);
+    // the unscaled matrix has max|A| = 1e5, so the automatic threshold would
+    // replace every 1e-5 pivot; keep the factorization exact instead.
+    sa.setStaticPivotThreshold(0);
+    sb.setStaticPivotThreshold(0);
+    sa.compute(A);
+    sb.compute(B);
+    const std::string tag = equilibrate ? " (equilibrated)" : " (unscaled)";
+    check(sa.replacedPivots() == 0 && std::abs(sa.determinant() - 1.0) < 1e-8,
+          "determinant() through intermediate overflow" + tag, sa.determinant());
+    check(sb.replacedPivots() == 0 && std::abs(sb.determinant() - 1.0) < 1e-8,
+          "determinant() through intermediate underflow" + tag, sb.determinant());
+    check(std::abs(sa.logAbsDeterminant()) < 1e-8 && sa.determinantSign() == 1.0,
+          "logAbsDeterminant()/determinantSign() agree" + tag, sa.logAbsDeterminant());
+  }
+  // complex: (i)^400 = 1, through the same magnitudes
+  SpMatC C(n, n);
+  for (int i = 0; i < n; ++i) C.insert(i, i) = std::complex<double>(0, (i % 2 == 0) ? 1e-5 : 1e5);
+  C.makeCompressed();
+  Eigen::SupernodalLU<SpMatC> sc;
+  sc.compute(C);
+  check(std::abs(sc.determinant() - 1.0) < 1e-8, "complex determinant() through intermediate overflow",
+        std::abs(sc.determinant() - 1.0));
+}
+
+// Multi-column honesty: each right-hand side is its own system, so the gate
+// must hold for the worst column. A singular matrix, a consistent column scaled
+// to 1e9 and an inconsistent column of norm 1: the block residual ratio is 1e-9
+// (Success), the second column's own residual is O(1) (garbage).
+void testPerColumnHonesty() {
+  const int n = 80;
+  SpMat A = randomSymmetricPattern(n, 0.06, 23);
+  const int dead = 40;
+  for (int j = 0; j < A.outerSize(); ++j)
+    for (SpMat::InnerIterator it(A, j); it; ++it)
+      if (it.row() == dead || it.col() == dead) it.valueRef() = 0.0;
+  A.prune(0.0);
+
+  Eigen::SupernodalLU<SpMat> s;
+  s.compute(A);
+  VectorXd xr = VectorXd::Random(n);
+  xr(dead) = 0.0;
+  const VectorXd consistent = 1e9 * (A * xr);
+  const VectorXd inconsistent = VectorXd::Random(n);
+  for (int order = 0; order < 2; ++order) {
+    MatrixXd B(n, 2);
+    B.col(order) = consistent;
+    B.col(1 - order) = inconsistent;
+    const MatrixXd X = s.solve(B);
+    double worst = 0.0, block = (A * X - B).norm() / B.norm();
+    for (int c = 0; c < 2; ++c) worst = std::max(worst, (A * X.col(c) - B.col(c)).norm() / B.col(c).norm());
+    const std::string tag = order ? " (huge column second)" : " (huge column first)";
+    check(s.info() == Eigen::NumericalIssue, "multi-rhs: a garbage column is flagged" + tag, worst);
+    check(std::abs(s.solveResidual() - worst) <= 0.5 * worst,
+          "multi-rhs: solveResidual() is the worst column's" + tag, s.solveResidual());
+    check(block < 1e-6, "multi-rhs: the block ratio alone would have passed" + tag, block);
+  }
+  // and every column fine, including an all-zero one, is Success with a finite residual.
+  MatrixXd G(n, 3);
+  G.col(0) = A * xr;
+  G.col(1) = 1e-9 * (A * xr);
+  G.col(2).setZero();
+  const MatrixXd Xg = s.solve(G);
+  check(s.info() == Eigen::Success && Xg.allFinite() && std::isfinite(s.solveResidual()),
+        "multi-rhs: consistent columns of any scale plus a zero column pass", s.solveResidual());
+}
+
+// lastErrorMessage() describes the LAST failure: it is cleared by a successful
+// factorize and by a successful solve.
+void testMessageLifetime() {
+  const SpMat A = randomSymmetricPattern(60, 0.08, 5);
+  Eigen::SupernodalLU<SpMat> s;
+  s.compute(A);
+  VectorXd bad = VectorXd::Ones(60);
+  bad(3) = std::numeric_limits<double>::quiet_NaN();
+  const VectorXd xb = s.solve(bad);
+  checkTrue(s.info() == Eigen::NumericalIssue && !s.lastErrorMessage().empty(),
+            "a NaN right-hand side is flagged with a message");
+  const VectorXd xg = s.solve(A * VectorXd::Ones(60));
+  checkTrue(s.info() == Eigen::Success && s.lastErrorMessage().empty(),
+            "a successful solve clears the message");
+}
+
+void testValidationAndReporting() {
+  testReanalysisRetiresFactors();
+  testSolveWithoutFactors();
+  testInvalidInput();
+  testDeterminantRange();
+  testPerColumnHonesty();
+  testMessageLifetime();
+}
+
 }  // namespace
 
 int main() {
@@ -317,6 +611,9 @@ int main() {
   testKrylovRefinement();
   testHonestFailure();
   testFillGuard();
+
+  std::printf("Input validation, state and reporting:\n");
+  testValidationAndReporting();
 
   return lu_testing::summarize("SupernodalLU correctness");
 }
