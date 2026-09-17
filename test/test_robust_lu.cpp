@@ -332,10 +332,13 @@ void testRankRevealingOnAConsistentSingularSystem() {
   checkTrue(s.rank() == n - 1, "the rank is exactly n-1, as constructed");
   check((A * x - b).norm() / b.norm() < 1e-12, "and it solves the system",
         (A * x - b).norm() / b.norm());
-  // The basic solution puts a zero in the free variable. Stating it is the point
-  // -- a caller who needs the minimum-norm solution needs to know this is not it.
-  checkTrue(x[k] == 0.0, "the free variable is zero: this is the BASIC solution");
-  checkTrue(s.report().find("BASIC least-squares") != std::string::npos,
+  // The null space is e_k, so the minimum-norm solution has nothing in the free
+  // variable -- and is exactly xTrue, which was built with x[k] == 0.
+  check(std::abs(x[k]) < 1e-14, "the free variable is zero: this is the MINIMUM-NORM solution",
+        std::abs(x[k]));
+  check((x - xTrue).norm() / xTrue.norm() < 1e-12, "and it is exactly the one constructed",
+        (x - xTrue).norm() / xTrue.norm());
+  checkTrue(s.report().find("minimum-norm least-squares") != std::string::npos,
             "and the report says so rather than implying A x = b was solved");
 }
 

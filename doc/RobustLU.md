@@ -113,48 +113,56 @@ dynamic threshold pivoting inside `LeftRightLU` would break its static-structure
 
 ## The rank-revealing rung
 
-The terminal rung is `Eigen::SparseQR` with COLAMD ordering — genuinely rank-revealing, with a
-SuiteSparseQR-style pivot threshold. It rescues two corpus matrices nothing else can:
+The terminal rung is [`MultifrontalQR`](MultifrontalQR.md): an equilibrated rank decision,
+**verified** against the smallest singular values of R11 and repaired when Heath's column-norm
+rule is fooled, and a minimum-norm least-squares answer. It rescues two corpus matrices nothing
+else can (patterns symmetrized, as the corpus sweep uses them):
 
-| matrix | LU result | QR rank | QR residual | time |
+| matrix | LU result | QR rank | QR residual | rung time |
 |---|---|---|---|---|
-| `Pajek/SmaGri` (structurally singular) | 1.6e-03 | **511 / 1059** | **2.7e-16** | 0.14 s |
-| `Bai/rw5151` (every LU rung failed) | 2.1e+05 | **5150 / 5151** | **1.6e-08** | 26 s |
+| `Pajek/SmaGri` (structurally singular) | 1.6e-03 | **511 / 1059**, verified | **5.5e-16** | 0.10 s |
+| `Bai/rw5151` (every LU rung failed) | 2.1e+05 | **5128 / 5151**, verified after repair | **2.4e-13** | 0.70 s |
 
-**The answer means something different, and that is reported rather than smoothed over.** QR
-returns a *basic* least-squares solution — free variables set to zero — not the minimum-norm one,
-which would need a complete orthogonal decomposition Eigen has no sparse version of. On `SmaGri`
-(rank 511, so a 548-dimensional null space) the basic solution has norm 288 against the reference
-solution's 35. Both satisfy `Ax = b` to machine precision; they differ by a null-space vector. So
-`outcome()` becomes `RankDeficient`, `isLeastSquares()` returns true, `rank()` is exposed, and the
-message says all of it. If your problem cares *which* solution it gets, this rung alone is not
-enough.
+`rw5151`'s rank is the one a dense SVD of the same scaled matrix gives at the same threshold;
+the column-norm rule alone says 5146. The rung's log line says which engine ran, whether the
+rank was verified, and the smallest singular value of R11 next to the dropped norm — the size
+of the gap the rank rests on.
+
+**The answer means something different, and that is reported rather than smoothed over.** On a
+rank-deficient matrix the rung returns the **minimum-norm** least-squares solution, `pinv(A) b`
+up to the rank decision — the one well-defined choice among the infinitely many a singular
+system has. `outcome()` becomes `RankDeficient`, `isLeastSquares()` returns true, `rank()` is
+exposed, and the message says all of it. Two exceptions are named in that message when they
+occur: a null space too large to form (`MultifrontalQR::setMaxNullSpaceScalars`) falls back to
+the *basic* solution, free variables zero; and a matrix whose rank decision depends on scaling
+its rows yields a *row-weighted* least-squares fit for an inconsistent right-hand side (see
+[`isWeightedLeastSquares`](MultifrontalQR.md#what-solve-returns)).
 
 **Its acceptance test has to be different from the LU rungs', in a way that is easy to get
 backwards.** Demanding a small residual is wrong: on an inconsistent system a nonzero residual
 *is* the answer. The right test is that the residual is orthogonal to the range of `A`,
 `‖Aᵀr‖ ≤ tol·‖A‖·‖r‖`. But that test is meaningless when the residual is negligible — on `SmaGri`,
-solved to 2.7e-16, the ratio reads 9.9e-02 because it is 0/0 noise, and using it alone would
+solved to 5.5e-16, the ratio reads 0.16 because it is 0/0 noise, and using it alone would
 reject a perfect answer. So: residual test when `r` is negligible, optimality test when it is not.
 
-**The guard is on fill, not size.** This was measured after a first version guarded on rows and
-would have let `Pajek/foldoc` run for over eight minutes at only 13,356 rows:
+**The guard is on the nnz(R) the QR analysis predicts**, checked before any numeric work. The
+LU fill an earlier rung measured does not predict QR's cost — the raw `lhr10c` carries 57 M
+scalars of LU fill and factors by QR in 0.13 s — while the QR's own symbolic count does:
 
-| matrix | LU fill | QR time | outcome |
+| matrix (symmetrized) | predicted nnz(R) | QR time | outcome |
 |---|---:|---:|---|
-| `SmaGri` | 348 k | 0.14 s | rescued |
-| `shyy41` | 203 k | 7.8 s | rescued |
-| `rw5151` | 583 k | 26 s | rescued |
-| `lhr10c` | 57.1 M | 265 s | LU already had a better answer |
-| `foldoc` | 51.6 M | **515 s** | correct, but 8.6 minutes |
+| `SmaGri` | 273 k | 0.04 s | rescued |
+| `shyy41` | 259 k | 0.1 s | (partial pivoting got there first) |
+| `rw5151` | 456 k | 0.3 s | rescued |
+| `lhr10c` | 41.9 M | **102 s** | declined (partial pivoting got there first) |
+| `foldoc` | 57.5 M | **76 s** | declined |
 
-Four clean orders of magnitude in LU fill separate the cases that pay from the ones that do not,
-and the LU fill is already measured by an earlier rung. Default `setMaxRankRevealingFill(5e6)`.
-
-What that default gives up is worth stating plainly: **`foldoc` is solvable this way** — 8.6
-minutes for a correct answer where every LU strategy returns 1.8e+33 — and the default declines
-it. A silent multi-minute stall is judged the worse failure mode, and the declined rung is logged
-with its reason, so raising the guard is an informed choice rather than a discovery.
+The prediction is within 1% of the fill the factorization then produces on the two large ones.
+Default `setMaxRankRevealingFill(25e6)`: it admits anything that factors in seconds and declines
+a minute-plus stall. That trade is stated plainly because it is a real one — `foldoc` **is**
+solvable this way, rank 12919 of 13356 in 76 s, where every LU strategy returns 1.8e+33 — and the
+declined rung is logged with its reason, so raising the guard is an informed choice rather than
+a discovery.
 
 ## Dense rows: detected and costed, not acted on
 
@@ -202,7 +210,7 @@ one, and it is deliberately not built.
 ## Knowing when to stop is the hard half
 
 Some corpus matrices cannot be rescued by any rung, and an MC64 attempt on `Mallya/lhr10c` costs
-**11.9 seconds** while a QR attempt on `Pajek/foldoc` costs 515. Spending that to confirm a
+**11.9 seconds** while a QR attempt on the symmetrized `Pajek/foldoc` costs 76. Spending that to confirm a
 failure is a bad trade, so the stopping rules carry as much weight as the escalation rules:
 
 - **Structural singularity is checked before the acceptance test, not only on failure.** A
@@ -254,9 +262,9 @@ either way.
 - **`setBackwardErrorTolerance(RealScalar)`** (default `1e-6`) and
   **`setResidualTolerance(RealScalar)`** (default `1e-6`) — a rung must satisfy **both**.
 - **`setMaxFactorNonzeros(Index)`** — the fill guard, applied to every rung.
-- **`setMaxRankRevealingFill(long long)`** (default `5e6`) and
-  **`setMaxRankRevealingSize(Index)`** (default `50000` rows, a backstop for when no LU rung
-  produced a fill figure) — what the terminal QR rung is allowed to attempt.
+- **`setMaxRankRevealingFill(long long)`** (default `25e6`, on the nnz(R) the QR analysis
+  predicts) and **`setMaxRankRevealingSize(Index)`** (default `0`, off: an optional cap on rows
+  alone) — what the terminal QR rung is allowed to attempt.
 - **`rank()`** and **`isLeastSquares()`** — meaningful only after the rank-revealing rung; `-1`
   and `false` otherwise, so a caller cannot mistake an unmeasured rank for a full one.
 - **`denseRowCount()`** and **`denseRowFillPenalty()`** — see above. The penalty is NaN unless the

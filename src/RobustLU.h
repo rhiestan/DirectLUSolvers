@@ -15,7 +15,7 @@
 //     By far the highest-value rung.
 //   * 1 is rescued by true partial pivoting (shyy41), which LeftRightLU cannot
 //     do by construction -- so that rung delegates to PointBlockLU.
-//   * 3 cannot be rescued at all (rw5151, foldoc, SmaGri). Recognising them
+//   * 3 cannot be rescued by any LU strategy (rw5151, foldoc, SmaGri). Recognising them
 //     early matters as much as fixing the others: an MC64 attempt on lhr10c
 //     costs 11.9 seconds, and spending that to confirm a failure is a bad trade.
 //
@@ -96,7 +96,7 @@
 #include <vector>
 
 #include <Eigen/OrderingMethods>
-#include <Eigen/SparseQR>
+#include "MultifrontalQR.h"
 
 #include "LeftRightLU.h"
 #include "PointBlockLU.h"
@@ -115,7 +115,7 @@ enum class Strategy {
   MC64,              ///< Re-analyze with the exact maximum-product matching.
   MC64Extended,      ///< MC64 plus the extended-precision residual.
   PartialPivoting,   ///< PointBlockLU: true threshold pivoting, no perturbation.
-  RankRevealing      ///< SparseQR: least squares plus a rank, when no LU exists.
+  RankRevealing      ///< MultifrontalQR: least squares plus a verified rank, when no LU exists.
 };
 
 const char* strategyName(Strategy s);
@@ -186,9 +186,9 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   // Lower triangle: the input is symmetric by the time this rung runs, so either
   // triangle would do, and the solver ignores the one it is not told to read.
   typedef Eigen::SupernodalLDLT<MatrixType, Lower> SymmetricSolver;
-  // COLAMD rather than AMD: QR's fill follows the pattern of A^T A, which is
-  // what COLAMD is designed to order.
-  typedef Eigen::SparseQR<MatrixType, COLAMDOrdering<StorageIndex>> RankRevealingSolver;
+  // Serial, like every rung here. MultifrontalQR picks its own ordering and
+  // engine, equilibrates, and verifies the rank it reports.
+  typedef Eigen::MultifrontalQR<MatrixType> RankRevealingSolver;
 
   enum {
     ColsAtCompileTime = MatrixType::ColsAtCompileTime,
@@ -291,43 +291,26 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   /** True when the answer is a LEAST-SQUARES solution rather than a solution of
     *  A x = b, i.e. when outcome() == RankDeficient.
     *
-    *  Worth checking explicitly. The answer is a BASIC least-squares solution --
-    *  free variables set to zero -- not the minimum-norm one, which would need a
-    *  complete orthogonal decomposition that Eigen has no sparse version of. On
-    *  a matrix with a large null space the two differ substantially: measured on
-    *  Pajek/SmaGri (rank 511 of 1059) the basic solution has norm 288 against
-    *  the reference solution's 35. Both satisfy A x = b to machine precision;
-    *  they simply differ by a null-space vector. If your problem cares which
-    *  solution it gets, this rung is not enough on its own. */
+    *  Worth checking explicitly. The answer is the MINIMUM-NORM least-squares
+    *  solution -- pinv(A) b up to the rank decision -- which is the one well
+    *  defined choice among the infinitely many a singular system has. If the
+    *  null space is too large to form (see MultifrontalQR's
+    *  setMaxNullSpaceScalars), the rung falls back to the basic solution (free
+    *  variables zero) and lastErrorMessage() says which one you got. */
   bool isLeastSquares() const { return m_outcome == robust_lu::Outcome::RankDeficient; }
 
   /** Guards on what the rank-revealing rung will attempt.
     *
-    * QR is not a cheaper LU, and the guard has to be on FILL rather than on
-    * size -- measured, after a first version guarded on rows and would have let
-    * Pajek/foldoc run for over 25 minutes at only 13356 rows:
+    * The fill guard is on the nnz(R) the QR's own symbolic analysis predicts,
+    * checked before any numeric work. The LU fill an earlier rung measured is
+    * NOT a usable predictor: Mallya/lhr10c carries 57 M scalars of LU fill and
+    * factors by QR in 0.13 s, while Pajek/foldoc's 52 M takes 20 s. What the
+    * QR analysis predicts tracks the cost directly -- see
+    * doc/RobustLU.md for the measured rung. Default 25e6 scalars, which
+    * admits foldoc (~20 M, 20 s serial) and nothing much larger. Set 0 to
+    * disable.
     *
-    *     matrix     LU fill    QR time   QR outcome
-    *     SmaGri       348 k    0.14 s    rank 511/1059, residual 2.7e-16
-    *     shyy41       203 k     7.8 s    rank 4718/4720
-    *     rw5151       583 k      26 s    rank 5150/5151 -- nothing else could
-    *     lhr10c      57.1 M     265 s    LU already had a better answer
-    *     foldoc      51.6 M     515 s    rank 12919/13356, residual 5.8e-14
-    *
-    * The separation is four orders of magnitude wide in LU fill and clean, so
-    * the LU fill an earlier rung already measured is the predictor: if LU could
-    * not stay under it, QR will not either. Default 5e6 scalars, midway across
-    * that gap. Set 0 to disable.
-    *
-    * Note what the default gives up, because it is a real trade rather than a
-    * free win: Pajek/foldoc IS solvable this way -- 8.6 minutes for a correct
-    * answer where every LU strategy returns 1.8e+33 -- and the default guard
-    * declines it. A silent 8.6-minute stall is judged the worse failure, and the
-    * rung is logged as declined with its reason, so a caller who wants that
-    * trade can raise the guard and get it.
-    *
-    * The row cap is a backstop for the case where no LU rung produced a fill
-    * figure at all. Default 50000; set 0 to disable. */
+    * The row cap is an optional backstop on size alone. Default 0 (off). */
   void setMaxRankRevealingFill(long long scalars) { m_maxRankRevealingFill = scalars; }
   long long maxRankRevealingFill() const { return m_maxRankRevealingFill; }
   void setMaxRankRevealingSize(Index rows) { m_maxRankRevealingRows = rows; }
@@ -365,8 +348,8 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     m_maxStrategy = robust_lu::Strategy::RankRevealing;  // the full ladder
     m_backwardTolerance = RealScalar(1e-6);
     m_residualTolerance = RealScalar(1e-6);
-    m_maxRankRevealingRows = 50000;
-    m_maxRankRevealingFill = 5000000;
+    m_maxRankRevealingRows = 0;
+    m_maxRankRevealingFill = 25000000;
     m_leastSquaresTolerance = RealScalar(1e-8);
     m_symmetryTolerance = RealScalar(1e-12);
     m_matrixIsSymmetric = false;
@@ -788,20 +771,29 @@ robust_lu::Attempt RobustLU<MatrixType>::runRankRevealing(const MatrixType& matr
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   };
 
-  MatrixType compressed = matrix;
-  compressed.makeCompressed();  // SparseQR requires it and does not check
-
   m_rankRevealing.reset(new RankRevealingSolver());
-  m_rankRevealing->compute(compressed);
+  m_rankRevealing->analyzePattern(matrix);
+  const long long predicted = (long long)m_rankRevealing->predictedFactorNonzeros();
+  if (m_maxRankRevealingFill > 0 && predicted > m_maxRankRevealingFill) {
+    a.milliseconds = elapsed();
+    a.factorNonzeros = predicted;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "not attempted: the QR analysis predicts %lld scalars in R, past the "
+                  "rank-revealing fill guard of %lld (see setMaxRankRevealingFill)",
+                  predicted, m_maxRankRevealingFill);
+    a.note = buf;
+    return a;
+  }
+  m_rankRevealing->factorize(matrix);
   if (m_rankRevealing->info() != Success) {
     a.milliseconds = elapsed();
-    a.note = "rank-revealing QR failed to factorize";
+    a.note = "rank-revealing QR failed to factorize: " + m_rankRevealing->lastErrorMessage();
     return a;
   }
   a.factored = true;
   a.rank = (long long)m_rankRevealing->rank();
-  a.factorNonzeros = (long long)m_rankRevealing->matrixR().nonZeros();
-
+  a.factorNonzeros = (long long)m_rankRevealing->nnzR();
   const DenseVector probe = probeFor(matrix);
   const DenseVector x = m_rankRevealing->solve(probe);
   a.milliseconds = elapsed();
@@ -820,13 +812,23 @@ robust_lu::Attempt RobustLU<MatrixType>::runRankRevealing(const MatrixType& matr
       double((rnorm > RealScalar(0) && anorm > RealScalar(0)) ? atr.norm() / (anorm * rnorm)
                                                              : RealScalar(0));
   a.accepted = acceptableLeastSquares(a, x.allFinite());
+  char buf[300];
   if (!a.accepted) {
-    char buf[200];
     std::snprintf(buf, sizeof(buf),
                   "rejected: rank=%lld, relative residual=%.2e, optimality=%.2e", a.rank,
                   a.probeResidual, a.leastSquaresOptimality);
-    a.note = buf;
+  } else {
+    // What the rank rests on, in the terms MultifrontalQR reports it.
+    const auto& sigma = m_rankRevealing->smallestSingularValues();
+    std::snprintf(buf, sizeof(buf), "%s engine, rank %s%s, sigma_min(R11) %s %.2e, dropped %.2e",
+                  m_rankRevealing->engineUsed() == multifrontal_qr::Engine::Scalar ? "scalar"
+                                                                                   : "multifrontal",
+                  m_rankRevealing->rankIsVerified() ? "verified" : "UNVERIFIED",
+                  m_rankRevealing->repairIterations() > 0 ? " after repair" : "",
+                  m_rankRevealing->singularValuesAreBound() ? ">=" : "~",
+                  sigma.size() ? double(sigma[0]) : 0.0, double(m_rankRevealing->droppedNorm()));
   }
+  a.note = buf;
   return a;
 }
 
@@ -840,35 +842,13 @@ bool RobustLU<MatrixType>::tryRankRevealing(const MatrixType& matrix) {
     m_attempts.push_back(a);
     return false;
   }
-  // The fill predictor: whatever the LU rungs managed. QR's R is comparable to
-  // or larger than the LU factors on every matrix measured here, so an LU fill
-  // that is already enormous is proof the rung cannot pay.
-  long long luFill = -1;
-  for (const Attempt& prior : m_attempts)
-    if (prior.strategy != Strategy::RankRevealing && prior.factorNonzeros > luFill)
-      luFill = prior.factorNonzeros;
-  if (m_maxRankRevealingFill > 0 && luFill > m_maxRankRevealingFill) {
-    Attempt a;
-    a.strategy = Strategy::RankRevealing;
-    a.factorNonzeros = luFill;
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "not attempted: the LU factors already carry %lld scalars, past the "
-                  "rank-revealing fill guard of %lld (see setMaxRankRevealingFill) -- QR's R is "
-                  "no smaller, and on a matrix this dense it runs for tens of minutes",
-                  luFill, m_maxRankRevealingFill);
-    a.note = buf;
-    m_attempts.push_back(a);
-    return false;
-  }
   if (m_maxRankRevealingRows > 0 && matrix.rows() > m_maxRankRevealingRows) {
     Attempt a;
     a.strategy = Strategy::RankRevealing;
     char buf[220];
     std::snprintf(buf, sizeof(buf),
                   "not attempted: %lld rows exceeds the rank-revealing size cap of %lld "
-                  "(see setMaxRankRevealingSize) -- QR is 17-24x the fill of LU on this "
-                  "project's corpus and is not a cheaper fallback",
+                  "(see setMaxRankRevealingSize)",
                   (long long)matrix.rows(), (long long)m_maxRankRevealingRows);
     a.note = buf;
     m_attempts.push_back(a);
@@ -888,19 +868,22 @@ bool RobustLU<MatrixType>::tryRankRevealing(const MatrixType& matrix) {
 
   if (m_rank < Index(matrix.cols())) {
     // A verified answer, but to a DIFFERENT question than the caller asked: it
-    // minimises ||Ax - b|| rather than solving A x = b, and it is the basic
-    // solution rather than the minimum-norm one. info() stays Success because
-    // the answer is trustworthy; the outcome and the message are what say it is
-    // a least-squares answer, and isLeastSquares() is the programmatic check.
+    // minimises ||Ax - b|| rather than solving A x = b. info() stays Success
+    // because the answer is trustworthy; the outcome and the message are what
+    // say it is a least-squares answer, and isLeastSquares() is the
+    // programmatic check.
     m_outcome = Outcome::RankDeficient;
     m_info = Success;
+    const bool basic = !m_rankRevealing->lastSolveMessage().empty();
     char buf[400];
     std::snprintf(buf, sizeof(buf),
                   "RobustLU: no LU factorization exists (numerical rank %lld of %lld). The "
-                  "answer is a verified BASIC least-squares solution -- free variables set to "
-                  "zero, not the minimum-norm solution -- so it may differ from another "
-                  "method's by a null-space vector. See rank() and isLeastSquares().",
-                  (long long)m_rank, (long long)matrix.cols());
+                  "answer is a verified %s least-squares solution%s. See rank() and "
+                  "isLeastSquares().",
+                  (long long)m_rank, (long long)matrix.cols(), basic ? "BASIC" : "minimum-norm",
+                  basic ? " -- free variables set to zero, because the null space was too large "
+                          "to form; it may differ from the minimum-norm one by a null-space vector"
+                        : "");
     m_lastError = buf;
   } else {
     m_outcome = Outcome::Solved;
@@ -1099,7 +1082,7 @@ void RobustLU<MatrixType>::_solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest
 template <typename MatrixType>
 Index RobustLU<MatrixType>::nnzL() const {
   if (m_useSymmetric) return m_symmetric->nnzL();
-  if (m_useRankRevealing) return Index(m_rankRevealing->matrixR().nonZeros());
+  if (m_useRankRevealing) return m_rankRevealing->nnzR();
   return m_usePivoting ? m_pivoting->nnzL() : m_direct->nnzL();
 }
 template <typename MatrixType>
@@ -1107,7 +1090,7 @@ Index RobustLU<MatrixType>::nnzU() const {
   // The symmetric rung stores no U at all -- L^H is read in its place, which is
   // the whole of what it saves -- so 0 here is the fact, not a missing value.
   if (m_useSymmetric) return 0;
-  if (m_useRankRevealing) return Index(m_rankRevealing->matrixR().nonZeros());
+  if (m_useRankRevealing) return m_rankRevealing->nnzR();
   return m_usePivoting ? m_pivoting->nnzU() : m_direct->nnzU();
 }
 
