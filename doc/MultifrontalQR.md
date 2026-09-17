@@ -227,16 +227,16 @@ a system solved to 1e-16 would otherwise read as far from optimal).
 
 Single thread unless noted; `err` is the forward error for a full-rank matrix.
 
-**setfos samples** — every matrix, both solvers correct except where noted:
+**setfos samples** (`bench_setfos_samples`, best of three, 2026-09-17) — every matrix, both solvers correct except where noted:
 
 | matrix | n | Eigen::SparseQR factor | MultifrontalQR factor | nnz(R) Eigen → ours |
 |---|---:|---:|---:|---:|
-| DriftDiffusion `…n29841` | 4737 | 8974 ms | 0.86 ms | 5,588,544 → 14,219 |
-| DriftDiffusion `…n722` | 3333 | 2348 ms | 3.1 ms | 5,277,925 → 70,946 |
-| DriftDiffusion `…n12841` | 3006 | 1230 ms | 1.8 ms | 3,142,408 → 24,030 |
-| Optics `…n26` | 1260 | 87 ms | 2.8 ms | 324,096 → 46,190 |
-| complex AcSolver `…n1` | 2025 | 113 ms, **rank 2, err 1.0** | 2.6 ms, rank 2025, err 5e-09 | — |
-| complex AcSolver `…n9` | 303 | 2.5 ms, **rank 2, err 1.0** | 0.17 ms, rank 303, err 3e-14 | — |
+| DriftDiffusion `…n29841` | 4737 | 8461 ms | 0.84 ms | 5,588,544 → 14,219 |
+| DriftDiffusion `…n722` | 3333 | 2661 ms | 3.4 ms | 5,277,925 → 70,946 |
+| DriftDiffusion `…n12841` | 3006 | 1414 ms | 1.5 ms | 3,142,408 → 24,030 |
+| Optics `…n26` | 1260 | 92 ms | 3.3 ms | 324,096 → 46,190 |
+| complex AcSolver `…n1` | 2025 | 115 ms, **rank 2, err 1.0** | 2.4 ms, rank 2025, err 4e-09 | — |
+| complex AcSolver `…n9` | 303 | 2.3 ms, **rank 2, err 1.0** | 0.14 ms, rank 303, err 4e-14 | — |
 
 Factor times are `Engine::Auto` (the scalar engine, for all of these) and include rank
 verification. With the cheap first stage verification costs about a third of the scalar
@@ -258,7 +258,8 @@ factorization on these matrices; `setRankVerification(false)` removes it.
 
 Both solvers single-threaded, `b = A·xTrue`; Eigen had 300 s per run. `rank` is each solver's
 own decision; MultifrontalQR's was verified on every matrix. Our factor time is
-`Engine::Auto`, best of three, and includes verification. Over the 34 matrices both finished,
+`Engine::Auto`, best of three, and includes verification; our columns were re-measured
+2026-09-17 (`bench_multifrontal_qr`). Over the 34 matrices both finished,
 MultifrontalQR is **5–6400× faster, median 57×**.
 
 | matrix | n | Eigen factor | Eigen rank | Eigen resid | ours factor | engine | our rank | our resid |
@@ -267,15 +268,15 @@ MultifrontalQR is **5–6400× faster, median 57×**.
 | `bwm2000` | 2000 | 282 ms | 2000 | 1e-14 | 1.0 ms | scalar | 2000 | 6e-16 |
 | `swang2` | 3169 | 3182 ms | 3169 | 4e-15 | 7.7 ms | multifrontal | 3169 | 1e-16 |
 | `raefsky2` | 3242 | 3095 ms | 3242 | 5e-15 | 622 ms | multifrontal | 3242 | 4e-16 |
-| `cell2` | 7055 | 66.6 s | 7054 | 5e-15 | 20 ms | multifrontal | 7054 | 3e-16 |
+| `cell2` | 7055 | 66.6 s | 7054 | 5e-15 | 20 ms | multifrontal | 7054 | 2e-16 |
 | `nemeth01` | 9506 | 92.4 s | 9506 | 2e-15 | 37 ms | multifrontal | 9506 | 3e-16 |
 | `cryg10000` | 10000 | 210 s | 9999 | **1e-8** | 81 ms | multifrontal | 9999 | 1e-14 |
-| `sit100` | 10262 | 216 s | 10261 | 5e-15 | 222 ms | multifrontal | 10261 | 1e-15 |
+| `sit100` | 10262 | 216 s | 10261 | 5e-15 | 221 ms | multifrontal | 10261 | 2e-16 |
 | `ted_B_unscaled` | 10605 | 8.4 s | **9183** | 3e-11 | 8.2 ms | scalar | 10605 (err 4e-16) | 2e-23 |
 | `Trefethen_20000b` | 19999 | timeout |  |  | timeout | | | |
 | `spmsrtls` | 29995 | 117 ms | 29995 | 3e-16 | 18 ms | scalar | 29995 | 1e-16 |
-| `as-caida` | 31379 | timeout |  |  | 12.5 s | multifrontal | 7360 | 5e-16 |
-| `nnc1374` | 1374 | 243 ms | **1093** | 6e-12 | 43 ms | multifrontal | 1371 | 3e-15 |
+| `as-caida` | 31379 | timeout |  |  | 11.7 s | multifrontal | 7360 | 5e-16 |
+| `nnc1374` | 1374 | 243 ms | **1093** | 6e-12 | 43 ms | multifrontal | 1371 | 7e-16 |
 | `adder_dcop_11` | 1813 | 569 ms | **1793** | 3e-12 | 78 ms | multifrontal | 1813 (err 1e-11) | 1e-16 |
 | `cavity10` | 2597 | 943 ms | 2597 | 4e-15 | 18 ms | multifrontal | 2597 | 3e-16 |
 | `Chebyshev3` | 4101 | 3818 ms | 4100 | 2e-11 | 400 ms | multifrontal | 4099 | 1e-13 |
@@ -288,9 +289,9 @@ MultifrontalQR is **5–6400× faster, median 57×**.
 | `rw5151` | 5151 | 25.4 s | 5149 | **3e-7** | 331 ms | multifrontal | 5128 | 3e-13 |
 | `raefsky5` | 6316 | 2601 ms | **622** | 6e-10 | 51 ms | multifrontal | 6316 (err 3e-16) | 6e-17 |
 | `lhr10c` | 10672 | 134 s | 10672 | 2e-15 | 134 ms | multifrontal | 10670 | 3e-14 |
-| `foldoc` | 13356 | timeout |  |  | 16.4 s | multifrontal | 12919 | 3e-14 |
+| `foldoc` | 13356 | timeout |  |  | 14.6 s | multifrontal | 12919 | 2e-16 |
 | `circuit204` | 1020 | 121 ms | 1020 | 1e-15 | 2.7 ms | scalar | 1020 | 1e-16 |
-| `SmaGri` | 1059 | 42 ms | 511 | 3e-16 | 3.7 ms | multifrontal | 511 | 6e-16 |
+| `SmaGri` | 1059 | 42 ms | 511 | 3e-16 | 3.8 ms | multifrontal | 511 | 4e-16 |
 | `b2_ss` | 1089 | 56 ms | 1089 | 4e-16 | 0.74 ms | scalar | 1089 | 2e-16 |
 | `gre_1107` | 1107 | 180 ms | 1107 | 1e-15 | 8.8 ms | multifrontal | 1107 | 8e-17 |
 | `mahindas` | 1258 | 59 ms | 1258 | 6e-16 | 3.1 ms | multifrontal | 1258 | 4e-16 |

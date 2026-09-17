@@ -1,9 +1,9 @@
 # Testing
 
-*[← DirectLUSolvers](../README.md) · [RobustLU](RobustLU.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md) · [Parallelism](Parallelism.md)*
+*[← DirectLUSolvers](../README.md) · [RobustLU](RobustLU.md) · [SupernodalLU](SupernodalLU.md) · [SupernodalLDLT](SupernodalLDLT.md) · [LeftRightLU](LeftRightLU.md) · [PointBlockLU](PointBlockLU.md) · [MultifrontalQR](MultifrontalQR.md) · [HeaderOnlyMetis](HeaderOnlyMetis.md) · [Parallelism](Parallelism.md)*
 
 Every suite in `test/` — correctness, regression, and the benchmark drivers — is described
-here, for all three solvers and the header-only METIS port.
+here, for every solver and the header-only METIS port.
 
 The suites build with CMake and run under CTest. From the `DirectLUSolvers`
 directory:
@@ -139,30 +139,44 @@ quietly return a wrong one. `test_suitesparse` judges exactly that, reading
 `info()` **after** `solve()`, and additionally confirms that a flagged solve
 really was bad (flagging a good one would be its own defect).
 
-Results on the 23-matrix quick tier: **15 solved** to machine precision, **8
-returned a bad answer the solver flagged itself**, 0 tripped the fill guard.
-No unflagged wrong answers — the honesty machinery
-(`solveFailureThreshold`, the post-solve residual check) is exercised against
-matrices that genuinely defeat the solvers.
+Results on the 33-matrix quick tier, as the summary line counts them (by `SupernodalLU`):
+**22 solved** to at most 1e-6, **11 returned a bad answer the solver flagged itself**, 0 tripped
+the fill guard. `LeftRightLU` flags 7 of those 11 and solves the other four (`nnc1374`,
+`cavity10`, `b2_ss`, `fd12`). No unflagged wrong answers — the honesty machinery
+(`solveFailureThreshold`, the post-solve residual check) is exercised against matrices that
+genuinely defeat the solvers.
 
-**Why the 8 failures fail.** Diagnosed by comparing against `Eigen::SparseLU`
-(real partial pivoting) on the same systems, then sweeping the solver options:
+**Why the 11 failures fail.** Diagnosed by comparing against `Eigen::SparseLU` (real partial
+pivoting) on the same systems, then sweeping `SupernodalLU`'s options. Residuals, default
+flags (no `-mavx2 -mfma`), measured 2026-09-17:
 
-| matrix | psym | SparseLU | diagnosis |
-|---|---:|---|---|
-| `Chebyshev3` | 0.50 | solves 4e-20 | **matching**; `setMatching(false)` → 7e-17 |
-| `CAG_mat1916` | 0.30 | solves 1e-15 | **matching**; → 5e-16 |
-| `cavity10` | 0.94 | solves 2e-15 | **matching**; → 3.6e-16 |
-| `nnc1374` | 0.82 | solves 7e-16 | **matching**; → 4.2e-10 |
-| `lhr10c` | 0.01 | solves 5e-16 | **block size**; `setMaxBlockSize(0)` → 2.4e-16 |
-| `shyy41` | 0.72 | **fails** 1e-06 | the matrix |
-| `rw5151` | 0.49 | **fails** 7e-02 | the matrix |
-| `foldoc` | 0.48 | **fails** inf | structurally singular |
+| matrix | psym | SparseLU | default | `setMatching(false)` | MC64 | `setMaxBlockSize(0)` |
+|---|---:|---:|---:|---:|---:|---:|
+| `nnc1374` | 0.82 | 8e-16 | 1.9e-01 | **4.2e-10** | **2.4e-13** | 1.9e-01 |
+| `cavity10` | 0.94 | 2e-15 | 4.6e-04 | **3.5e-16** | **3.8e-16** | 3.1e-03 |
+| `Chebyshev3` | 0.50 | 3e-16 | 6.1e+94 | **7.3e-17** | **1.7e-16** | **1.5e-16** |
+| `CAG_mat1916` | 0.30 | 1e-15 | 9.3e+23 | **4.8e-16** | **4.7e-16** | 2.0e+20 |
+| `lhr10c` | 0.01 | 1e-15 | 8.1e+14 | inf | **2.4e-16** | **2.4e-16** |
+| `b2_ss` | 0.01 | 1e-16 | 5.8e+01 | 2.4e+69 | **2.0e-16** | **2.6e-16** |
+| `fd12` | 0.00 | 3e-16 | 4.0e+02 | 8.2e+104 | 3.3e-01 | **4.7e-16** |
+| `shyy41` | 0.72 | 4e-14 | 5.9e+07 | 7.9e+07 | 1.7e+07 | 5.9e+07 |
+| `rw5151` | 0.49 | **fails** 4e-01 | 1.7e+05 | 8.2e+02 | 3.0e+15 | 6.4e+04 |
+| `foldoc` | 0.48 | **fails** | 6.2e+85 | 2.3e+126 | 7.1e+59 | 1.1e+33 |
+| `SmaGri` | 0.00 | **fails** | 9.1e+05 | inf | 3.9e+25 | 7.0e-02 |
 
-So **5 of 8 are ours, not the matrix** — and **`setMatchingMethod(MatchingMethod::MC64)`
-fixes all five at once**, including `lhr10c`. See
+So **8 of 11 are ours, not the matrix**, and **`setMatchingMethod(MatchingMethod::MC64)` fixes
+6 of those 8** while leaving every matrix that already solved solved. Of the other two, `fd12`
+needs `setMaxBlockSize(0)` (or `LeftRightLU`, which solves it by default), and `shyy41` yields
+to nothing short of true partial pivoting — [`RobustLU`](RobustLU.md) reaches it through its
+`PointBlockLU` rung. The remaining three are the matrix: `SparseLU` fails too, `foldoc` is
+structurally singular, and `SmaGri` has numerical rank 511 of 1059
+([`MultifrontalQR`](MultifrontalQR.md#suitesparse-corpus-against-eigensparseqr)). See
 [Matching & diagonal pivoting](SupernodalLU.md#matching--diagonal-pivoting-robustness) for the
 mechanism and the cost trade-off.
+
+These residuals move with the floating-point code the compiler emits: built with
+`-mavx2 -mfma`, the default `SupernodalLU` solves `b2_ss` to 4e-16 and the list above is ten
+long. The classification — which of them are the solver's fault — does not change.
 
 **A finding worth knowing: pattern symmetry does not predict success.** The
 intuition that `psym == 1.00` is safe and `psym < 0.5` is doomed is wrong in
@@ -194,38 +208,82 @@ Three things it shows that a single cold factor+solve number cannot:
 - **Cold-start cost is excluded.** MKL's first `pardiso()` call spins up its thread pool; on a
   1015-row matrix that is ~500 ms against ~1 ms of real work, which makes an unwarmed PARDISO
   measurement meaningless.
-- **Which phase costs.** `analyzePattern` is a third of wall clock for METIS on `setfos_2` —
-  and it is exactly the phase you skip when refactorizing an unchanged pattern. Note the shape
-  of the table below at 16 threads: for METIS (78.8 ms analyze against 65.4 ms factor) and for
-  PARDISO (117.6 against 45.3) the symbolic phase is now the *larger* half.
+- **Which phase costs.** `analyzePattern` is more than half of wall clock for METIS on
+  `setfos_2` — and it is exactly the phase you skip when refactorizing an unchanged pattern. At
+  16 threads the symbolic phase is the *larger* half for METIS (101.9 ms analyze against 61.0 ms
+  factor) and for PARDISO (122.6 against 40.4).
 - **The ordering**, which on an unsymmetric pattern moves the result further than the choice of
-  solver does. Measured on `setfos_2` (n=3048, 238 nnz/row, symmetry 0.44), best of 5:
+  solver does. Measured 2026-09-17 on `setfos_2` (n=3048, 238 nnz/row, symmetry 0.44), best of 5:
 
   | configuration | thr | analyze | factor | solve | total | fill |
   |---|--:|--:|--:|--:|--:|--:|
-  | `LeftRightLU` AMD | 1 | 33.2 | 189.1 | 2.5 | 224.8 | 3,933,570 |
-  | `LeftRightLU` AMD | 16 | 34.6 | 92.0 | 2.6 | 129.1 | 3,933,570 |
-  | `LeftRightLU` COLAMD | 1 | 34.1 | 97.4 | 2.8 | 134.3 | 2,360,714 |
-  | **`LeftRightLU` COLAMD** | 16 | 33.5 | 60.5 | 2.6 | **96.7** | 2,360,714 |
-  | `LeftRightLU` METIS | 1 | 76.3 | 112.7 | 1.2 | 190.1 | 1,609,832 |
-  | `LeftRightLU` METIS | 16 | 78.8 | 65.4 | 1.2 | 145.3 | 1,609,832 |
-  | `SupernodalLU` AMD (on `Asym`) | 1 | 88.9 | 191.3 | 6.2 | 286.3 | 3,927,774 |
-  | `SupernodalLU` AMD (on `Asym`) | 16 | 88.7 | 91.5 | 5.6 | 185.9 | 3,927,774 |
-  | `Eigen::SparseLU` | 1 | 8.6 | 105.7 | 1.0 | 115.3 | 1,935,897 |
-  | MKL PARDISO | 1 | 94.4 | 110.2 | 4.4 | 209.0 | 1,563,528 |
-  | MKL PARDISO | 16 | 117.6 | 45.3 | 4.3 | 167.2 | 1,563,528 |
+  | `LeftRightLU` AMD | 1 | 55.8 | 137.7 | 2.0 | 195.4 | 3,844,854 |
+  | `LeftRightLU` AMD | 16 | 59.0 | 85.1 | 1.8 | 145.9 | 3,844,854 |
+  | `LeftRightLU` COLAMD | 1 | 56.6 | 74.7 | 3.4 | 134.7 | 2,349,388 |
+  | **`LeftRightLU` COLAMD** | 16 | 58.0 | 57.4 | 2.1 | **117.6** | 2,349,388 |
+  | `LeftRightLU` METIS | 1 | 101.9 | 80.6 | 1.1 | 183.6 | 1,629,952 |
+  | `LeftRightLU` METIS | 16 | 101.9 | 61.0 | 1.2 | 164.1 | 1,629,952 |
+  | `SupernodalLU` AMD (on `Asym`) | 1 | 94.5 | 146.1 | 4.9 | 245.5 | 3,927,774 |
+  | `SupernodalLU` AMD (on `Asym`) | 16 | 92.7 | 83.7 | 4.6 | 180.9 | 3,927,774 |
+  | `PointBlockLU` COLAMD (replay) | 1 | 6.2 | 392.6 | 2.5 | 401.3 | 1,935,546 |
+  | **`Eigen::SparseLU`** | 1 | 8.9 | 96.8 | 1.0 | **106.7** | 1,935,897 |
+  | MKL PARDISO | 1 | 99.4 | 116.3 | 4.6 | 220.2 | 1,563,528 |
+  | MKL PARDISO | 16 | 122.6 | 40.4 | 4.3 | 167.3 | 1,563,528 |
 
-  Two results worth reading twice. COLAMD carries 47% more fill than METIS and still factors
-  faster (39 wide supernodes against METIS's 321 narrow ones — the fatter dense blocks win the
+  Three results worth reading twice. COLAMD carries 44% more fill than METIS and still factors
+  faster (44 wide supernodes against METIS's 322 narrow ones — the fatter dense blocks win the
   difference back in BLAS-3 efficiency), so fill is a first-order proxy for cost and not more
-  than that. And with only 29 supernodes there is almost no assembly-DAG parallelism to find,
-  so what scaling either solver gets on this matrix comes from the chunked
-  intra-supernode path rather than from the schedule.
+  than that. With only 34 supernodes under AMD there is almost no assembly-DAG parallelism to
+  find, so what scaling either solver gets on this matrix comes from the chunked
+  intra-supernode path rather than from the schedule. And the fastest *cold* solve here is
+  `Eigen::SparseLU`, because `LeftRightLU`'s analysis (matching, block triangular form,
+  symmetrization, ordering, symbolic factorization) takes 57 ms where `SparseLU`'s takes 9. On a
+  refactorization, which skips that phase, `LeftRightLU` COLAMD is ahead at 60 ms to 98.
 
 Fill is printed as each solver reports it: ours and `Eigen::SparseLU` count the diagonal in
 both factors, PARDISO's `IPARM(18)` counts it once, so those columns are comparable only up to
 an offset of `n`. The exit code counts only *our* solvers failing `resid < 1e-6` — the
 benchmark is not a bug report against Eigen or MKL.
+
+## Which solver per matrix family
+
+`bench_setfos_samples` asks the question one level up from `bench_solvers`: not "which
+configuration for this matrix" but "which solver for this *kind* of matrix". It runs every solver
+in this library — plus `Eigen::SparseLU`, `Eigen::SparseQR` and BiCGSTAB/GMRES with ILUT, and on
+matrices verified numerically symmetric at run time also `SupernodalLDLT`, `SimplicialLDLT` and
+CG with incomplete Cholesky — over `setfosmatrices_samples/`: five pattern categories of real
+drift-diffusion and optics Jacobians, five examples each, one of them complex.
+
+```sh
+./build/bench_setfos_samples                        # ../setfosmatrices_samples
+./build/bench_setfos_samples --reps 5 path/to/samples
+./build/bench_setfos_samples --csv out.csv          # default analysis/benchmark_results.csv (git-ignored)
+```
+
+Like the other drivers it synthesizes `b = A·xTrue` rather than reading the samples' own
+right-hand sides, so every row carries a forward error as well as a residual; it warms each
+solver up and reports the best of N per phase. It is not a CTest target — the corpus lives
+outside the repository (`DLU_SETFOS_SAMPLES_DIR`).
+
+Measured 2026-09-17, best of 3, mean total time per category:
+
+| category | fastest | runner-up | `MultifrontalQR` | `Eigen::SparseQR` |
+|---|---|---|---:|---:|
+| complex unsymmetric, general sparse | `PointBlockLU` 0.38 ms | BiCGSTAB+ILUT 0.48 ms | 1.41 ms | 32.0 ms |
+| real symmetric tridiagonal | `PointBlockLU` 0.14 ms | BiCGSTAB+ILUT 0.20 ms | 0.43 ms | 1695 ms |
+| real unsymmetric banded | `PointBlockLU` 0.14 ms | BiCGSTAB+ILUT 0.19 ms | 0.51 ms | 286 ms |
+| real unsymmetric, general sparse | `PointBlockLU` 0.29 ms | `Eigen::SparseLU` 0.41 ms | 1.16 ms | 18.9 ms |
+| real unsymmetric tridiagonal | BiCGSTAB+ILUT 0.32 ms | GMRES+ILUT 0.33 ms | 1.31 ms | 535 ms |
+
+These matrices are small (n ≤ 4737), which is the regime where `PointBlockLU`'s scalar kernels win
+— see [its crossover](PointBlockLU.md#when-to-use-it). Every solver in the table solved all 25,
+with two exceptions that are reports rather than wrong answers: `RobustLU` declines two of the
+complex matrices as too ill-conditioned to guarantee any digits, and `SupernodalLU` flags one
+optics matrix's solve. `MultifrontalQR` picks its scalar engine on every one. The category labels
+come from one representative per structural group, so individual files can differ from their
+label: only one of the five "symmetric tridiagonal" examples is numerically symmetric at run
+time, and so is one of the "unsymmetric tridiagonal" ones — those two are the only matrices the
+symmetric solvers ran on.
 
 ## Does the block triangular form pay?
 
@@ -239,21 +297,21 @@ here can make that comparison: they all run the shipping configuration, where BT
 ./build/bench_btf --reps 15 ted_B     # one matrix, tighter estimate
 ```
 
-Measured 2026-08-26 over 44 matrices, best of 3 after a warm-up. The summary separates three
+Measured 2026-09-17 over 44 matrices, best of 3 after a warm-up. The summary separates three
 groups, because their answers have nothing to do with each other:
 
 | group | n | speedup (median) | fill | what it means |
 |---|---:|---|---|---|
 | irreducible (1 block) | 14 | 0.99x / 1.00x | 1.000x | BTF found nothing and cost one `O(n + nnz)` sweep. Every symmetric-pattern matrix is here. |
-| reducible, fill unchanged | 7 / 8 | 0.94x / 0.97x | 1.000x | The matrix split but the split bought no fill. **This group pays.** |
-| reducible, fill reduced | 23 / 22 | **1.24x / 1.57x** | 0.75x / 0.72x | What BTF is for. |
+| reducible, fill unchanged | 7 / 8 | 0.93x / 0.93x | 1.000x | The matrix split but the split bought no fill. **This group pays.** |
+| reducible, fill reduced | 23 / 22 | **1.20x / 1.35x** | 0.75x / 0.72x | What BTF is for. |
 
-(AMD / COLAMD.) Read the **median row** — 0.99x under AMD, 1.06x under COLAMD — alongside the
-corpus total of 1.10x / 1.30x. They disagree because the win is concentrated, not broad: under
-AMD 14 matrices gain 5% or more, 20 are unchanged within ±5%, and the total is dominated by
+(AMD / COLAMD.) Read the **median row** — 0.99x under AMD, 1.00x under COLAMD — alongside the
+corpus total of 1.16x / 1.29x. They disagree because the win is concentrated, not broad: under
+AMD 14 matrices gain 5% or more, 21 are unchanged within ±5%, 9 lose more than that, and the total is dominated by
 whichever matrix is slowest (`Pajek/foldoc` alone is most of it, which is why the total moves
 several points between runs while the medians do not). The big movers are
-`TSOPF_RS_b9_c6` 4.0x / 8.1x, `raefsky5` 3.8x / 5.8x, `raefsky6` 4.0x / 5.1x, `SmaGri` 8.4x / 4.4x
+`TSOPF_RS_b9_c6` 3.4x / 7.7x, `raefsky5` 3.8x / 5.9x, `raefsky6` 3.8x / 5.7x, `SmaGri` 8.0x / 6.9x
 and `bayer05` 2.8x / 2.4x.
 
 **Where BTF costs, the cost is entirely in `analyzePattern`.** Ordering many small blocks
@@ -262,11 +320,11 @@ untouched — confirmed at 15 repetitions, where the noise is well below the eff
 
 | matrix | blocks | analyze off→on | factor off→on | total |
 |---|---:|---|---|---|
-| `Bindel/ted_B_unscaled` | 4245 | 10.13 → **11.69** ms | 3.52 → 3.56 ms | 0.89x |
-| `tomography` | 37 | 3.72 → **4.24** ms | 3.47 → 3.65 ms | 0.90x |
-| `CPM/cz1268` | 2 | 1.80 → **2.00** ms | 0.92 → 0.92 ms | 0.93x |
+| `Bindel/ted_B_unscaled` | 4245 | 10.64 → **13.49** ms | 3.82 → 3.78 ms | 0.84x |
+| `tomography` | 37 | 3.76 → **4.46** ms | 3.55 → 3.67 ms | 0.90x |
+| `CPM/cz1268` | 2 | 1.97 → **2.29** ms | 1.02 → 1.01 ms | 0.91x |
 
-Worst confirmed case is ~15% of the symbolic phase and ~11% of a cold factor+solve — and
+Worst confirmed case is ~27% of the symbolic phase and ~16% of a cold factor+solve — and
 `analyzePattern` is exactly the phase a refactorization workflow skips, so in a Newton loop with
 a fixed pattern it amortizes to nothing. Three repetitions is too few to trust the per-group
 *extremes* (a single row's min swung 0.68x-1.91x between runs at `--reps 3`); the medians are

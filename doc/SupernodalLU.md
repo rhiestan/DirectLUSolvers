@@ -206,13 +206,13 @@ operation they describe has run at least once.
   diagonal (`false` indicates the matrix is structurally singular).
 
   > **Matching is not always an improvement — try turning it off if a solve fails.**
-  > Measured over the [SuiteSparse corpus](Testing.md#the-suitesparse-corpus): of 8 matrices whose
+  > Measured over the [SuiteSparse corpus](Testing.md#the-suitesparse-corpus): of 11 matrices whose
   > solve failed, **4 are fixed outright by `setMatching(false)`** (`Chebyshev3`
-  > 6e+94 → 7e-17, `CAG_mat1916` 4e+23 → 5e-16, `cavity10` 4.6e-04 → 3.6e-16,
-  > `nnc1374` 5.4e-01 → 4.2e-10) — and `Eigen::SparseLU` solves all four, so the
+  > 6e+94 → 7e-17, `CAG_mat1916` 9e+23 → 5e-16, `cavity10` 4.6e-04 → 3.5e-16,
+  > `nnc1374` 1.9e-01 → 4.2e-10) — and `Eigen::SparseLU` solves all four, so the
   > matrices are not at fault. Matching remains *essential* on others
-  > (`meg1` 5.9e-16 with, 1e+300 without; `gemat12` 1.6e-16 with, 7e+76 without),
-  > which is why it stays on by default.
+  > (`meg1` 6.6e-16 with, NaN without; `gemat12` 1.6e-16 with, 1e+81 without;
+  > `lhr10c`, `b2_ss` and `fd12` fail worse without it), which is why it stays on by default.
   >
   > The cause is that this is a maximum *transversal* that prefers large entries,
   > not a true maximum-weight (MC64) assignment — the header says so. The
@@ -243,11 +243,14 @@ operation they describe has run at least once.
      MUMPS/SuperLU_DIST. The transversal returns a permutation and nothing else.
 
   Measured over the [SuiteSparse corpus](Testing.md#the-suitesparse-corpus), MC64 **fixes
-  every one of the five failures that were the solver's fault rather than the
-  matrix's** — `Chebyshev3`, `CAG_mat1916`, `cavity10`, `nnc1374` and `lhr10c`
-  (the last of which otherwise needed `setMaxBlockSize(0)`) — and breaks nothing.
-  It also quietly improves others: `cavity17` goes from 197 bumped pivots to 0.
-  The three remaining failures are matrices `Eigen::SparseLU` cannot solve either.
+  six of the eight failures that are the solver's fault rather than the matrix's** —
+  `Chebyshev3`, `CAG_mat1916`, `cavity10`, `nnc1374`, `lhr10c` and `b2_ss` (the last two
+  otherwise need `setMaxBlockSize(0)`) — and breaks nothing: all 22 matrices that solve
+  without it still solve. It also quietly improves others: `cavity17` goes from 197 bumped
+  pivots to 0, `circuit204` from 38 to 0. Of the two it does not fix, `fd12` needs
+  `setMaxBlockSize(0)` and `shyy41` needs true partial pivoting; the three remaining
+  failures are matrices `Eigen::SparseLU` cannot solve either. See the
+  [per-matrix table](Testing.md#the-suitesparse-corpus).
 
   **Why it is not the default.** Cost is O(n) shortest-path searches rather than
   one greedy pass. On this project's `testdata/` that is free or better —
@@ -599,15 +602,15 @@ solver.compute(A);
   fill** (41.9M scalars, ~335 MB), matching MKL PARDISO's 41.1M and beating
   `Eigen::SparseLU`'s ~24.2x/85.1M-scalar/~680MB factor by roughly 2x. Even the *default* AMD
   ordering alone already beats SparseLU on fill here (~16.5x, 58.0M scalars) and is **faster in
-  absolute wall-clock time**: factor+solve 2.9s vs SparseLU's 8.7s (3.0x faster) vs PARDISO's
-  1.4s, all single-threaded (SupernodalLU ~2.1x behind PARDISO). `laoss_2` (100k rows, 1.4M nnz)
-  shows the same shape: 0.82s vs SparseLU's 2.1s (2.6x faster) vs PARDISO's 0.47s. `LeftRightLU`
-  tracks these numbers closely (2.7s / 0.74s on laoss_1/laoss_2, single-threaded) since it reuses
+  absolute wall-clock time**: factor+solve 2.7s vs SparseLU's 7.0s (2.6x faster) vs PARDISO's
+  1.5s, all single-threaded (SupernodalLU ~1.8x behind PARDISO). `laoss_2` (100k rows, 1.4M nnz)
+  shows the same shape: 0.75s vs SparseLU's 1.8s (2.4x faster) vs PARDISO's 0.61s. `LeftRightLU`
+  tracks these numbers closely (2.3s / 0.65s on laoss_1/laoss_2, single-threaded) since it reuses
   the same analysis pipeline and only its numeric core differs — see its own
   [Performance notes](LeftRightLU.md#performance-notes-honest-summary). **Give every solver its
-  threads before comparing**: at 16 threads PARDISO does `laoss_1` factor+solve in 0.80s against
-  `LeftRightLU`'s 1.31s and `SupernodalLU`'s 1.66s, so the gap narrows to ~1.6x rather than
-  widening. (Measured 2026-08-22 with `DirectLUSolvers/test/compare_testdata.cpp` and
+  threads before comparing**: at 16 threads PARDISO does `laoss_1` in 0.82s against
+  `LeftRightLU`'s 1.23s and `SupernodalLU`'s 1.45s (analyze + factor + solve, AMD for ours), so
+  the gap narrows to ~1.5x rather than widening. (Measured 2026-09-17 with `DirectLUSolvers/test/compare_testdata.cpp` and
   `test/bench_solvers.cpp`; the remaining gap to PARDISO is factorization *speed*, not fill.)
 - **Get the ordering direction right.** These solvers consume the fill-reducing permutation as the
   *inverse* of what `Eigen`'s `AMDOrdering`/`MetisOrdering` put in `indices()` (see the note in
@@ -615,9 +618,9 @@ solver.compute(A);
   inflates fill 250-350x on strongly directional 3D matrices, at unchanged residuals. If you write
   a custom `OrderingType`, return the same convention as Eigen's built-in orderings.
 - Parallel scaling benefits the most from `setIntraSupernodeParallelism` (on by default) on
-  matrices with a wide, well-separated elimination tree (e.g. 2D/3D discretizations) — 3.21x
-  measured at 32 threads on a 30³ 3D Laplacian, versus 1.15x from level-parallelism alone.
-  Note that on the *whole* pipeline the serial `analyzePattern()` then dominates (~43% of
+  matrices with a wide, well-separated elimination tree (e.g. 2D/3D discretizations) — 3.18x
+  measured at 32 threads on a 30³ 3D Laplacian, versus 1.14x from level-parallelism alone.
+  Note that on the *whole* pipeline the serial `analyzePattern()` then dominates (~46% of
   factor+solve on `laoss_1` at 32 threads), so total speedup is well below the factorization
   figure. Expect the peak somewhere around 16 threads on a 16-core part, not at 32: the
   workload is memory-bound and the second SMT thread per core adds no bandwidth. See

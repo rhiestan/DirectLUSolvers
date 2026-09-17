@@ -17,13 +17,13 @@ Numeric factorization parallelizes two ways, both driven by the same `Executor`:
    single big supernode's GEMM/TRSM work across the executor when a level is too narrow to keep
    the machine busy on its own — this is what breaks the "serial tail" of the few huge
    root-separator supernodes and is responsible for most of the speedup on well-separated
-   matrices (measured 3.21x on a 30³ 3D Laplacian at 32 threads, versus 1.15x
+   matrices (measured 3.18x on a 30³ 3D Laplacian at 32 threads, versus 1.14x
    from level parallelism alone; see [Parallel scaling](#parallel-scaling-measured)).
 
 `LeftRightLU` has the same two knobs in a different shape: a barrier-free DAG in place of the
 level barrier, and the same `setIntraSupernodeParallelism` switch, which there carves the narrow
 top levels out of the DAG phase and sweeps them afterwards with the pool applied inside each
-supernode. The split matters for the same reason and by the same order (1.18x → 3.08x on the
+supernode. The split matters for the same reason and by the same order (1.19x → 3.01x on the
 same matrix).
 
 [`SupernodalLDLT`](SupernodalLDLT.md#parallelism) uses the level scheme and the same
@@ -220,7 +220,7 @@ why that is not optional here.
 ./build/bench_parallel --quick                    # synthetic matrices only
 ```
 
-Measured 2026-08-22 on an AMD Ryzen 9 5950X (16 physical cores, 32 logical),
+Measured 2026-09-17 on an AMD Ryzen 9 5950X (16 physical cores, 32 logical),
 `StdThreadExecutor` via `PooledExecutor`, clang 22 `-O3` at the default x86-64
 ISA, best of 5 after a discarded warm-up, AMD ordering. Times in ms; "speedup"
 is 1t → 32t.
@@ -238,46 +238,47 @@ sweep. The second row of each pair is the shipping default.
 
 | matrix | phase | 1t | 8t | 16t | 32t | speedup |
 |---|---|---:|---:|---:|---:|---:|
-| `laoss_1` (251k) | analyze (symbolic) | 643 | 634 | 620 | 634 | 1.02x  (serial) |
-| | SNLU factor, levels only | 2102 | 1391 | 1346 | 1348 | 1.56x |
-| | SNLU factor, levels+intra | 2104 | 958 | 921 | 808 | **2.60x** |
-| | LRLU factor, DAG only | 2110 | 1254 | 1225 | 1207 | 1.75x |
-| | LRLU factor, DAG+intra | 2119 | 838 | 770 | 714 | **2.97x** |
-| | solve, 1 rhs | 72.1 | 41.3 | 37.2 | 37.8 | **1.91x** |
-| | solve, 8 rhs | 210 | 118 | 108 | 107 | **1.96x** |
-| `laoss_2` (100k) | SNLU factor, levels only | 531 | 339 | 326 | 320 | 1.66x |
-| | SNLU factor, levels+intra | 530 | 262 | 224 | 212 | **2.50x** |
-| | LRLU factor, DAG only | 533 | 296 | 287 | 297 | 1.79x |
-| | LRLU factor, DAG+intra | 536 | 228 | 215 | 222 | **2.41x** |
-| `lap3d_30³` | SNLU factor, levels only | 603 | 528 | 527 | 523 | 1.15x |
-| | SNLU factor, levels+intra | 599 | 258 | 217 | 187 | **3.21x** |
-| | LRLU factor, DAG only | 621 | 529 | 527 | 526 | 1.18x |
-| | LRLU factor, DAG+intra | 627 | 261 | 244 | 204 | **3.08x** |
-| `lap2d_300²` | SNLU factor, levels only | 109 | 66.8 | 63.0 | 62.5 | 1.75x |
-| | SNLU factor, levels+intra | 108 | 57.7 | 52.5 | 53.1 | **2.04x** |
-| | LRLU factor, DAG only | 116 | 59.9 | 52.7 | 50.7 | **2.28x** |
-| | LRLU factor, DAG+intra | 116 | 58.4 | 52.8 | 61.1 | 1.90x |
+| `laoss_1` (251k) | analyze (symbolic) | 640 | 628 | 625 | 638 | 1.00x  (serial) |
+| | SNLU factor, levels only | 2115 | 1391 | 1355 | 1351 | 1.57x |
+| | SNLU factor, levels+intra | 2125 | 976 | 875 | 719 | **2.96x** |
+| | LRLU factor, DAG only | 2134 | 1308 | 1231 | 1247 | 1.71x |
+| | LRLU factor, DAG+intra | 2139 | 794 | 770 | 713 | **3.00x** |
+| | solve, 1 rhs | 72.2 | 41.5 | 38.8 | 38.8 | **1.86x** |
+| | solve, 8 rhs | 210 | 120 | 110 | 109 | **1.93x** |
+| `laoss_2` (100k) | SNLU factor, levels only | 543 | 337 | 330 | 334 | 1.63x |
+| | SNLU factor, levels+intra | 536 | 261 | 225 | 218 | **2.46x** |
+| | LRLU factor, DAG only | 543 | 307 | 288 | 298 | 1.82x |
+| | LRLU factor, DAG+intra | 535 | 233 | 224 | 234 | **2.29x** |
+| `lap3d_30³` | SNLU factor, levels only | 618 | 548 | 544 | 544 | 1.14x |
+| | SNLU factor, levels+intra | 618 | 267 | 223 | 194 | **3.18x** |
+| | LRLU factor, DAG only | 643 | 539 | 542 | 539 | 1.19x |
+| | LRLU factor, DAG+intra | 644 | 270 | 218 | 214 | **3.01x** |
+| `lap2d_300²` | SNLU factor, levels only | 109 | 75.6 | 65.1 | 64.9 | 1.69x |
+| | SNLU factor, levels+intra | 109 | 62.2 | 55.3 | 56.7 | **1.92x** |
+| | LRLU factor, DAG only | 116 | 60.0 | 56.4 | 55.9 | **2.08x** |
+| | LRLU factor, DAG+intra | 121 | 60.1 | 57.3 | 64.9 | 1.87x |
 
 Five things this says, none of them visible from a single-thread-count timing:
 
 1. **`solve()` parallelizes too** (~1.9x) — see [Parallel triangular
    solve](#parallel-triangular-solve). Even so it is only 3-7% of a
-   factor+solve here, so this matters most when you factor once and solve many
+   factor+solve on `laoss_1`, so this matters most when you factor once and solve many
    times.
 2. **`analyzePattern()` is serial and is often the *largest* remaining term.**
-   At 32 threads it is 43% of a single factor+solve on `laoss_1`, 48% on
-   `laoss_2`, and 56% on `lap2d_300²` — more than the factorization it feeds.
+   At 32 threads it is 46% of a single factor+solve on `laoss_1`, 47% on
+   `laoss_2`, and 54% on `lap2d_300²` — more than the factorization it feeds.
    Improving factorization scaling further buys little until this moves.
 3. **Parallelism INSIDE a supernode is the mechanism that pays, in both
-   solvers.** On the 3D Laplacian, levels alone give 1.15x and the DAG alone
-   1.18x; adding intra-supernode chunking takes them to 3.21x and 3.08x. Neither
-   across-supernode schedule exceeded 1.79x on any matrix here. See [Chunk
+   solvers.** On the 3D Laplacian, levels alone give 1.14x and the DAG alone
+   1.19x; adding intra-supernode chunking takes them to 3.18x and 3.01x. Neither
+   across-supernode schedule exceeded 1.82x on the FEM and 3D matrices, or 2.08x
+   even on the wide 2D tree. See [Chunk
    sizing](#chunk-sizing) for how the chunk extent is picked.
 4. **The two solvers now land in the same place on 3D**, because `LeftRightLU`
    gained a chunked tail sweep of its own — the earlier version of this table
-   showed it stuck at 1.19x on `lap3d_30³` for exactly the reason it no longer
-   is. On the wide 2D tree the tail sweep is a *cost*, not a gain (1.90x with it
-   against 2.28x without at 32 threads): there the levels it carves had real
+   showed it stuck near 1.2x on `lap3d_30³` for exactly the reason it no longer
+   is. On the wide 2D tree the tail sweep is a *cost*, not a gain (1.87x with it
+   against 2.08x without at 32 threads): there the levels it carves had real
    inter-supernode parallelism to give up, and the carve is a hard phase
    boundary in an otherwise barrier-free schedule.
 5. **Peak is at 16 threads about as often as at 32.** Half the rows above are
@@ -306,7 +307,8 @@ is perfect by construction and the only contended resource is memory. Whatever
 scaling that reaches is an upper bound on what *any* scheduler could achieve.
 
 Measured 2026-08-22 on an AMD Ryzen 9 5950X (**16 physical cores**, 32 logical,
-dual-channel DDR4):
+dual-channel DDR4), and re-checked 2026-09-17 within run-to-run spread — which is large in the
+K=32 column: two consecutive runs put `laoss_1` there at 7.4x and 10.6x:
 
 | matrix | factor size | K=1 | K=8 | K=16 | K=32 |
 |---|---|---:|---:|---:|---:|
@@ -323,7 +325,7 @@ does not fit in L3. The K=32 column shows what the extra SMT thread per core is
 worth here: 16 → 32 buys 1.35-1.48x, not 2x, and only because two threads on one
 core cover each other's memory stalls.
 
-So `laoss_1`'s 2.60x (`SupernodalLU`) and 2.97x (`LeftRightLU`) should be read
+So `laoss_1`'s 2.96x (`SupernodalLU`) and 3.00x (`LeftRightLU`) should be read
 against **~7.7x, not against 32**. Two multiplicative limits produce them:
 
 1. **Hardware**: 16 cores behave like ~7.7 for this workload (48% efficiency).
@@ -331,15 +333,15 @@ against **~7.7x, not against 32**. Two multiplicative limits produce them:
    lanes' worth of work near the root, which is what the chunked tail sweep
    exists to patch and only partly can.
 
-In absolute terms, `laoss_1` factors 26.6 GFLOP in 714 ms at 32 threads
-(`LeftRightLU`) — 37.2 GFLOP/s, against the 130.9 GFLOP/s the same machine
+In absolute terms, `laoss_1` factors 26.6 GFLOP in 713 ms at 32 threads
+(`LeftRightLU`) — 37.3 GFLOP/s, against the 130.9 GFLOP/s the same machine
 delivers on 32 independent copies of that factorization and the 94.5 GFLOP/s it
 delivers on 16. Read the shortfall as schedule, not as kernel: the kernels are
 the same Eigen GEMMs in both measurements.
 
 The practical consequences:
 
-- **There is real headroom on `laoss_1` — about 3x, not 12x.** Anyone planning
+- **There is real headroom on `laoss_1` — about 2.5x, not 10x.** Anyone planning
   around these solvers should size expectations to the ceiling table, not to the
   core count.
 - **Further gains must come from moving less memory**, not from more threads:
@@ -422,10 +424,10 @@ account for 80% of `lap3d_30³`'s factorize time and 76% of `laoss_1`'s.
 
 | matrix | factor (levels+intra) at 32t | speedup 1→32 |
 |---|---:|---|
-| `lap3d_30³` | 187 ms | **3.21x** |
-| `laoss_2` (100k) | 212 ms | **2.50x** |
-| `lap2d_300²` | 53.1 ms | 2.04x |
-| `laoss_1` (251k) | 808 ms | **2.60x** |
+| `lap3d_30³` | 194 ms | **3.18x** |
+| `laoss_2` (100k) | 218 ms | **2.46x** |
+| `lap2d_300²` | 56.7 ms | 1.92x |
+| `laoss_1` (251k) | 719 ms | **2.96x** |
 
 `lap2d_300²` is where this pays least: its elimination tree is wide enough that
 level parallelism already fills the lanes, so the chunked path has little left to
@@ -455,15 +457,15 @@ worker takes them immediately). Measured, it is slow enough at high thread
 counts to make `lap2d_300²` and `lap3d_30³` run *worse* at 32 threads than at
 16.
 
-Measured 2026-08-22 (same setup as the table above), LRLU factorization with
+Measured 2026-09-17 (same setup as the table above), LRLU factorization with
 the tail sweep OFF, so this row isolates the DAG and its queue:
 
 | matrix | 16t | 32t | speedup 1→32 |
 |---|---:|---:|---|
-| `lap2d_300²` | 52.7 ms | **50.7 ms** | **2.28x** |
-| `lap3d_30³` | 527 ms | 526 ms | 1.18x |
-| `laoss_2` (100k) | 287 ms | 297 ms | 1.79x |
-| `laoss_1` (251k) | 1225 ms | 1207 ms | 1.75x |
+| `lap2d_300²` | 56.4 ms | **55.9 ms** | **2.08x** |
+| `lap3d_30³` | 542 ms | 539 ms | 1.19x |
+| `laoss_2` (100k) | 288 ms | 298 ms | 1.82x |
+| `laoss_1` (251k) | 1231 ms | 1247 ms | 1.71x |
 
 Read this honestly: **queue design decides the outcome only where tasks are fine
 grained.** `lap2d_300²` factors in ~116 ms across 32919 supernodes, so per-task
@@ -471,7 +473,7 @@ queue overhead is a large fraction of task cost and queue throughput dominates;
 `laoss_1` spends 2.1 s over 49928 supernodes, so its tasks are far coarser and
 the queue is not the limiter there.
 
-The `lap3d_30³` row's 1.18x is therefore **not** a queue problem, and the fix
+The `lap3d_30³` row's 1.19x is therefore **not** a queue problem, and the fix
 was not a queue change. Near the root the DAG narrows to a chain of separator
 supernodes, so a scheduler that only parallelizes ACROSS supernodes runs out of
 work: VTune's threading analysis of this configuration measures 1.18 of the 8
@@ -486,11 +488,11 @@ into two phases is what makes it possible at all: the executor's `parallelFor`
 is fork-join and **not nestable**, and during the DAG phase every lane is
 already inside one, so ending the parallel region is what frees the pool. With
 it on, the same measurement reaches 2.72 of 8 lanes and 6.39 of 32, and
-`lap3d_30³` goes 1.18x → **3.08x**.
+`lap3d_30³` goes 1.19x → **3.01x**.
 
 The cost is real and shows up on the wide 2D tree, where the carved levels *did*
 have inter-supernode parallelism worth having and the tail sweep is a hard phase
 boundary in an otherwise barrier-free schedule: `lap2d_300²` at 32 threads is
-50.7 ms with the sweep off and 61.1 ms with it on. `setIntraSupernodeParallelism(false)`
+55.9 ms with the sweep off and 64.9 ms with it on. `setIntraSupernodeParallelism(false)`
 is the switch if your matrices look like that one.
 

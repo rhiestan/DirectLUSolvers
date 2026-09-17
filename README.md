@@ -1,10 +1,12 @@
 # DirectLUSolvers
 
-Three header-only sparse **direct LU** solvers for [Eigen](https://eigen.tuxfamily.org), plus a
-header-only reimplementation of METIS's nested-dissection ordering. Each solver is a template in
-the style of `Eigen::SparseLU` and shares its interface (`compute`/`analyzePattern`/`factorize`/
-`solve`, `matrixL()`/`matrixU()`, `transpose()`/`adjoint()`, `determinant()`, `info()`), so they
-are interchangeable at the call site — they differ in what kind of matrix they are good at.
+Header-only sparse **direct** solvers for [Eigen](https://eigen.tuxfamily.org): three LU
+factorizations, a symmetric `LDL^T`, a rank-revealing QR and a fallback ladder over them, plus a
+header-only reimplementation of METIS's nested-dissection ordering. The three LU solvers are
+templates in the style of `Eigen::SparseLU` and share its interface (`compute`/`analyzePattern`/
+`factorize`/`solve`, `matrixL()`/`matrixU()`, `transpose()`/`adjoint()`, `determinant()`,
+`info()`), so they are interchangeable at the call site — they differ in what kind of matrix they
+are good at. `SupernodalLDLT` and `MultifrontalQR` follow the same `compute`/`solve`/`info` shape.
 
 ```cpp
 #include <LeftRightLU.h>
@@ -66,8 +68,8 @@ Practical guidance:
   machine precision, in less time and less fill). It is off by default because it is a 2×-fill
   regression on a matrix that does not need it.
 - **Start with `LeftRightLU`** for anything else. It takes any pattern, matches `SupernodalLU`
-  on symmetric-pattern matrices, and is far ahead of it on unsymmetric ones (`gemat11` 8.2 ms
-  against 1476 ms).
+  on symmetric-pattern matrices, and is far ahead of it on unsymmetric ones (`gemat11` 9.8 ms
+  against 1117 ms).
 - **Use `PointBlockLU` when the factor stays sparse** — below roughly 100k stored scalars it is
   the fastest solver here and often the most accurate, because it never perturbs a pivot. Above
   that its scalar kernels lose to supernodal ones.
@@ -90,18 +92,19 @@ Practical guidance:
   it costs 102x the fill on `gemat11` — see
   [Unsymmetric nonzero patterns](doc/LeftRightLU.md#unsymmetric-nonzero-patterns).
 
-All three report failure honestly: `solve()` measures the true residual against the original `A`
-and downgrades `info()` to `NumericalIssue` rather than returning a bad answer quietly. That
-contract is itself tested, against matrices that genuinely defeat the solvers — see
+All three LU solvers, and `SupernodalLDLT`, report failure honestly: `solve()` measures the true
+residual against the original `A` and downgrades `info()` to `NumericalIssue` rather than
+returning a bad answer quietly. That contract is itself tested, against matrices that genuinely
+defeat the solvers — see
 [The SuiteSparse corpus](doc/Testing.md#the-suitesparse-corpus).
 
 ## Requirements
 
-The core solvers (`SupernodalLU.h`, `LeftRightLU.h`, `PointBlockLU.h`, and the shared
-`SupernodalLUExecutor.h` / `SupernodalLUMatching.h` / `SupernodalLUSupport.h`) need only Eigen and
-a C++17 compiler — no external dependencies, no linking beyond your usual Eigen setup. Everything
-else in the table below is an **opt-in** header that pulls in one extra dependency, listed
-per-header. This mirrors Eigen's own `*Support` module convention: the base solvers stay
+The core solvers (`SupernodalLU.h`, `LeftRightLU.h`, `PointBlockLU.h`, `SupernodalLDLT.h`,
+`MultifrontalQR.h`, `RobustLU.h`, and the shared `SupernodalLUExecutor.h` /
+`SupernodalLUMatching.h` / `SupernodalLUSupport.h`) need only Eigen and a C++17 compiler — no
+external dependencies, no linking beyond your usual Eigen setup. Everything else in the table
+below is an **opt-in** header that pulls in one extra dependency, listed per-header. This mirrors Eigen's own `*Support` module convention: the base solvers stay
 dependency-free so you only pay for what you use.
 
 ## Quick start
@@ -165,6 +168,7 @@ solver.factorize(A2);
 | `CMakeLists.txt` | Builds and registers every suite with CTest. See [Testing](doc/Testing.md). |
 | `test/test_supernodal_lu.cpp` | Correctness tests (dependency-free — only needs Eigen). |
 | `test/test_leftright_lu.cpp` | `LeftRightLU` correctness tests (dependency-free; `-pthread` for the parallel-vs-serial test). |
+| `test/test_supernodal_ldlt.cpp` | `SupernodalLDLT` against `Eigen::SimplicialLDLT` and dense `LDLT`: that only one triangle of the input is read and only one triangle of the factor computed, 2×2 pivots, inertia, matching, and the transposed backsolve. |
 | `test/test_btf.cpp` | Block triangular form: the decomposition on graphs whose block structure is known by construction, and the solver with BTF on against BTF off. See [LeftRightLU testing](doc/LeftRightLU.md#testing). |
 | `test/test_condition_estimate.cpp` | Condition estimation and error bounds: the estimator against closed-form and dense references, the backward error against its defining properties, and the promise that a default solve pays nothing for either. |
 | `test/test_extended_residual.cpp` | Error-free transformations, the compensated residual, and the forward-vs-backward error claim — on integer systems, so there is an exact answer to converge to. |
@@ -181,7 +185,8 @@ solver.factorize(A2);
 | `test/test_suitesparse.cpp` | Correctness sweep over the curated SuiteSparse corpus, including matrices these solvers cannot handle. See [The SuiteSparse corpus](doc/Testing.md#the-suitesparse-corpus). |
 | `test/matrices/fetch_suitesparse.py` | Downloads the corpus named by `suitesparse.manifest` into a git-ignored `cache/`. No third-party dependency. |
 | `test/matrices/suitesparse.manifest` | The checked-in, human-curated corpus definition. |
-| `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
+| `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) and LeftRightLU against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
+| `test/bench_setfos_samples.cpp` | Every solver here plus Eigen's direct and iterative ones over the `setfosmatrices_samples/` category corpus; raw rows to `analysis/benchmark_results.csv`. See [Which solver per matrix family](doc/Testing.md#which-solver-per-matrix-family). |
 | `test/bench_parallel.cpp` | Thread-count scaling sweep with per-phase timing (analyze / factor / solve), per mechanism. See [Parallel scaling](doc/Parallelism.md#parallel-scaling-measured). |
 | `test/bench_ceiling.cpp` | What the *machine* can deliver, via independent concurrent factorizations — the upper bound any scheduler could reach. See [The machine ceiling](doc/Parallelism.md#the-machine-ceiling). |
 | `test/bench_btf.cpp` | Block triangular form on against off, the one comparison no other benchmark makes — every other runs the shipping configuration, where BTF is simply on. See [Does the block triangular form pay?](doc/Testing.md#does-the-block-triangular-form-pay). |
@@ -197,6 +202,7 @@ solver.factorize(A2);
 | `test/testing/Check.h` | Shared PASS/FAIL reporting and timing used by every suite. |
 | `test/testing/MatrixMarket.h` | MatrixMarket reader: coordinate + array formats, real/integer/complex/pattern fields, general/symmetric/skew-symmetric/hermitian symmetries. |
 | `test/testing/TestMatrices.h` | Deterministic matrix generators (2D/3D Laplacians, random symmetric-pattern, weak-diagonal) and the `symmetrizePattern`/`patternIsSymmetric` helpers. |
+| `test/testing/MetisGraph.h` | The symmetrized graph exactly as `Eigen::MetisOrdering` builds it, so the METIS-comparison suites feed both sides identical input. |
 | `test/testing/TestData.h` | The benchmark-matrix registry: one list of `testdata/` matrices, with size tiers, shared by every suite. |
 
 ## Building and testing

@@ -25,20 +25,20 @@ for (/* each Newton step */) {
 matrices". Symmetrizing an unsymmetric pattern can cost enormous fill, and avoiding that is
 what this solver buys; but a scalar column algorithm runs at roughly a fifth of the throughput
 of a supernodal one, so once the factor densifies the fill advantage is spent and
-`LeftRightLU` wins. Measured 2026-09-13, single-threaded, best of 5, COLAMD ordering,
+`LeftRightLU` wins. Measured 2026-09-17, single-threaded, best of 5, COLAMD ordering,
 `bench_solvers` (PointBlockLU timed on its **replay** — the call the target workload actually
 makes; its `analyze` column is paid once):
 
 | matrix | n | PointBlockLU fill / replay+solve | LeftRightLU fill / factor+solve | `Eigen::SparseLU` |
 |---|---:|---:|---:|---:|
-| `setfos` | 1015 | **4,080** / **0.04 ms** | 116,602 / 1.76 ms | 4,080 / 0.14 ms |
-| `bayer05` | 3268 | 77,462 / **1.26 ms** | **58,036** / 4.33 ms | 126,396 / 5.24 ms |
-| `gemat11` | 4929 | **79,614** / **1.54 ms** | 121,294 / 2.90 ms | 86,476 / 4.33 ms |
-| `tomography` | 500 | **46,540** / **2.13 ms** | 164,836 / 4.55 ms | 91,650 / 5.50 ms |
-| `sherman1` | 1000 | **32,916** / **0.73 ms** | 40,884 / 0.87 ms | 31,900 / 1.11 ms |
-| `laoss_3` | 4180 | 731,852 / 37.4 ms | 1,210,476 / **23.8 ms** | 731,852 / 32.5 ms |
-| `YaleB_10NN` | 2414 | 1,232,024 / 229.1 ms | 1,638,482 / **82.4 ms** | 1,226,238 / 111.8 ms |
-| `setfos_2` | 3048 | 1,935,546 / 402.6 ms | 2,349,388 / **102.1 ms** | 1,935,897 / 111.2 ms |
+| `setfos` | 1015 | **4,080** / **0.04 ms** | 116,602 / 1.82 ms | 4,080 / 0.28 ms |
+| `bayer05` | 3268 | 77,462 / **1.18 ms** | **58,036** / 4.40 ms | 126,266 / 5.32 ms |
+| `gemat11` | 4929 | **79,614** / **1.53 ms** | 121,294 / 3.24 ms | 86,476 / 4.54 ms |
+| `tomography` | 500 | **46,540** / **1.99 ms** | 164,836 / 4.05 ms | 91,650 / 5.18 ms |
+| `sherman1` | 1000 | **32,916** / **0.66 ms** | 40,884 / 0.82 ms | 31,900 / 1.05 ms |
+| `laoss_3` | 4180 | 731,852 / 34.4 ms | 1,210,476 / **20.4 ms** | 731,852 / 30.6 ms |
+| `YaleB_10NN` | 2414 | 1,232,024 / 207.2 ms | 1,638,482 / **67.7 ms** | 1,226,238 / 96.8 ms |
+| `setfos_2` | 3048 | 1,935,546 / 379.3 ms | 2,349,388 / **81.4 ms** | 1,935,897 / 96.8 ms |
 
 Every row is the shipping configuration, so the `solve` half of each includes the residual check
 each solver runs by default — see [What it costs](#what-it-costs) for what that is worth here.
@@ -51,11 +51,14 @@ scalar one has arithmetic on blocks that small.
 
 **The crossover sits near 100k stored scalars in the factor.** Below it `PointBlockLU` is the
 fastest solver in this project — on `setfos`, `gemat11`, `sherman1`, `tomography` and
-`bayer05` it beats `Eigen::SparseLU` and MKL PARDISO outright. Above it, use `LeftRightLU`.
+`bayer05` it beats `Eigen::SparseLU` outright, and MKL PARDISO's refactorization on `setfos`,
+`bayer05` and `gemat11`. PARDISO's is faster on `tomography` (0.85 ms against 1.99) and
+`sherman1` (0.58 against 0.66), matrices on which it also carries less fill. Above the
+crossover, use `LeftRightLU`.
 
 It is often more *accurate* too, because it never perturbs a pivot: on `gemat11` its solve
-error is 8.8e-13 against `LeftRightLU`'s 4.3e-08, on `tomography` 6.8e-14 against 7.2e-09,
-and on the near-singular `bayer05` 1.1e-03 against `Eigen::SparseLU`'s 8.3e+00.
+error is 4.4e-13 against `LeftRightLU`'s 6.2e-09, on `tomography` 6.2e-14 against 5.2e-09,
+and on the near-singular `bayer05` 2.8e-04 against `Eigen::SparseLU`'s 1.0e+01.
 
 Equilibration iterates to convergence rather than a fixed sweep count, which matters at this
 scale: the sweep is O(nnz) and runs on every replay, so a fixed eight sweeps was 80% of
@@ -90,7 +93,7 @@ Two structural reasons, either sufficient on its own:
    `YaleB_10NN`, 1.01x on `tomography`, 1.25x on `setfos`, and reaches only 3.3x on `bayer05`.
    A 2-D Laplacian control scores just **1.4x**, so this is not a quirk of these matrices: it is
    the same fact the [parallel scaling](Parallelism.md#parallel-scaling-measured) section records for the
-   supernodal solvers, where level/DAG parallelism alone never exceeded 1.79x and all the real
+   supernodal solvers, where level/DAG parallelism alone never exceeded 2.1x and all the real
    scaling came from chunking *inside* dense panels. PointBlockLU has no dense panels to
    chunk — having none is the point of it.
 2. **The tasks are too small to schedule.** A column of `bayer05`'s replay costs ~350 ns, while
