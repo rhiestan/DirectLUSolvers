@@ -157,6 +157,48 @@ void checkHandBuiltGraphs() {
     xadj[static_cast<std::size_t>(n)] = static_cast<idx_t>(adjncy.size());
     checkGraph("edge: complete graph K60", xadj, adjncy);
   }
+  // One dense hub in a large graph. CompressGraph keys every vertex by the sum
+  // of its neighbour indices, and the hub's sum passes 2^31: the reference's
+  // idx_t wraps, and the port must wrap to the same bits (it accumulates in
+  // the unsigned type for exactly this case) or the sort that picks each
+  // merged group's representative orders differently.
+  {
+    const idx_t n = 70000;
+    std::vector<std::vector<idx_t>> adj(static_cast<std::size_t>(n));
+    for (idx_t i = 1; i < n; ++i) {
+      adj[0].push_back(i);
+      adj[static_cast<std::size_t>(i)].push_back(0);
+      if (i + 1 < n && i % 3 != 0) {
+        adj[static_cast<std::size_t>(i)].push_back(i + 1);
+        adj[static_cast<std::size_t>(i) + 1].push_back(i);
+      }
+    }
+    std::vector<idx_t> xadj(static_cast<std::size_t>(n) + 1, 0);
+    std::vector<idx_t> adjncy;
+    for (idx_t i = 0; i < n; ++i) {
+      xadj[static_cast<std::size_t>(i)] = static_cast<idx_t>(adjncy.size());
+      adjncy.insert(adjncy.end(), adj[static_cast<std::size_t>(i)].begin(), adj[static_cast<std::size_t>(i)].end());
+    }
+    xadj[static_cast<std::size_t>(n)] = static_cast<idx_t>(adjncy.size());
+    checkGraph("edge: dense hub, compression key overflows int32 (n=70000)", xadj, adjncy);
+  }
+  // A connected component plus more isolated vertices than MMDSWITCH: the
+  // first separator leaves an EDGELESS side too large to recurse into, which
+  // is ordered by MMD on an empty adjacency (the null-pointer path).
+  {
+    const idx_t n = 400;
+    std::vector<idx_t> xadj(static_cast<std::size_t>(n) + 1, 0);
+    std::vector<idx_t> adjncy;
+    for (idx_t i = 0; i < n; ++i) {
+      xadj[static_cast<std::size_t>(i)] = static_cast<idx_t>(adjncy.size());
+      if (i < 200) {  // a path on the first 200 vertices; the other 200 are isolated
+        if (i > 0) adjncy.push_back(i - 1);
+        if (i + 1 < 200) adjncy.push_back(i + 1);
+      }
+    }
+    xadj[static_cast<std::size_t>(n)] = static_cast<idx_t>(adjncy.size());
+    checkGraph("edge: path + 200 isolated vertices (edgeless MMD subgraph)", xadj, adjncy);
+  }
 }
 
 // Synthetic grids sized to straddle both sides of every size threshold in

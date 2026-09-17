@@ -213,6 +213,14 @@ Four suites, each answering a different question:
   `MetisOrdering` element-wise, identical solver fill (`nnzL`/`nnzU`) through both `SupernodalLU`
   and `LeftRightLU`, and — built with `DLU_WITH_METIS=OFF` — that it links and passes with no
   METIS or GKlib on the link line at all, producing byte-identical residuals to the METIS build.
+  It also runs the graph shapes at the algorithm's boundaries standalone, in every build: isolated
+  vertices past `MMDSWITCH` (a separator side with no edges at all, ordered by MMD on an empty
+  adjacency), cloned vertices that compress by more than 1.5× (the two-trial separator path), a
+  hub whose `CompressGraph` key — the sum of its neighbour indices — passes 2³¹ and must wrap to
+  the reference's bits rather than overflow, star and complete graphs, the empty matrix, and
+  uncompressed input. Each has to give valid, mutually inverse, reproducible permutations on both
+  the exact and the parallel path. The oracle suite above compares the same hub and edgeless
+  shapes against METIS when it is linked.
 - **`test_header_only_metis_parallel`** — the determinism gate for the parallel path, which links
   no METIS because its oracle is its own serial run. It pins thread-count invariance (N threads
   must give the byte-identical permutation to serial, for every N — this is the race detector),

@@ -22,6 +22,7 @@
 #define DIRECTLUSOLVERS_HEADER_ONLY_METIS_COMPRESS_H
 
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #include "Graph.h"
@@ -51,10 +52,21 @@ std::unique_ptr<Graph<IndexT, RealT>> compressGraph(IndexT nvtxs, const IndexT* 
   std::vector<IndexKeyValue<IndexT>> keys(static_cast<std::size_t>(nvtxs));
 
   /* Compute a key for each adjacency list */
+  //
+  // The key is the plain sum of a vertex's neighbour indices, and on a dense
+  // row of a large graph that sum exceeds the index type: a vertex adjacent to
+  // 70k others already passes 2^31. The reference lets its idx_t wrap (signed
+  // overflow, undefined in C but two's-complement in every build it ships in),
+  // and the wrapped value is what its sort then orders by. Accumulating in the
+  // unsigned type and converting back gives exactly those bits with defined
+  // behaviour, so the tie-breaking -- and the representative each merged group
+  // gets -- stays identical to the reference.
+  typedef typename std::make_unsigned<IndexT>::type UIndexT;
   for (i = 0; i < nvtxs; i++) {
-    k = 0;
-    for (j = xadj[i]; j < xadj[i + 1]; j++) k += adjncy[j];
-    keys[static_cast<std::size_t>(i)].key = k + i; /* Add the diagonal entry as well */
+    UIndexT sum = 0;
+    for (j = xadj[i]; j < xadj[i + 1]; j++) sum += static_cast<UIndexT>(adjncy[j]);
+    sum += static_cast<UIndexT>(i); /* Add the diagonal entry as well */
+    keys[static_cast<std::size_t>(i)].key = static_cast<IndexT>(sum);
     keys[static_cast<std::size_t>(i)].val = i;
   }
 

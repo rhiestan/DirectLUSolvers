@@ -320,6 +320,14 @@ void mmdOrder(Graph<IndexT, RealT>* graph, IndexT* order, IndexT lastvtx) {
   for (IndexT i = 0; i < k; i++) adjncy[static_cast<std::size_t>(i)]++;
   for (IndexT i = 0; i <= nvtxs; i++) xadj[static_cast<std::size_t>(i)]++;
 
+  // genmmd's Fortran adjustment decrements every array pointer once on entry.
+  // A subgraph with no edges at all (isolated vertices split off by a
+  // separator) has an EMPTY adjncy, whose data() may be null, and offsetting a
+  // null pointer is undefined behaviour (UBSan reports it). One spare element
+  // gives the pointer something to point at; the 1-based xadj is all ones for
+  // such a graph, so genmmd never reads or writes it.
+  if (adjncy.empty()) adjncy.assign(1, IndexT(0));
+
   std::vector<IndexT> perm(static_cast<std::size_t>(nvtxs) + 5);
   std::vector<IndexT> iperm(static_cast<std::size_t>(nvtxs) + 5);
   std::vector<IndexT> head(static_cast<std::size_t>(nvtxs) + 5);
