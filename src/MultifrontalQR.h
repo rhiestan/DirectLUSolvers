@@ -37,6 +37,19 @@
 // blocked (compact-WY) Householder transformations, and independent subtrees of
 // the elimination tree run in parallel through the executor.
 //
+// TWO ENGINES
+//
+// The multifrontal engine pays per front (assembly, sorting, dense blocks with
+// amalgamation zeros); while R stays sparse that costs more than the
+// arithmetic. A scalar left-looking engine (CSparse's cs_qr, with its row
+// assignment) computes the same factorization in compact sparse storage.
+// Scaling, verification, the deferred block, solves and refinement are shared.
+// Engine::Auto chooses by how FULL R's columns are, measured: the scalar engine
+// wins at up to ~38 entries per column even with 250k entries, and loses at 69
+// per column with only 35k. Its structure is static, so it defers every
+// dependent column into the SVD block instead of dropping it in place; Auto
+// hands a matrix with many of them to the multifrontal engine.
+//
 // HOW RANK IS DECIDED -- AND CHECKED
 //
 // Rank is decided in two stages, because the cheap stage alone is known to fail.
@@ -152,6 +165,28 @@ enum class Solution { MinimumNorm, Basic };
  */
 enum class Scaling { Auto, RowsAndColumns, Columns, None };
 
+/** Which factorization engine computes R and Q. Everything else -- scaling,
+ *  rank verification, the SVD-decided deferred block, solves, refinement -- is
+ *  shared.
+ *
+ *   Multifrontal  dense fronts with blocked Householder kernels and tree
+ *                 parallelism. What pays once R has real fill.
+ *   Scalar        left-looking column-by-column Householder QR in compact sparse
+ *                 storage (CSparse's cs_qr, with its row assignment). No dense
+ *                 fronts, no per-front bookkeeping: the faster engine while R
+ *                 stays sparse. Serial.
+ *   Auto          Scalar when the symbolic nnz(R) is small, or moderate and
+ *                 spread thin (few entries per column); Multifrontal otherwise.
+ *                 See setScalarEngineThreshold / setScalarEngineDensity.
+ *
+ * What decides between them, measured over 70 matrices: not the size of R but
+ * how DENSE its columns are. Dense kernels pay once a column carries a few
+ * dozen entries; below that the scalar engine's lack of per-front bookkeeping
+ * wins even at 250k entries (spmsrtls, 7 per column: 2.3x), and above it the
+ * multifrontal engine wins even at 35k (a 3D Laplacian, 69 per column).
+ */
+enum class Engine { Auto, Multifrontal, Scalar };
+
 namespace detail {
 
 // 2^e with e chosen so that value * 2^e lies in [0.5, 1): the power of two
@@ -244,8 +279,14 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
    *  step (empty if verification is off or r == 0). They estimate sigma_r,
    *  sigma_{r-1}, ... of the scaled matrix: exact for a small R11 (dense SVD),
    *  converged Ritz values otherwise. Compare the first against droppedNorm():
-   *  the ratio is the size of the gap the rank decision rests on. */
+   *  the ratio is the size of the gap the rank decision rests on.
+   *
+   *  When R11 is far from the threshold the check stops early (see
+   *  setThoroughVerification) and this holds a single value,
+   *  1 / (sqrt(r) ||R11^-1||_1) -- a lower bound on sigma_min up to the accuracy
+   *  of the norm estimate; singularValuesAreBound() says which. */
   const RealVector& smallestSingularValues() const { return m_sigma; }
+  bool singularValuesAreBound() const { return m_sigmaIsBound; }
 
   /** True when verification ran and found no singular value of R11 at or below
    *  absoluteRankThreshold() -- i.e. no column dependency was missed. False when
@@ -300,6 +341,8 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   Index largestFrontEntries() const { return m_largestFront; }
   /** The ordering the analysis ended up using (Auto resolves to one). */
   multifrontal_qr::Ordering orderingUsed() const { return m_sym.ordering; }
+  /** The engine the analysis ended up using (Auto resolves to one). */
+  multifrontal_qr::Engine engineUsed() const { return m_engineUsed; }
 
   /** Row and column equilibration factors (powers of two): the factored matrix
    *  is diag(rowScaling()) * A * diag(colScaling()). */
@@ -363,6 +406,24 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
 
   // --- options --------------------------------------------------------------
 
+  void setEngine(multifrontal_qr::Engine e) { m_engine = e; }
+  multifrontal_qr::Engine engine() const { return m_engine; }
+  /** Engine::Auto picks the scalar engine when the symbolic nnz(R) is at most
+   *  this (default 25000) regardless of its density... */
+  void setScalarEngineThreshold(Index nnzR) { m_scalarThreshold = nnzR; }
+  Index scalarEngineThreshold() const { return m_scalarThreshold; }
+  /** ... and, beyond that, while nnz(R) stays within both perColumn * n
+   *  (default 38) and maxNnzR (default 500000). */
+  void setScalarEngineDensity(double perColumn, Index maxNnzR) {
+    m_scalarDensity = perColumn;
+    m_scalarCap = maxNnzR;
+  }
+  /** Engine::Auto abandons the scalar engine for a matrix whose deferred block
+   *  would exceed this many columns (default 64): the scalar engine defers
+   *  every dependent column into the dense SVD block, which the multifrontal
+   *  engine avoids by dropping such columns in place. */
+  void setScalarDeferralLimit(Index columns) { m_scalarDeferLimit = columns; }
+
   void setOrdering(multifrontal_qr::Ordering o) { m_ordering = o; }
   multifrontal_qr::Ordering ordering() const { return m_ordering; }
   void setSolution(multifrontal_qr::Solution s) { m_solution = s; }
@@ -382,6 +443,11 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   /** Check the rank decision and repair it (default on). See the header. */
   void setRankVerification(bool on) { m_verifyRank = on; }
   bool rankVerification() const { return m_verifyRank; }
+  /** Run the full singular-value iteration even when a condition estimate
+   *  already places R11 more than 1000x above the threshold (default off). The
+   *  shortcut costs a few solves instead of a few dozen; it can only be fooled
+   *  if the 1-norm estimate is off by more than that margin. */
+  void setThoroughVerification(bool on) { m_thoroughVerification = on; }
   /** Bound on verification refactorizations (default 8). */
   void setMaxRepairs(Index n) { m_maxRepairs = n; }
   /** R11 order up to which verification uses a dense SVD (default 24). */
@@ -470,6 +536,64 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
     std::vector<StorageIndex> slots;
   };
 
+  // --- scalar engine ----------------------------------------------------------
+  //
+  // Internal column k < nLive is live and its pivot row is slot k (the row
+  // assignment guarantees one); columns >= nLive are the deferred block. Slots
+  // are rows after the assignment, plus fictitious empty rows where a column
+  // has none of its own (slots >= rows()).
+  struct ScalarSymbolic {
+    multifrontal_qr::Ordering ordering = multifrontal_qr::Ordering::COLAMD;
+    std::vector<StorageIndex> internalToOrig, origToInternal;
+    Index nLive = 0;
+    Index slots = 0;
+    std::vector<StorageIndex> parent;     // column elimination tree
+    std::vector<StorageIndex> leftmost;   // per original row: first internal column, -1 if empty
+    std::vector<StorageIndex> rowToSlot;  // original row -> slot
+    std::vector<Index> colPtr;            // A by internal column: original rows, source positions
+    std::vector<StorageIndex> colRows;
+    std::vector<Index> entrySrc;
+    Index predictedNnzR = 0;
+  };
+  struct ScalarFactor {
+    // R by column: live column k ends with its diagonal; a deferred column holds
+    // only its entries in live rows.
+    std::vector<Index> Rp;
+    std::vector<StorageIndex> Ri;
+    std::vector<Scalar> Rx;
+    // Householder vectors of the live columns (first entry: slot k, value 1).
+    std::vector<Index> Vp;
+    std::vector<StorageIndex> Vi;
+    std::vector<Scalar> Vx;
+    std::vector<Scalar> tau;
+  };
+
+  bool buildScalarSymbolic(const MatrixType& A, multifrontal_qr::Ordering ordering, Index budget,
+                           ScalarSymbolic& ss) const;
+  void adoptScalarSymbolic(ScalarSymbolic&& ss);
+  void scalarFactorOnce(std::vector<StorageIndex>& smallPivots);
+  void scalarApply(Index k, Scalar* x, bool adjointOfH) const;
+  void finishRotated(FrontFactor& ff, const DenseMatrix& RD, Index npiv, RealScalar& drop2, bool& nonFinite) const;
+  void rebuildSymbolic();
+  Index analyzedNonZeros() const {
+    return m_engineUsed == multifrontal_qr::Engine::Scalar ? Index(m_ssym.colRows.size())
+                                                           : Index(m_sym.rowCols.size());
+  }
+  Index scalarLive() const { return m_engineUsed == multifrontal_qr::Engine::Scalar ? m_ssym.nLive : 0; }
+  // Row space <-> slot space (the identity for the multifrontal engine).
+  template <typename In>
+  void toSlots(const In& rows, Vector& y) const {
+    y.setZero(m_slotCount);
+    if (m_engineUsed == multifrontal_qr::Engine::Scalar) {
+      for (Index i = 0; i < m_rows; ++i) y[m_ssym.rowToSlot[std::size_t(i)]] = rows[i];
+    } else {
+      y.head(m_rows) = rows;
+    }
+  }
+  Scalar slotOfRow(const Vector& y, Index i) const {
+    return m_engineUsed == multifrontal_qr::Engine::Scalar ? y[m_ssym.rowToSlot[std::size_t(i)]] : y[i];
+  }
+
   void buildSymbolic(const MatrixType& A, multifrontal_qr::Ordering ordering, Symbolic& sym) const;
   void orderColumns(const MatrixType& A, const std::vector<char>& isDeferred, multifrontal_qr::Ordering ordering,
                     std::vector<StorageIndex>& ordered) const;
@@ -478,6 +602,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   void factorOnce();
   void processFront(Index f, bool intraParallel, RealScalar& dropped, bool& nonFinite, Index& frontEntries);
   void verifyRank(bool& needsRepair, std::vector<StorageIndex>& newDeferred);
+  bool quickVerification();
   void finishPivotMaps();
   void releaseNumeric();
 
@@ -492,6 +617,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   void upperAdjointSolve(const Vector& g, Vector& h) const;
   void upperMultiply(const Vector& z, Vector& u) const;
   void ensureNullSpace() const;
+  RealScalar inverseNormEstimate() const;  // Hager-Higham ||R11^-1||_1, cached
   void toOriginal(const Vector& z, Vector& x) const {
     x.resize(m_cols);
     for (Index c = 0; c < m_cols; ++c) x[c] = z[m_sym.origToInternal[std::size_t(c)]];
@@ -503,10 +629,22 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
 
   // options
   multifrontal_qr::Ordering m_ordering = multifrontal_qr::Ordering::Auto;
+  multifrontal_qr::Engine m_engine = multifrontal_qr::Engine::Auto;
+  multifrontal_qr::Engine m_engineUsed = multifrontal_qr::Engine::Multifrontal;
+  Index m_scalarThreshold = 25000;
+  double m_scalarDensity = 38.0;
+  Index m_scalarCap = 500000;
+  Index m_scalarDeferLimit = 64;
+  ScalarSymbolic m_ssym;
+  ScalarFactor m_sf;
+  Index m_slotCount = 0;
   multifrontal_qr::Solution m_solution = multifrontal_qr::Solution::MinimumNorm;
   multifrontal_qr::Scaling m_scaling = multifrontal_qr::Scaling::Auto;
   RealScalar m_relTol = RealScalar(-1);
   bool m_verifyRank = true;
+  bool m_thoroughVerification = false;
+  static constexpr double kQuickVerifyMargin = 1e3;
+  bool m_sigmaIsBound = false;
   Index m_maxRepairs = 8;
   Index m_denseVerifyLimit = 24;
   Index m_maxRefinements = 3;
@@ -519,6 +657,8 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   Index m_maxFactorNonzeros = 0;
   double m_maxAtA = -1.0;
   Executor m_executor;
+  mutable std::vector<StorageIndex> m_orderCache[2];
+  mutable bool m_orderCacheValid[2] = {false, false};
 
   // state
   Index m_rows = 0, m_cols = 0;
@@ -555,6 +695,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   mutable HouseholderQR<DenseMatrix> m_nullQR;  // the basis in factored form
   mutable Index m_nullDim = 0;
   mutable RealScalar m_conditionEstimate = RealScalar(-1);
+  mutable RealScalar m_inverseNormEstimate = RealScalar(-1);
   mutable RealScalar m_lastResidual = RealScalar(0);
   mutable RealScalar m_lastOptimality = RealScalar(0);
   mutable Index m_lastRefinements = 0;
@@ -587,6 +728,18 @@ void MultifrontalQR<MatrixType, Executor>::orderColumns(const MatrixType& A, con
   const Index nk = Index(keep.size());
   ordered.clear();
   ordered.reserve(std::size_t(n));
+
+  // Engine::Auto can ask for the same ordering twice in one analysis (the
+  // scalar attempt, then the multifrontal analysis); the orderings are the
+  // expensive part of either, so a full-matrix ordering is computed once.
+  const int cacheSlot = ordering == multifrontal_qr::Ordering::COLAMD ? 0
+                        : ordering == multifrontal_qr::Ordering::AMD  ? 1
+                                                                      : -1;
+  const bool cacheable = cacheSlot >= 0 && nk == n;
+  if (cacheable && m_orderCacheValid[cacheSlot]) {
+    ordered = m_orderCache[cacheSlot];
+    return;
+  }
 
   if (ordering == multifrontal_qr::Ordering::Natural || nk == 0) {
     ordered = keep;
@@ -653,6 +806,10 @@ void MultifrontalQR<MatrixType, Executor>::orderColumns(const MatrixType& A, con
   }
   for (Index c = 0; c < n; ++c)
     if (isDeferred[std::size_t(c)]) ordered.push_back(StorageIndex(c));
+  if (cacheable) {
+    m_orderCache[cacheSlot] = ordered;
+    m_orderCacheValid[cacheSlot] = true;
+  }
 }
 
 template <typename MatrixType, typename Executor>
@@ -882,19 +1039,200 @@ void MultifrontalQR<MatrixType, Executor>::analyzePattern(const MatrixType& matr
   m_deferredCols.clear();
   m_pattern = matrix;
   m_pattern.makeCompressed();
+  m_orderCacheValid[0] = m_orderCacheValid[1] = false;
 
+  using multifrontal_qr::Engine;
   using multifrontal_qr::Ordering;
+  const double limit = m_maxAtA > 0 ? m_maxAtA : std::max(1e7, 50.0 * double(m_pattern.nonZeros()));
+  const bool amdAffordable = m_cols > 0 && atAPatternSize(m_pattern) <= limit;
+
+  if (m_engine != Engine::Multifrontal) {
+    // The scalar engine's symbolic pass counts nnz(R) exactly, and stops as
+    // soon as the count passes the budget -- so asking costs at most the budget.
+    const Index sparseBudget =
+        (std::min)(m_scalarCap, static_cast<Index>(m_scalarDensity * static_cast<double>(m_cols)));
+    const Index budget = m_engine == Engine::Scalar ? Index(0) : (std::max)(m_scalarThreshold, sparseBudget);
+    ScalarSymbolic best;
+    bool found = false;
+    std::vector<Ordering> candidates;
+    if (m_ordering != Ordering::Auto) {
+      candidates.push_back(m_ordering);
+    } else {
+      candidates.push_back(Ordering::COLAMD);
+      if (amdAffordable) candidates.push_back(Ordering::AMD);
+    }
+    for (Ordering o : candidates) {
+      // A later candidate only has to beat the best count so far, so that is
+      // its budget; and when R is already within 2x of A there is too little
+      // left to gain to pay for a second ordering.
+      Index b = budget;
+      if (found) {
+        if (best.predictedNnzR <= 2 * m_pattern.nonZeros()) break;
+        b = b > 0 ? (std::min)(b, best.predictedNnzR) : best.predictedNnzR;
+      }
+      ScalarSymbolic ss;
+      if (!buildScalarSymbolic(m_pattern, o, b, ss)) continue;
+      if (!found || ss.predictedNnzR < best.predictedNnzR) best = std::move(ss);
+      found = true;
+    }
+    if (found) {
+      adoptScalarSymbolic(std::move(best));
+      return;
+    }
+  }
+
+  m_engineUsed = Engine::Multifrontal;
+  m_ssym = ScalarSymbolic();
+  m_slotCount = m_rows;
   if (m_ordering != Ordering::Auto) {
     buildSymbolic(m_pattern, m_ordering, m_sym);
   } else {
     buildSymbolic(m_pattern, Ordering::COLAMD, m_sym);
-    const double limit = m_maxAtA > 0 ? m_maxAtA : std::max(1e7, 50.0 * double(m_pattern.nonZeros()));
-    if (m_cols > 0 && atAPatternSize(m_pattern) <= limit) {
+    if (amdAffordable) {
       Symbolic alt;
       buildSymbolic(m_pattern, Ordering::AMD, alt);
       if (alt.predictedNnzR < m_sym.predictedNnzR) m_sym = std::move(alt);
     }
   }
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::adoptScalarSymbolic(ScalarSymbolic&& ss) {
+  m_engineUsed = multifrontal_qr::Engine::Scalar;
+  m_ssym = std::move(ss);
+  m_slotCount = m_ssym.slots;
+  // The column maps are shared with the multifrontal code paths; the fronts are
+  // not used.
+  m_sym = Symbolic();
+  m_sym.ordering = m_ssym.ordering;
+  m_sym.internalToOrig = m_ssym.internalToOrig;
+  m_sym.origToInternal = m_ssym.origToInternal;
+  m_sym.predictedNnzR = m_ssym.predictedNnzR;
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::rebuildSymbolic() {
+  if (m_engineUsed == multifrontal_qr::Engine::Scalar) {
+    ScalarSymbolic ss;
+    buildScalarSymbolic(m_pattern, m_ssym.ordering, 0, ss);
+    adoptScalarSymbolic(std::move(ss));
+  } else {
+    const multifrontal_qr::Ordering used = m_sym.ordering;
+    buildSymbolic(m_pattern, used, m_sym);
+  }
+}
+
+template <typename MatrixType, typename Executor>
+bool MultifrontalQR<MatrixType, Executor>::buildScalarSymbolic(const MatrixType& A, multifrontal_qr::Ordering ordering,
+                                                               Index budget, ScalarSymbolic& ss) const {
+  const Index m = A.rows(), n = A.cols();
+  ss = ScalarSymbolic();
+  ss.ordering = ordering;
+  std::vector<char> isDeferred(static_cast<std::size_t>(n), 0);
+  for (StorageIndex c : m_deferredCols) isDeferred[std::size_t(c)] = 1;
+  const Index d = Index(m_deferredCols.size());
+  ss.nLive = n - d;
+  orderColumns(A, isDeferred, ordering, ss.internalToOrig);
+  ss.origToInternal.resize(std::size_t(n));
+  for (Index k = 0; k < n; ++k) ss.origToInternal[std::size_t(ss.internalToOrig[std::size_t(k)])] = StorageIndex(k);
+
+  // A by internal column.
+  ss.colPtr.assign(std::size_t(n) + 1, 0);
+  for (Index k = 0; k < n; ++k) {
+    const StorageIndex c = ss.internalToOrig[std::size_t(k)];
+    ss.colPtr[std::size_t(k) + 1] = ss.colPtr[std::size_t(k)] + (A.outerIndexPtr()[c + 1] - A.outerIndexPtr()[c]);
+  }
+  ss.colRows.resize(std::size_t(ss.colPtr[std::size_t(n)]));
+  ss.entrySrc.resize(ss.colRows.size());
+  for (Index k = 0; k < n; ++k) {
+    const StorageIndex c = ss.internalToOrig[std::size_t(k)];
+    Index q = ss.colPtr[std::size_t(k)];
+    for (Index p = A.outerIndexPtr()[c]; p < A.outerIndexPtr()[c + 1]; ++p, ++q) {
+      ss.colRows[std::size_t(q)] = A.innerIndexPtr()[p];
+      ss.entrySrc[std::size_t(q)] = p;
+    }
+  }
+
+  // Column elimination tree (cs_etree with ata) and leftmost columns.
+  ss.parent.assign(std::size_t(n), StorageIndex(-1));
+  {
+    std::vector<StorageIndex> ancestor(static_cast<std::size_t>(n), StorageIndex(-1));
+    std::vector<StorageIndex> prev(static_cast<std::size_t>(m), StorageIndex(-1));
+    for (Index k = 0; k < n; ++k)
+      for (Index q = ss.colPtr[std::size_t(k)]; q < ss.colPtr[std::size_t(k) + 1]; ++q) {
+        const StorageIndex row = ss.colRows[std::size_t(q)];
+        StorageIndex j = prev[std::size_t(row)];
+        while (j != StorageIndex(-1) && j < k) {
+          const StorageIndex next = ancestor[std::size_t(j)];
+          ancestor[std::size_t(j)] = StorageIndex(k);
+          if (next == StorageIndex(-1)) {
+            ss.parent[std::size_t(j)] = StorageIndex(k);
+            break;
+          }
+          j = next;
+        }
+        prev[std::size_t(row)] = StorageIndex(k);
+      }
+  }
+  ss.leftmost.assign(std::size_t(m), StorageIndex(-1));
+  for (Index k = n - 1; k >= 0; --k)
+    for (Index q = ss.colPtr[std::size_t(k)]; q < ss.colPtr[std::size_t(k) + 1]; ++q)
+      ss.leftmost[std::size_t(ss.colRows[std::size_t(q)])] = StorageIndex(k);
+
+  // Row assignment (cs_vcount): every column gets a pivot row from its own
+  // leftmost-row queue, or a fictitious empty slot; leftover rows go last.
+  {
+    std::vector<StorageIndex> next(static_cast<std::size_t>(m), StorageIndex(-1));
+    std::vector<StorageIndex> head(static_cast<std::size_t>(n), StorageIndex(-1));
+    std::vector<StorageIndex> tail(static_cast<std::size_t>(n), StorageIndex(-1));
+    std::vector<StorageIndex> nque(static_cast<std::size_t>(n), StorageIndex(0));
+    ss.rowToSlot.assign(std::size_t(m), StorageIndex(-1));
+    for (Index i = m - 1; i >= 0; --i) {
+      const StorageIndex k = ss.leftmost[std::size_t(i)];
+      if (k < 0) continue;
+      if (nque[std::size_t(k)]++ == 0) tail[std::size_t(k)] = StorageIndex(i);
+      next[std::size_t(i)] = head[std::size_t(k)];
+      head[std::size_t(k)] = StorageIndex(i);
+    }
+    for (Index k = 0; k < n; ++k) {
+      const StorageIndex i = head[std::size_t(k)];
+      if (i < 0) continue;  // slot k stays fictitious: no original row
+      ss.rowToSlot[std::size_t(i)] = StorageIndex(k);
+      if (--nque[std::size_t(k)] <= 0) continue;
+      const StorageIndex pa = ss.parent[std::size_t(k)];
+      if (pa != StorageIndex(-1)) {
+        if (nque[std::size_t(pa)] == 0) tail[std::size_t(pa)] = tail[std::size_t(k)];
+        next[std::size_t(tail[std::size_t(k)])] = head[std::size_t(pa)];
+        head[std::size_t(pa)] = next[std::size_t(i)];
+        nque[std::size_t(pa)] += nque[std::size_t(k)];
+      }
+    }
+    Index slot = n;
+    for (Index i = 0; i < m; ++i)
+      if (ss.rowToSlot[std::size_t(i)] < 0) ss.rowToSlot[std::size_t(i)] = StorageIndex(slot++);
+    ss.slots = slot;
+  }
+
+  // nnz(R): the reach of every column through the tree, with an early exit.
+  {
+    std::vector<StorageIndex> mark(static_cast<std::size_t>(n), StorageIndex(-1));
+    Index total = 0;
+    for (Index k = 0; k < n; ++k) {
+      mark[std::size_t(k)] = StorageIndex(k);
+      if (k < ss.nLive) ++total;
+      for (Index q = ss.colPtr[std::size_t(k)]; q < ss.colPtr[std::size_t(k) + 1]; ++q) {
+        for (StorageIndex j = ss.leftmost[std::size_t(ss.colRows[std::size_t(q)])]; mark[std::size_t(j)] != StorageIndex(k);
+             j = ss.parent[std::size_t(j)]) {
+          mark[std::size_t(j)] = StorageIndex(k);
+          if (j < ss.nLive) ++total;
+        }
+      }
+      if (budget > 0 && total > budget) return false;
+    }
+    ss.predictedNnzR = total + d * (d + 1) / 2;
+    if (budget > 0 && ss.predictedNnzR > budget) return false;
+  }
+  return true;
 }
 
 // ============================================================================
@@ -905,6 +1243,7 @@ template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::releaseNumeric() {
   std::vector<FrontFactor>().swap(m_factors);
   std::vector<Contribution>().swap(m_contrib);
+  m_sf = ScalarFactor();
   m_pivotCol.clear();
   m_pivotSlot.clear();
   m_internalToPivot.clear();
@@ -920,6 +1259,8 @@ void MultifrontalQR<MatrixType, Executor>::releaseNumeric() {
   m_nullQR = HouseholderQR<DenseMatrix>();
   m_nullDim = 0;
   m_conditionEstimate = RealScalar(-1);
+  m_inverseNormEstimate = RealScalar(-1);
+  m_sigmaIsBound = false;
   m_nnzR = m_nnzH = m_largestFront = 0;
 }
 
@@ -971,7 +1312,7 @@ void MultifrontalQR<MatrixType, Executor>::factorize(const MatrixType& matrix) {
   releaseNumeric();
 
   computeScaling(matrix);
-  if (m_scaled.nonZeros() != Index(m_sym.rowCols.size())) {
+  if (m_scaled.nonZeros() != analyzedNonZeros()) {
     m_info = InvalidInput;
     m_lastError = "MultifrontalQR: factorize() was given a different sparsity pattern than analyzePattern()";
     return;
@@ -998,14 +1339,44 @@ void MultifrontalQR<MatrixType, Executor>::factorize(const MatrixType& matrix) {
                     " exceeds setMaxFactorNonzeros(" + std::to_string(m_maxFactorNonzeros) + ")";
       return;
     }
-    factorOnce();
-    if (m_info != Success) return;
-    if (!m_verifyRank) break;
-    bool needsRepair = false;
+    bool needsRepair = false, pivotDeferral = false;
     std::vector<StorageIndex> extra;
-    verifyRank(needsRepair, extra);
-    if (!needsRepair) break;
-    if (extra.empty() || m_repairs >= m_maxRepairs) {
+    if (m_engineUsed == multifrontal_qr::Engine::Scalar) {
+      // The scalar engine's structure is static, so it cannot hand a dead
+      // column's pivot row on to a later column the way a front does. A pivot at
+      // or below the threshold is deferred instead, and the SVD of the deferred
+      // block then makes the decision Heath's rule would have made.
+      scalarFactorOnce(extra);
+      if (m_info != Success) return;
+      needsRepair = pivotDeferral = !extra.empty();
+      // Every dependent column costs the scalar engine a place in the dense
+      // deferred block, where the multifrontal engine drops it in place. Past a
+      // modest block, Auto hands the matrix over (measured: 548 dependent
+      // columns of Pajek/SmaGri took 75 ms here against 4.7 ms there).
+      if (m_engine == multifrontal_qr::Engine::Auto &&
+          Index(m_deferredCols.size() + extra.size()) > m_scalarDeferLimit) {
+        m_deferredCols.clear();
+        m_repairs = 0;
+        m_engineUsed = multifrontal_qr::Engine::Multifrontal;
+        m_ssym = ScalarSymbolic();
+        m_slotCount = m_rows;
+        const multifrontal_qr::Ordering o = m_sym.ordering;
+        buildSymbolic(m_pattern, o, m_sym);
+        releaseNumeric();
+        continue;
+      }
+    } else {
+      factorOnce();
+      if (m_info != Success) return;
+    }
+    if (!needsRepair) {
+      if (!m_verifyRank) break;
+      verifyRank(needsRepair, extra);
+      if (!needsRepair) break;
+    }
+    // Pivot deferrals always add a new column, so they terminate on their own
+    // and do not count against the repair budget.
+    if (extra.empty() || (m_repairs >= m_maxRepairs && !pivotDeferral)) {
       m_rankVerified = false;
       m_lastError = extra.empty()
                         ? "MultifrontalQR: R11 has a singular value below the rank threshold that column deferral "
@@ -1014,11 +1385,11 @@ void MultifrontalQR<MatrixType, Executor>::factorize(const MatrixType& matrix) {
                           "rank is unverified";
       break;
     }
-    ++m_repairs;
+    if (!pivotDeferral) ++m_repairs;
     m_deferredCols.insert(m_deferredCols.end(), extra.begin(), extra.end());
     std::sort(m_deferredCols.begin(), m_deferredCols.end());
-    const multifrontal_qr::Ordering used = m_sym.ordering;
-    buildSymbolic(m_pattern, used, m_sym);
+    m_deferredCols.erase(std::unique(m_deferredCols.begin(), m_deferredCols.end()), m_deferredCols.end());
+    rebuildSymbolic();
     releaseNumeric();
   }
   m_factorized = true;
@@ -1075,9 +1446,11 @@ void MultifrontalQR<MatrixType, Executor>::factorOnce() {
 template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::finishPivotMaps() {
   const Index nf = Index(m_factors.size());
+  const Index ns = scalarLive();
   m_liveOffset.assign(std::size_t(nf) + 1, 0);
-  m_rank = 0;
-  m_nnzR = m_nnzH = 0;
+  m_rank = ns;
+  m_nnzR = Index(m_sf.Rx.size());
+  m_nnzH = Index(m_sf.Vx.size());
   m_rotatedFront = -1;
   for (Index f = 0; f < nf; ++f) {
     m_liveOffset[std::size_t(f)] = m_rank;
@@ -1093,6 +1466,11 @@ void MultifrontalQR<MatrixType, Executor>::finishPivotMaps() {
   m_pivotSlot.assign(std::size_t(m_rank), 0);
   m_internalToPivot.assign(std::size_t(m_cols), StorageIndex(-1));
   m_deferredOrder.clear();
+  for (Index k = 0; k < ns; ++k) {
+    m_pivotCol[std::size_t(k)] = StorageIndex(k);
+    m_pivotSlot[std::size_t(k)] = StorageIndex(k);
+    m_internalToPivot[std::size_t(k)] = StorageIndex(k);
+  }
   for (Index f = 0; f < nf; ++f) {
     const FrontFactor& ff = m_factors[std::size_t(f)];
     for (Index t = 0; t < ff.rank; ++t) {
@@ -1333,28 +1711,8 @@ void MultifrontalQR<MatrixType, Executor>::processFront(Index f, bool intraParal
       const Index hr = (std::min)(Index(hReach[std::size_t(i)]), kq);
       if (hr > i + 1) RD.col(hCol[std::size_t(i)]).segment(i + 1, hr - i - 1).setZero();
     }
-    ff.rotated = true;
-    RealVector sv;
-    if (kq > 0) {
-      BDCSVD<DenseMatrix, ComputeFullU | ComputeFullV> svd(RD);
-      ff.rotU = svd.matrixU();
-      ff.rotV = svd.matrixV();
-      sv = svd.singularValues();
-    } else {
-      ff.rotV = DenseMatrix::Identity(npiv, npiv);
-    }
-    if (!sv.allFinite()) {
-      nonFinite = true;
-      return;
-    }
-    Index live = 0;
-    while (live < sv.size() && sv[live] > tol) ++live;
-    for (Index i = live; i < sv.size(); ++i) drop2 += sv[i] * sv[i];
-    ff.rank = live;
-    ff.dead = npiv - live;
-    ff.sigma = sv.head(live);
-    ff.R.setZero(live, npiv);
-    for (Index i = 0; i < live; ++i) ff.R(i, i) = Scalar(sv[i]);
+    finishRotated(ff, RD, npiv, drop2, nonFinite);
+    if (nonFinite) return;
     ff.cols.resize(std::size_t(npiv));
     for (Index j = 0; j < npiv; ++j) ff.cols[std::size_t(j)] = globalOf(j);
     dropped = drop2;
@@ -1402,6 +1760,201 @@ void MultifrontalQR<MatrixType, Executor>::processFront(Index f, bool intraParal
   }
 }
 
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::finishRotated(FrontFactor& ff, const DenseMatrix& RD, Index npiv,
+                                                         RealScalar& drop2, bool& nonFinite) const {
+  // R_D = U diag(sigma) V^H. Column-norm criteria -- Heath's rule, and column
+  // pivoting too -- can only overestimate rank, since a column's residual norm
+  // is never below the singular value it hides; the SVD decides exactly, and
+  // what it discards is the smallest perturbation that achieves the rank.
+  ff.rotated = true;
+  RealVector sv;
+  if (RD.rows() > 0 && npiv > 0) {
+    BDCSVD<DenseMatrix, ComputeFullU | ComputeFullV> svd(RD);
+    ff.rotU = svd.matrixU();
+    ff.rotV = svd.matrixV();
+    sv = svd.singularValues();
+  } else {
+    ff.rotU.resize(0, 0);
+    ff.rotV = DenseMatrix::Identity(npiv, npiv);
+  }
+  if (!sv.allFinite()) {
+    nonFinite = true;
+    return;
+  }
+  Index live = 0;
+  while (live < sv.size() && sv[live] > m_absTol) ++live;
+  for (Index i = live; i < sv.size(); ++i) drop2 += sv[i] * sv[i];
+  ff.rank = live;
+  ff.dead = npiv - live;
+  ff.sigma = sv.head(live);
+  ff.R.setZero(live, npiv);
+  for (Index i = 0; i < live; ++i) ff.R(i, i) = Scalar(sv[i]);
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::scalarApply(Index k, Scalar* x, bool adjointOfH) const {
+  // x -= v (tau v^H x), the reflector H_k = I - tau v v^H (or its adjoint).
+  const Index b = m_sf.Vp[std::size_t(k)], e = m_sf.Vp[std::size_t(k) + 1];
+  Scalar t(0);
+  for (Index p = b; p < e; ++p) t += numext::conj(m_sf.Vx[std::size_t(p)]) * x[m_sf.Vi[std::size_t(p)]];
+  t *= adjointOfH ? numext::conj(m_sf.tau[std::size_t(k)]) : m_sf.tau[std::size_t(k)];
+  if (t == Scalar(0)) return;
+  for (Index p = b; p < e; ++p) x[m_sf.Vi[std::size_t(p)]] -= m_sf.Vx[std::size_t(p)] * t;
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::scalarFactorOnce(std::vector<StorageIndex>& smallPivots) {
+  // Left-looking sparse Householder QR (Davis, CSparse cs_qr). Column k's R
+  // pattern is its reach in the column elimination tree; its reflector's
+  // pattern is its own rows below slot k plus its tree children's reflectors.
+  // Row slot i and column i share one mark array: slot i is column i's pivot.
+  const ScalarSymbolic& ss = m_ssym;
+  const Index n = m_cols, nL = ss.nLive, S = ss.slots;
+  const RealScalar tol = m_absTol;
+  smallPivots.clear();
+  m_factors.clear();
+  m_sf = ScalarFactor();
+  m_sf.Rp.assign(std::size_t(n) + 1, 0);
+  m_sf.Vp.assign(std::size_t(nL) + 1, 0);
+  m_sf.tau.assign(std::size_t(nL), Scalar(0));
+  m_sf.Ri.reserve(std::size_t(ss.predictedNnzR));
+  m_sf.Rx.reserve(std::size_t(ss.predictedNnzR));
+
+  const Scalar* values = m_scaled.valuePtr();
+  Vector x = Vector::Zero(S);
+  std::vector<StorageIndex> mark(static_cast<std::size_t>((std::max)(S, n)), StorageIndex(-1));
+  std::vector<StorageIndex> stack(static_cast<std::size_t>(n)), path(static_cast<std::size_t>(n));
+  Vector house(S);  // one buffer for every reflector: a resize per column would allocate
+
+  // The deferred block, column by column: rows (slots >= nLive) and values.
+  std::vector<StorageIndex> blockMark(static_cast<std::size_t>(S), StorageIndex(-1));
+  std::vector<StorageIndex> blockRows;
+  std::vector<std::vector<std::pair<StorageIndex, Scalar>>> blockCols(static_cast<std::size_t>(n - nL));
+  RealScalar drop2(0);
+
+  for (Index k = 0; k < n; ++k) {
+    const bool live = k < nL;
+    m_sf.Rp[std::size_t(k)] = Index(m_sf.Ri.size());
+    const Index v0 = Index(m_sf.Vi.size());
+    std::vector<StorageIndex> touched;  // deferred column: every slot that may be nonzero
+    mark[std::size_t(k)] = StorageIndex(k);
+    if (live) m_sf.Vi.push_back(StorageIndex(k));
+    Index top = n;
+    for (Index q = ss.colPtr[std::size_t(k)]; q < ss.colPtr[std::size_t(k) + 1]; ++q) {
+      const StorageIndex row = ss.colRows[std::size_t(q)];
+      Index len = 0;
+      for (StorageIndex j = ss.leftmost[std::size_t(row)]; mark[std::size_t(j)] != StorageIndex(k); j = ss.parent[std::size_t(j)]) {
+        path[std::size_t(len++)] = j;
+        mark[std::size_t(j)] = StorageIndex(k);
+      }
+      while (len > 0) stack[std::size_t(--top)] = path[std::size_t(--len)];
+      const StorageIndex i = ss.rowToSlot[std::size_t(row)];
+      x[i] = values[ss.entrySrc[std::size_t(q)]];
+      if (live) {
+        if (i > k && mark[std::size_t(i)] < StorageIndex(k)) {
+          m_sf.Vi.push_back(i);
+          mark[std::size_t(i)] = StorageIndex(k);
+        }
+      } else if (i >= nL) {
+        touched.push_back(i);
+      }
+    }
+    for (Index t = top; t < n; ++t) {
+      const StorageIndex i = stack[std::size_t(t)];
+      if (i >= nL) continue;  // a deferred node: no reflector
+      scalarApply(i, x.data(), false);
+      m_sf.Ri.push_back(i);
+      m_sf.Rx.push_back(x[i]);
+      x[i] = Scalar(0);
+      if (live) {
+        if (ss.parent[std::size_t(i)] == StorageIndex(k))
+          for (Index p = m_sf.Vp[std::size_t(i)]; p < m_sf.Vp[std::size_t(i) + 1]; ++p) {
+            const StorageIndex r = m_sf.Vi[std::size_t(p)];
+            if (mark[std::size_t(r)] < StorageIndex(k)) {
+              mark[std::size_t(r)] = StorageIndex(k);
+              m_sf.Vi.push_back(r);
+            }
+          }
+      } else {
+        for (Index p = m_sf.Vp[std::size_t(i)]; p < m_sf.Vp[std::size_t(i) + 1]; ++p)
+          if (m_sf.Vi[std::size_t(p)] >= nL) touched.push_back(m_sf.Vi[std::size_t(p)]);
+      }
+    }
+    if (live) {
+      const Index v1 = Index(m_sf.Vi.size());
+      const Index hlen = v1 - v0;
+      for (Index p = v0; p < v1; ++p) {
+        house[p - v0] = x[m_sf.Vi[std::size_t(p)]];
+        x[m_sf.Vi[std::size_t(p)]] = Scalar(0);
+      }
+      Scalar tau;
+      RealScalar beta;
+      auto hv = house.head(hlen);
+      hv.makeHouseholderInPlace(tau, beta);
+      if (!(numext::isfinite)(beta)) {
+        m_info = NumericalIssue;
+        m_lastError = "MultifrontalQR: non-finite values appeared during factorization";
+        return;
+      }
+      house[0] = Scalar(1);
+      m_sf.Vx.insert(m_sf.Vx.end(), house.data(), house.data() + hlen);
+      m_sf.Vp[std::size_t(k) + 1] = v1;
+      m_sf.tau[std::size_t(k)] = tau;
+      m_sf.Ri.push_back(StorageIndex(k));
+      m_sf.Rx.push_back(Scalar(beta));
+      if (!(numext::abs(beta) > tol)) smallPivots.push_back(m_sym.internalToOrig[std::size_t(k)]);
+    } else {
+      auto& col = blockCols[std::size_t(k - nL)];
+      for (StorageIndex i : touched) {
+        if (x[i] == Scalar(0)) continue;
+        if (blockMark[std::size_t(i)] < 0) {
+          blockMark[std::size_t(i)] = StorageIndex(blockRows.size());
+          blockRows.push_back(i);
+        }
+        col.emplace_back(i, x[i]);
+        x[i] = Scalar(0);
+      }
+    }
+  }
+  m_sf.Rp[std::size_t(n)] = Index(m_sf.Ri.size());
+  if (!smallPivots.empty()) return;
+
+  if (nL < n) {
+    // Dense QR of the deferred block, then the SVD of its triangular factor.
+    const Index d = n - nL, nb = Index(blockRows.size());
+    DenseMatrix B = DenseMatrix::Zero(nb, d);
+    for (Index j = 0; j < d; ++j)
+      for (const auto& e : blockCols[std::size_t(j)]) B(blockMark[std::size_t(e.first)], j) = e.second;
+    HouseholderQR<DenseMatrix> qr;
+    if (nb > 0) qr.compute(B);
+    const Index kq = (std::min)(nb, d);
+    FrontFactor ff;
+    DenseMatrix RD(kq, d);
+    if (kq > 0) RD = qr.matrixQR().topRows(kq).template triangularView<Upper>();
+    bool nonFinite = false;
+    finishRotated(ff, RD, d, drop2, nonFinite);
+    if (nonFinite) {
+      m_info = NumericalIssue;
+      m_lastError = "MultifrontalQR: non-finite values appeared during factorization";
+      return;
+    }
+    ff.cols.resize(std::size_t(d));
+    for (Index j = 0; j < d; ++j) ff.cols[std::size_t(j)] = StorageIndex(nL + j);
+    if (kq > 0) {
+      ff.H = qr.matrixQR().leftCols(kq).template triangularView<StrictlyLower>();
+      ff.tau.assign(qr.hCoeffs().data(), qr.hCoeffs().data() + kq);
+    } else {
+      ff.H.resize(nb, 0);
+    }
+    ff.reach.assign(std::size_t(kq), StorageIndex(nb));
+    ff.slots = blockRows;
+    m_factors.push_back(std::move(ff));
+  }
+  m_droppedNorm = numext::sqrt(drop2);
+  finishPivotMaps();
+}
+
 // ============================================================================
 // triangular kernels. Pivot index p runs over the pivots front by front; R11
 // is upper triangular in that order. The rotated front, if any, is the last
@@ -1436,6 +1989,25 @@ void MultifrontalQR<MatrixType, Executor>::upperSolve(const Vector& c, Vector& z
     ff.R.topLeftCorner(k, k).template triangularView<Upper>().solveInPlace(rhs);
     for (Index t = 0; t < k; ++t) z[ff.cols[std::size_t(t)]] = rhs[t];
   }
+  const Index ns = scalarLive();
+  if (ns > 0) {
+    // Column-oriented back substitution; the deferred columns' values are
+    // known by now (the rotated front came first) and enter as given.
+    Vector w = c.head(ns);
+    for (Index d = ns; d < m_cols; ++d) {
+      const Scalar zd = z[d];
+      if (zd == Scalar(0)) continue;
+      for (Index p = m_sf.Rp[std::size_t(d)]; p < m_sf.Rp[std::size_t(d) + 1]; ++p)
+        w[m_sf.Ri[std::size_t(p)]] -= m_sf.Rx[std::size_t(p)] * zd;
+    }
+    for (Index k = ns - 1; k >= 0; --k) {
+      const Index last = m_sf.Rp[std::size_t(k) + 1] - 1;
+      const Scalar zk = w[k] / m_sf.Rx[std::size_t(last)];
+      z[k] = zk;
+      if (zk == Scalar(0)) continue;
+      for (Index p = m_sf.Rp[std::size_t(k)]; p < last; ++p) w[m_sf.Ri[std::size_t(p)]] -= m_sf.Rx[std::size_t(p)] * zk;
+    }
+  }
 }
 
 template <typename MatrixType, typename Executor>
@@ -1446,6 +2018,19 @@ void MultifrontalQR<MatrixType, Executor>::upperAdjointSolve(const Vector& g, Ve
   Vector w = g;
   h.setZero(m_rank);
   Vector rhs, gathered;
+  const Index ns = scalarLive();
+  if (ns > 0) {
+    for (Index k = 0; k < ns; ++k) {
+      const Index last = m_sf.Rp[std::size_t(k) + 1] - 1;
+      Scalar acc = w[k];
+      for (Index p = m_sf.Rp[std::size_t(k)]; p < last; ++p)
+        acc -= numext::conj(m_sf.Rx[std::size_t(p)]) * h[m_sf.Ri[std::size_t(p)]];
+      h[k] = acc / numext::conj(m_sf.Rx[std::size_t(last)]);
+    }
+    for (Index d = ns; d < m_cols; ++d)
+      for (Index p = m_sf.Rp[std::size_t(d)]; p < m_sf.Rp[std::size_t(d) + 1]; ++p)
+        w[d] -= numext::conj(m_sf.Rx[std::size_t(p)]) * h[m_sf.Ri[std::size_t(p)]];
+  }
   for (Index f = 0; f < nf; ++f) {
     const FrontFactor& ff = m_factors[std::size_t(f)];
     const Index k = ff.rank;
@@ -1477,6 +2062,13 @@ void MultifrontalQR<MatrixType, Executor>::upperMultiply(const Vector& z, Vector
   const Index nf = Index(m_factors.size());
   u.setZero(m_rank);
   Vector x;
+  const Index ns = scalarLive();
+  for (Index k = 0; k < (ns > 0 ? m_cols : 0); ++k) {
+    const Scalar zk = z[k];
+    if (zk == Scalar(0)) continue;
+    for (Index p = m_sf.Rp[std::size_t(k)]; p < m_sf.Rp[std::size_t(k) + 1]; ++p)
+      u[m_sf.Ri[std::size_t(p)]] += m_sf.Rx[std::size_t(p)] * zk;
+  }
   for (Index f = 0; f < nf; ++f) {
     const FrontFactor& ff = m_factors[std::size_t(f)];
     const Index k = ff.rank;
@@ -1526,6 +2118,7 @@ void MultifrontalQR<MatrixType, Executor>::internalToLive(const Vector& z, Vecto
 template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::applyQAdjoint(Vector& y) const {
   Vector yf, work(1);
+  for (Index k = 0; k < scalarLive(); ++k) scalarApply(k, y.data(), false);
   for (const FrontFactor& ff : m_factors) {
     const Index hr = ff.H.rows(), nh = ff.H.cols();
     if (nh == 0) continue;
@@ -1557,11 +2150,28 @@ void MultifrontalQR<MatrixType, Executor>::applyQ(Vector& y) const {
     }
     for (Index r = 0; r < hr; ++r) y[ff.slots[std::size_t(r)]] = yf[r];
   }
+  for (Index k = scalarLive() - 1; k >= 0; --k) scalarApply(k, y.data(), true);
 }
 
 // ============================================================================
 // rank verification
 // ============================================================================
+
+template <typename MatrixType, typename Executor>
+bool MultifrontalQR<MatrixType, Executor>::quickVerification() {
+  // sigma_min(R11) = 1 / ||R11^-1||_2 >= 1 / (sqrt(r) ||R11^-1||_1). The 1-norm
+  // comes from Hager-Higham (a handful of solves, and needed for
+  // conditionEstimate() anyway), which can underestimate -- hence a wide margin
+  // before the block iteration is skipped. A matrix near its rank threshold
+  // never passes, so the cases the check exists for still get the full one.
+  const RealScalar inv = inverseNormEstimate();
+  if (!(inv > RealScalar(0)) || !(numext::isfinite)(inv)) return false;
+  const RealScalar bound = RealScalar(1) / (inv * numext::sqrt(RealScalar(m_rank)));
+  if (!(bound > RealScalar(kQuickVerifyMargin) * m_absTol)) return false;
+  m_sigma = RealVector::Constant(1, bound);
+  m_sigmaIsBound = true;
+  return true;
+}
 
 template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::vector<StorageIndex>& extra) {
@@ -1588,6 +2198,8 @@ void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::ve
     const Index keep = (std::min)(r, Index(8));
     m_sigma = s.tail(keep).reverse();
     X = svd.matrixV().rightCols(keep).rowwise().reverse();
+  } else if (!m_thoroughVerification && quickVerification()) {
+    return;
   } else {
     // Block inverse iteration on (R11^H R11)^-1 with Rayleigh-Ritz on R11.
     // Three vectors are enough to see a cluster of small singular values, and
@@ -1731,6 +2343,20 @@ void MultifrontalQR<MatrixType, Executor>::ensureNullSpace() const {
     ff.R.topLeftCorner(kf, kf).template triangularView<Upper>().solveInPlace(block);
     for (Index t = 0; t < kf; ++t) Z.row(ff.cols[std::size_t(t)]) = block.row(t);
   }
+  const Index ns = scalarLive();
+  if (ns > 0) {
+    // Rows 0..ns-1 of Z start at zero (the right-hand side) and accumulate the
+    // column-oriented back substitution in place.
+    for (Index d = ns; d < m_cols; ++d)
+      for (Index p = m_sf.Rp[std::size_t(d)]; p < m_sf.Rp[std::size_t(d) + 1]; ++p)
+        Z.row(m_sf.Ri[std::size_t(p)]) -= m_sf.Rx[std::size_t(p)] * Z.row(d);
+    for (Index kk = ns - 1; kk >= 0; --kk) {
+      const Index last = m_sf.Rp[std::size_t(kk) + 1] - 1;
+      Z.row(kk) /= m_sf.Rx[std::size_t(last)];
+      for (Index p = m_sf.Rp[std::size_t(kk)]; p < last; ++p)
+        Z.row(m_sf.Ri[std::size_t(p)]) -= m_sf.Rx[std::size_t(p)] * Z.row(kk);
+    }
+  }
   DenseMatrix N(m_cols, k);
   for (Index c2 = 0; c2 < m_cols; ++c2)
     N.row(c2) = Z.row(m_sym.origToInternal[std::size_t(c2)]) * Scalar(m_colScale[c2]);
@@ -1757,6 +2383,25 @@ typename MultifrontalQR<MatrixType, Executor>::RealScalar MultifrontalQR<MatrixT
     rotPos.assign(std::size_t(m_cols), -1);
     for (std::size_t j = 0; j < rot->cols.size(); ++j) rotPos[std::size_t(rot->cols[j])] = Index(j);
   }
+  const Index ns = scalarLive();
+  if (ns > 0) {
+    for (Index k = 0; k < ns; ++k)
+      for (Index p = m_sf.Rp[std::size_t(k)]; p < m_sf.Rp[std::size_t(k) + 1]; ++p)
+        colSum[k] += numext::abs(m_sf.Rx[std::size_t(p)]);
+    if (rot && rot->rank > 0) {
+      // Deferred columns enter R11 rotated: column j of R12 V_live.
+      Vector acc(ns);
+      for (Index j = 0; j < rot->rank; ++j) {
+        acc.setZero();
+        for (Index d = ns; d < m_cols; ++d) {
+          const Scalar vj = rot->rotV(rotPos[std::size_t(d)], j);
+          for (Index p = m_sf.Rp[std::size_t(d)]; p < m_sf.Rp[std::size_t(d) + 1]; ++p)
+            acc[m_sf.Ri[std::size_t(p)]] += m_sf.Rx[std::size_t(p)] * vj;
+        }
+        colSum[m_liveOffset[std::size_t(m_rotatedFront)] + j] += acc.cwiseAbs().sum();
+      }
+    }
+  }
   for (std::size_t f = 0; f < m_factors.size(); ++f) {
     const FrontFactor& ff = m_factors[f];
     if (ff.rotated) {
@@ -1774,6 +2419,15 @@ typename MultifrontalQR<MatrixType, Executor>::RealScalar MultifrontalQR<MatrixT
     }
     if (toRot.size() > 0) colSum.segment(m_liveOffset[std::size_t(m_rotatedFront)], rot->rank) += toRot.cwiseAbs().colwise().sum().transpose();
   }
+  m_conditionEstimate = colSum.maxCoeff() * inverseNormEstimate();
+  return m_conditionEstimate;
+}
+
+template <typename MatrixType, typename Executor>
+typename MultifrontalQR<MatrixType, Executor>::RealScalar MultifrontalQR<MatrixType, Executor>::inverseNormEstimate()
+    const {
+  if (m_inverseNormEstimate >= RealScalar(0)) return m_inverseNormEstimate;
+  if (m_rank == 0) return m_inverseNormEstimate = RealScalar(0);
   auto applyInv = [this](const Vector& in, Vector& out) {
     Vector z = Vector::Zero(m_cols);
     upperSolve(in, z);
@@ -1784,9 +2438,8 @@ typename MultifrontalQR<MatrixType, Executor>::RealScalar MultifrontalQR<MatrixT
     liveToInternal(in, g);
     upperAdjointSolve(g, out);
   };
-  const RealScalar inv = left_right_lu::oneNormEstimate<Scalar>(m_rank, applyInv, applyInvAdj);
-  m_conditionEstimate = colSum.maxCoeff() * inv;
-  return m_conditionEstimate;
+  m_inverseNormEstimate = left_right_lu::oneNormEstimate<Scalar>(m_rank, applyInv, applyInvAdj);
+  return m_inverseNormEstimate;
 }
 
 template <typename MatrixType, typename Executor>
@@ -1805,13 +2458,13 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
   const bool augmented = !(m == n && r == n);
   const RealScalar eps = NumTraits<RealScalar>::epsilon();
 
-  Vector bs(m), y(m), c(r), z(n), dz(n), zo(n), res(m), rr(m), g(n), gi(n), h, x;
+  Vector bs(m), y, c(r), z(n), dz(n), zo(n), res(m), rr(m), g(n), gi(n), h, x;
   for (Index col = 0; col < nrhs; ++col) {
     bs = b.col(col).template cast<Scalar>();
     bs.array() *= m_rowScale.array().template cast<Scalar>();
 
     auto basicSolve = [&](const Vector& rhs, Vector& out) {
-      y = rhs;
+      toSlots(rhs, y);
       applyQAdjoint(y);
       for (Index p = 0; p < r; ++p) c[p] = y[m_pivotSlot[std::size_t(p)]];
       out.setZero(n);
@@ -1846,7 +2499,7 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
         // is dr = Q [h; d2], dz = R11^-1 (d1 - h) with R11^H h = g, d = Q^H f.
         toOriginal(z, zo);
         Vector rv = bs - m_scaled * zo;
-        Vector e(m);
+        Vector e;
         for (; steps < m_maxRefinements; ++steps) {
           residual(z, rr);
           Vector fv = rr - rv;
@@ -1859,7 +2512,7 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
           toInternal(g, gi);
           for (Index q = 0; q < n; ++q)
             if (m_internalToPivot[std::size_t(q)] == StorageIndex(-1)) gi[q] = Scalar(0);
-          e = fv;
+          toSlots(fv, e);
           applyQAdjoint(e);
           upperAdjointSolve(gi, h);
           for (Index p = 0; p < r; ++p) c[p] = e[m_pivotSlot[std::size_t(p)]] - h[p];
@@ -1870,7 +2523,7 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
           const RealScalar dn = dz.template lpNorm<Infinity>();
           if (!(numext::isfinite)(dn) || dn >= prevNorm) break;
           z += dz;
-          rv += e;
+          for (Index i = 0; i < m; ++i) rv[i] += slotOfRow(e, i);
           prevNorm = RealScalar(0.5) * dn;
           if (dn <= eps * z.template lpNorm<Infinity>()) break;
         }
@@ -1941,6 +2594,22 @@ MultifrontalQR<MatrixType, Executor>::matrixR() const {
   if (rot)
     for (std::size_t j = 0; j < rot->cols.size(); ++j) rotPos[std::size_t(rot->cols[j])] = Index(j);
   std::vector<Triplet<Scalar, StorageIndex>> t;
+  const Index ns = scalarLive();
+  if (ns > 0) {
+    for (Index k = 0; k < ns; ++k)
+      for (Index p = m_sf.Rp[std::size_t(k)]; p < m_sf.Rp[std::size_t(k) + 1]; ++p)
+        t.emplace_back(m_sf.Ri[std::size_t(p)], position[std::size_t(k)], m_sf.Rx[std::size_t(p)]);
+    if (rot) {
+      const Index d = m_cols - ns;
+      DenseMatrix toRot = DenseMatrix::Zero(ns, d);
+      for (Index c = ns; c < m_cols; ++c)
+        for (Index p = m_sf.Rp[std::size_t(c)]; p < m_sf.Rp[std::size_t(c) + 1]; ++p)
+          toRot.row(m_sf.Ri[std::size_t(p)]) += m_sf.Rx[std::size_t(p)] * rot->rotV.row(rotPos[std::size_t(c)]);
+      for (Index j = 0; j < d; ++j)
+        for (Index row = 0; row < ns; ++row)
+          if (toRot(row, j) != Scalar(0)) t.emplace_back(StorageIndex(row), StorageIndex(rotStart + j), toRot(row, j));
+    }
+  }
   for (std::size_t f = 0; f < m_factors.size(); ++f) {
     const FrontFactor& ff = m_factors[f];
     const StorageIndex row0 = StorageIndex(m_liveOffset[f]);

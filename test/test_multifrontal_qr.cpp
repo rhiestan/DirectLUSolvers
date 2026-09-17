@@ -20,6 +20,9 @@ using lu_testing::check;
 using lu_testing::checkTrue;
 using Eigen::Index;
 
+// Every test runs once per engine; main() sets this.
+Eigen::multifrontal_qr::Engine g_engine = Eigen::multifrontal_qr::Engine::Multifrontal;
+
 namespace {
 
 template <typename Scalar>
@@ -109,7 +112,9 @@ void testSquare(const char* tag, const Eigen::SparseMatrix<Scalar>& A, double to
   Vec<Scalar> xTrue(n);
   for (Index i = 0; i < n; ++i) xTrue[i] = Scalar(1.0 + 0.5 * std::sin(double(i)));
   Vec<Scalar> b = A * xTrue;
-  Solver qr(A);
+  Solver qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
   checkTrue(qr.info() == Eigen::Success, std::string(tag) + ": factorize");
   check(qr.rank() == n, std::string(tag) + ": full rank", double(qr.rank()));
   checkTrue(qr.rankIsVerified(), std::string(tag) + ": rank verified");
@@ -126,6 +131,7 @@ void testOrderingsAgree() {
   using O = Eigen::multifrontal_qr::Ordering;
   for (O o : {O::COLAMD, O::AMD, O::Natural, O::Auto}) {
     Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+    qr.setEngine(g_engine);
     qr.setOrdering(o);
     qr.compute(A);
     Eigen::VectorXd x = qr.solve(b);
@@ -144,7 +150,9 @@ void testTridiagonalFill() {
   }
   Eigen::SparseMatrix<double> A(n, n);
   A.setFromTriplets(t.begin(), t.end());
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr(A);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
   // R of a tridiagonal matrix has 3 entries per row; amalgamation may add a few.
   check(qr.nnzR() < 6 * n, "tridiagonal: nnz(R) stays O(n)", double(qr.nnzR()) / n);
   Eigen::VectorXd x = qr.solve(Eigen::VectorXd::Ones(n));
@@ -160,7 +168,9 @@ void testLeastSquares(const char* tag, int m, int n, unsigned seed) {
   for (int i = 0; i < m; ++i) b[i] = randomScalar<Scalar>(rng);
   Dense<Scalar> Ad = Dense<Scalar>(A);
   Vec<Scalar> ref = Ad.colPivHouseholderQr().solve(b);
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>> qr(A);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
   check(qr.rank() == n, std::string(tag) + ": full column rank", double(qr.rank()));
   Vec<Scalar> x = qr.solve(b);
   check(relErr(x, ref) < 1e-11, std::string(tag) + ": matches dense least squares", relErr(x, ref));
@@ -177,7 +187,9 @@ void testUnderdetermined(const char* tag, int m, int n, unsigned seed) {
   Vec<Scalar> b = A * xAny;
   Dense<Scalar> Ad = Dense<Scalar>(A);
   Vec<Scalar> ref = pinvSolve(Ad, b, 1e-12);
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>> qr(A);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
   check(qr.rank() == m, std::string(tag) + ": rank = m", double(qr.rank()));
   Vec<Scalar> x = qr.solve(b);
   check(relErr(x, ref) < 1e-11, std::string(tag) + ": minimum-norm solution", relErr(x, ref));
@@ -209,7 +221,9 @@ void testExactRankDeficiency() {
     if (j % 9 == 7) Bd.col(j) = 3.0 * Bd.col(j - 1);
   B = Bd.sparseView();
   const Index refRank = numericalRank<double>(Bd, 1e-12);
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr(B);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(B);
   check(qr.rank() == refRank, "exact deficiency: rank matches SVD", double(qr.rank()));
   checkTrue(qr.rankIsVerified(), "exact deficiency: rank verified");
   std::mt19937 rng(3);
@@ -239,7 +253,9 @@ void testBadScaling() {
   Eigen::SparseMatrix<double> B = r.asDiagonal() * A * c.asDiagonal();
   Eigen::VectorXd xTrue = Eigen::VectorXd::Ones(n).cwiseQuotient(c);
   Eigen::VectorXd b = B * xTrue;
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr(B);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(B);
   check(qr.rank() == n, "bad scaling: full rank", double(qr.rank()));
   Eigen::VectorXd x = qr.solve(b);
   check(relErr<double>(x, xTrue) < 1e-10, "bad scaling: forward error", relErr<double>(x, xTrue));
@@ -267,6 +283,7 @@ void testIllConditioned() {
   for (int i = 0; i < n; ++i) xTrue[i] = double((i * 7) % 11 - 5);
   Eigen::VectorXd b = A * xTrue;
   Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
   qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
   qr.setRankTolerance(0);  // this test is about accuracy, not rank
   qr.compute(A);
@@ -303,6 +320,7 @@ void testHiddenRankDeficiency() {
                    ", sigma_min/sigma_max " + std::to_string(svd.singularValues()[n - 1] / svd.singularValues()[0]));
   check(refRank < n, "Kahan: reference rank is deficient", double(refRank));
   Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
   qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
   qr.setOrdering(Eigen::multifrontal_qr::Ordering::Natural);
   qr.setRankTolerance(tau / svd.singularValues()[0] * Ad.colwise().norm().maxCoeff());
@@ -349,6 +367,7 @@ void testGraphMatrices() {
     using O = Eigen::multifrontal_qr::Ordering;
     for (O o : {O::COLAMD, O::AMD, O::Natural}) {
       Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+      qr.setEngine(g_engine);
       qr.setOrdering(o);
       qr.setSolution(Eigen::multifrontal_qr::Solution::Basic);
       qr.setMaxRefinements(0);
@@ -374,8 +393,11 @@ void testGraphMatrices() {
 void testParallelIdentical() {
   const auto A = lu_testing::laplacian2d(40, 40);
   Eigen::VectorXd b = Eigen::VectorXd::LinSpaced(A.rows(), 0.0, 1.0);
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> s(A);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> s;
+  s.setEngine(g_engine);
+  s.compute(A);
   Eigen::MultifrontalQR<Eigen::SparseMatrix<double>, Eigen::supernodal_lu::PooledExecutor> p;
+  p.setEngine(g_engine);
   p.executor() = Eigen::supernodal_lu::PooledExecutor(4);
   p.compute(A);
   Eigen::VectorXd xs = s.solve(b), xp = p.solve(b);
@@ -386,7 +408,9 @@ void testEdgeCases() {
   // empty rows and columns, a zero matrix, a single column
   Eigen::SparseMatrix<double> Z(5, 4);
   Z.makeCompressed();
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qz(Z);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qz;
+  qz.setEngine(g_engine);
+  qz.compute(Z);
   check(qz.rank() == 0 && qz.info() == Eigen::Success, "zero matrix: rank 0", double(qz.rank()));
   Eigen::VectorXd xz = qz.solve(Eigen::VectorXd::Ones(5));
   check(xz.norm() == 0.0, "zero matrix: min-norm solution is 0", xz.norm());
@@ -395,7 +419,9 @@ void testEdgeCases() {
   C.insert(1, 0) = 2.0;
   C.insert(3, 0) = 2.0;
   C.makeCompressed();
-  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qc(C);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qc;
+  qc.setEngine(g_engine);
+  qc.compute(C);
   Eigen::VectorXd bc(4);
   bc << 1, 1, 1, 3;  // x = (2*1 + 2*3) / (2^2 + 2^2) = 1
   check(std::abs(qc.solve(bc)[0] - 1.0) < 1e-15, "single column: least squares", qc.solve(bc)[0]);
@@ -403,28 +429,55 @@ void testEdgeCases() {
 
 }  // namespace
 
+void testAutoEngine() {
+  using Eigen::multifrontal_qr::Engine;
+  const auto A = lu_testing::laplacian2d(30, 30);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setScalarEngineThreshold(1000000);
+  qr.compute(A);
+  checkTrue(qr.engineUsed() == Engine::Scalar, "auto engine: R below the threshold -> scalar");
+  qr.setScalarEngineThreshold(1000);
+  qr.setScalarEngineDensity(0.0, 0);
+  qr.compute(A);
+  checkTrue(qr.engineUsed() == Engine::Multifrontal, "auto engine: R above the threshold -> multifrontal");
+  Eigen::VectorXd b = Eigen::VectorXd::LinSpaced(A.rows(), -1.0, 1.0);
+  Eigen::VectorXd xm = qr.solve(b);
+  qr.setEngine(Engine::Scalar);
+  qr.compute(A);
+  Eigen::VectorXd xs = qr.solve(b);
+  check(relErr<double>(xs, xm) < 1e-13, "engines agree", relErr<double>(xs, xm));
+}
+
 int main() {
-  std::printf("--- square ---\n");
-  testSquare<double>("random 300", randomSparse<double>(300, 300, 0.01, 1));
-  testSquare<double>("laplacian 30x30", lu_testing::laplacian2d(30, 30));
-  testSquare<double>("upwind 25x25", lu_testing::upwind2d(25, 25));
-  testSquare<std::complex<double>>("complex random 200", randomSparse<std::complex<double>>(200, 200, 0.02, 2));
-  testSquare<double>("laplacian3d 12^3 (large R11)", lu_testing::laplacian3d(12, 12, 12));
-  testOrderingsAgree();
-  testTridiagonalFill();
-  std::printf("--- least squares ---\n");
-  testLeastSquares<double>("tall 300x120", 300, 120, 3);
-  testLeastSquares<std::complex<double>>("complex tall 200x90", 200, 90, 4);
-  testUnderdetermined<double>("wide 80x150", 80, 150, 5);
-  testUnderdetermined<std::complex<double>>("complex wide 60x100", 60, 100, 6);
-  std::printf("--- rank ---\n");
-  testExactRankDeficiency();
-  testHiddenRankDeficiency();
-  testBadScaling();
-  testGraphMatrices();
-  std::printf("--- accuracy / parallel / edge ---\n");
-  testIllConditioned();
-  testParallelIdentical();
-  testEdgeCases();
+  using Eigen::multifrontal_qr::Engine;
+  for (Engine e : {Engine::Multifrontal, Engine::Scalar}) {
+    g_engine = e;
+    const char* tag = e == Engine::Multifrontal ? "multifrontal" : "scalar";
+    std::printf("=== engine: %s ===\n", tag);
+    std::printf("--- square ---\n");
+    testSquare<double>("random 300", randomSparse<double>(300, 300, 0.01, 1));
+    testSquare<double>("laplacian 30x30", lu_testing::laplacian2d(30, 30));
+    testSquare<double>("upwind 25x25", lu_testing::upwind2d(25, 25));
+    testSquare<std::complex<double>>("complex random 200", randomSparse<std::complex<double>>(200, 200, 0.02, 2));
+    testSquare<double>("laplacian3d 12^3 (large R11)", lu_testing::laplacian3d(12, 12, 12));
+    testOrderingsAgree();
+    testTridiagonalFill();
+    std::printf("--- least squares ---\n");
+    testLeastSquares<double>("tall 300x120", 300, 120, 3);
+    testLeastSquares<std::complex<double>>("complex tall 200x90", 200, 90, 4);
+    testUnderdetermined<double>("wide 80x150", 80, 150, 5);
+    testUnderdetermined<std::complex<double>>("complex wide 60x100", 60, 100, 6);
+    std::printf("--- rank ---\n");
+    testExactRankDeficiency();
+    testHiddenRankDeficiency();
+    testBadScaling();
+    testGraphMatrices();
+    std::printf("--- accuracy / parallel / edge ---\n");
+    testIllConditioned();
+    testParallelIdentical();
+    testEdgeCases();
+  }
+  std::printf("=== engine selection ===\n");
+  testAutoEngine();
   return lu_testing::summarize("MultifrontalQR");
 }

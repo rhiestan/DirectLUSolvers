@@ -20,8 +20,10 @@ bool trusted   = qr.rankIsVerified();
 Eigen::VectorXd x = qr.solve(b);   // minimum-norm least-squares solution by default
 ```
 
-Dependency-free (Eigen + C++17), parallel through the same [`Executor`](Parallelism.md) as the
-other solvers.
+Two factorization engines sit behind the one interface — a multifrontal one with dense
+block kernels and a scalar left-looking one — and `Engine::Auto` picks between them per matrix
+(see [Two engines](#two-engines)). Dependency-free (Eigen + C++17), parallel through the same
+[`Executor`](Parallelism.md) as the other solvers.
 
 ## Why not `Eigen::SparseQR`
 
@@ -43,7 +45,8 @@ Two defects of `Eigen::SparseQR`, both measured on this project's matrices, deci
 ## How it works
 
 **Analysis** (pattern only). Column ordering (COLAMD, AMD on the pattern of AᴴA, or natural;
-`Auto` tries COLAMD and AMD and keeps the smaller predicted R), the column elimination tree
+`Auto` tries COLAMD and AMD and keeps the smaller predicted R — skipping AMD when COLAMD's R is
+already within 2× of nnz(A), and stopping AMD's count once it passes COLAMD's), the column elimination tree
 straight from A (never forming AᴴA), a postorder, and the front partition. The partition is the
 shared one in `SupernodalLUSymbolic.h`, fed a *pseudo-adjacency* (each column's own rows are the
 rows whose leftmost column it is — everything else arrives through the tree), with the
@@ -61,6 +64,40 @@ run concurrently; a level with fewer fronts than lanes (the root separators, whe
 work is) instead splits each trailing update into fixed-width column chunks across the executor.
 The chunk width does not depend on the thread count, so **parallel results are bit-identical to
 serial ones**.
+
+### Two engines
+
+The multifrontal engine above pays per front: assembly, sorting, a dense block with its
+amalgamation zeros. While R stays sparse that bookkeeping costs more than the arithmetic, so a
+second engine computes the same factorization without it — a **scalar left-looking Householder
+QR** in compact sparse storage (Davis's `cs_qr`, with its `cs_vcount` row assignment, which is
+exactly what `Eigen::SparseQR` lacks). Scaling, rank verification, the deferred block, the solves
+and refinement are shared; only the loop that produces R and Q differs.
+
+Its structure is static: every column has a fixed pivot row. So it cannot do what Heath's rule
+does in a front — let a dead column's row serve a later column — and instead **defers** any
+column whose pivot is at or below the threshold. The SVD of the deferred block then decides
+those columns exactly. That is cheap for a few dependent columns and expensive for many
+(`Pajek/SmaGri`'s 548 took 75 ms against 4.7 ms multifrontal), so `Auto` hands a matrix to the
+multifrontal engine as soon as its deferred block would exceed `setScalarDeferralLimit` (64).
+
+What decides between the engines is not the size of R but **how full its columns are**.
+Measured over 77 matrices (both engines, best of three):
+
+| nnz(R) per column | scalar vs multifrontal | examples |
+|---|---|---|
+| any, with nnz(R) ≤ 25k | **1.2–3.1× faster** | every setfos sample, `bwm2000` 2.9×, `b2_ss` 2.1× |
+| ≤ ~38, nnz(R) up to ~250k | **1.1–2.9× faster** | `spmsrtls` (7/col) 2.3×, `ted_B_unscaled` (24/col) 2.4×, `TSOPF_RS_b9_c6` 1.5× |
+| ≥ ~40 | 0.15–1.0× | `lap3d_8` (69/col, only 35k) 0.85×, `cell2` 0.42×, `sit100` 0.15× |
+| 20M-entry R | does not finish in 60 s | `foldoc`, `as-caida`, `wiki-RfA` |
+
+`Auto` therefore takes the scalar engine when nnz(R) ≤ 25k, or when nnz(R) ≤ 500k and at most
+38 per column (the symbolic count stops as soon as it passes that budget, so asking is cheap).
+Over the 77 matrices that choice is **1.56× faster than multifrontal-only** (geometric mean,
+0.91–4.3×), 1.29× faster than scalar-only, and within 2% of the better engine per matrix; it
+picked the scalar engine for 42 of them. Every rank was identical under all three settings.
+
+The scalar engine is serial; the multifrontal one is the parallel path.
 
 **Q is stored**, as per-front Householder vectors. It costs memory (nnzH is comparable to nnzR)
 but is what makes the least-squares solve backward stable without relying on the semi-normal
@@ -88,6 +125,14 @@ equations.
      when singular values cluster near `tol` (see `nnc1374` below).
 
    This repeats until the check passes (`setMaxRepairs`, default 8).
+
+   The check has a cheap first stage. σ_min(R11) ≥ 1/(√r · ‖R11⁻¹‖₁), and a Hager–Higham
+   estimate of that 1-norm costs a handful of solves (it is also what `conditionEstimate()`
+   needs). When the bound clears the threshold by 1000× the iteration is skipped and
+   `smallestSingularValues()` holds that single bound (`singularValuesAreBound()`). A matrix
+   near its rank threshold never passes, so Kahan, `nnc1374` and `rw5151` still get the full
+   iteration; on a well-conditioned matrix the check drops from ~25 solves to ~6.
+   `setThoroughVerification(true)` always runs the full iteration.
 
 What the decision rests on is reported rather than hidden:
 
@@ -163,15 +208,16 @@ Single thread unless noted; `err` is the forward error for a full-rank matrix.
 
 | matrix | n | Eigen::SparseQR factor | MultifrontalQR factor | nnz(R) Eigen → ours |
 |---|---:|---:|---:|---:|
-| DriftDiffusion `…n29841` | 4737 | 8974 ms | 5.9 ms | 5,588,544 → 26,070 |
-| DriftDiffusion `…n722` | 3333 | 2348 ms | 5.2 ms | 5,277,925 → 70,946 |
-| DriftDiffusion `…n12841` | 3006 | 1230 ms | 3.8 ms | 3,142,408 → 41,958 |
-| Optics `…n26` | 1260 | 87 ms | 4.5 ms | 324,096 → 58,381 |
-| complex AcSolver `…n1` | 2025 | 113 ms, **rank 2, err 1.0** | 4.9 ms, rank 2025, err 4.7e-9 | — |
-| complex AcSolver `…n9` | 303 | 2.5 ms, **rank 2, err 1.0** | 0.9 ms, rank 303, err 2.9e-14 | — |
+| DriftDiffusion `…n29841` | 4737 | 8974 ms | 0.86 ms | 5,588,544 → 14,219 |
+| DriftDiffusion `…n722` | 3333 | 2348 ms | 3.1 ms | 5,277,925 → 70,946 |
+| DriftDiffusion `…n12841` | 3006 | 1230 ms | 1.8 ms | 3,142,408 → 24,030 |
+| Optics `…n26` | 1260 | 87 ms | 2.8 ms | 324,096 → 46,190 |
+| complex AcSolver `…n1` | 2025 | 113 ms, **rank 2, err 1.0** | 2.6 ms, rank 2025, err 5e-09 | — |
+| complex AcSolver `…n9` | 303 | 2.5 ms, **rank 2, err 1.0** | 0.17 ms, rank 303, err 3e-14 | — |
 
-Factor times include rank verification. On matrices this small, verification costs 0.3–1.5×
-the factorization itself (`setRankVerification(false)` removes it).
+Factor times are `Engine::Auto` (the scalar engine, for all of these) and include rank
+verification. With the cheap first stage verification costs about a third of the scalar
+factorization on these matrices; `setRankVerification(false)` removes it.
 
 **SuiteSparse corpus** — see [the comparison table below](#suitesparse-corpus-against-eigensparseqr).
 
@@ -187,68 +233,74 @@ the factorization itself (`setRankVerification(false)` removes it).
 
 ## SuiteSparse corpus, against `Eigen::SparseQR`
 
-Both solvers single-threaded, 300 s limit per run, `b = A·xTrue`. `rank` is each solver's own
-decision; MultifrontalQR's was verified on every matrix. Factor time includes verification.
-Over the 34 matrices both finished, MultifrontalQR is **3–3600× faster, median 38×**.
+Both solvers single-threaded, `b = A·xTrue`; Eigen had 300 s per run. `rank` is each solver's
+own decision; MultifrontalQR's was verified on every matrix. Our factor time is
+`Engine::Auto`, best of three, and includes verification. Over the 34 matrices both finished,
+MultifrontalQR is **5–6400× faster, median 57×**.
 
-| matrix | n | Eigen factor | Eigen rank | Eigen resid | ours factor | our rank | our resid |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| `nasa1824` | 1824 | 535 ms | 1824 | 3e-15 | 21 ms | 1824 | 3e-16 |
-| `bwm2000` | 2000 | 282 ms | 2000 | 1e-14 | 2.3 ms | 2000 | 6e-16 |
-| `swang2` | 3169 | 3182 ms | 3169 | 4e-15 | 13 ms | 3169 | 1e-16 |
-| `raefsky2` | 3242 | 3095 ms | 3242 | 5e-15 | 736 ms | 3242 | 4e-16 |
-| `cell2` | 7055 | 66.6 s | 7054 | 5e-15 | 32 ms | 7054 | 2e-16 |
-| `nemeth01` | 9506 | 92.4 s | 9506 | 2e-15 | 52 ms | 9506 | 3e-16 |
-| `cryg10000` | 10000 | 210 s | 9999 | **1e-8** | 94 ms | 9999 | 4e-15 |
-| `sit100` | 10262 | 216 s | 10261 | 5e-15 | 286 ms | 10261 | 3e-16 |
-| `ted_B_unscaled` | 10605 | 8.4 s | **9183** | 3e-11 | 19 ms | 10605 (err 4e-16) | 2e-23 |
-| `Trefethen_20000b` | 19999 | timeout | | | timeout | | |
-| `spmsrtls` | 29995 | 117 ms | 29995 | 3e-16 | 39 ms | 29995 | 1e-16 |
-| `as-caida` | 31379 | timeout | | | 15.6 s | 7360 | 5e-16 |
-| `nnc1374` | 1374 | 243 ms | **1093** | 6e-12 | 46 ms | 1371 | 1e-15 |
-| `adder_dcop_11` | 1813 | 569 ms | **1793** | 3e-12 | 88 ms | 1813 (err 1e-11) | 1e-16 |
-| `cavity10` | 2597 | 943 ms | 2597 | 4e-15 | 23 ms | 2597 | 3e-16 |
-| `Chebyshev3` | 4101 | 3818 ms | 4100 | 2e-11 | 704 ms | 4099 | 1e-13 |
-| `cavity17` | 4562 | 4194 ms | 4562 | 5e-15 | 50 ms | 4562 | 4e-16 |
-| `shyy41` | 4720 | 7921 ms | 4715 | **4e-6** | 92 ms | 4712 | 2e-16 |
-| `tols1090` | 1090 | 16 ms | 1090 | 7e-17 | 2.2 ms | 1090 | 7e-17 |
-| `CAG_mat1916` | 1916 | 503 ms | 1916 | 1e-15 | 47 ms | 1916 | 4e-16 |
-| `meg1` | 2904 | 1716 ms | **2890** | 1e-10 | 55 ms | 2904 (err 7e-12) | 7e-16 |
-| `gemat12` | 4929 | 8173 ms | 4929 | 3e-16 | 11 ms | 4929 | 3e-16 |
-| `rw5151` | 5151 | 25.4 s | 5149 | **3e-7** | 367 ms | 5128 | 3e-13 |
-| `raefsky5` | 6316 | 2601 ms | **622** | 6e-10 | 68 ms | 6316 (err 3e-16) | 6e-17 |
-| `lhr10c` | 10672 | 134 s | 10672 | 2e-15 | 144 ms | 10670 | 3e-14 |
-| `foldoc` | 13356 | timeout | | | 20.8 s | 12919 | 3e-14 |
-| `circuit204` | 1020 | 121 ms | 1020 | 1e-15 | 3.3 ms | 1020 | 1e-16 |
-| `SmaGri` | 1059 | 42 ms | 511 | 3e-16 | 5.8 ms | 511 | 5e-16 |
-| `b2_ss` | 1089 | 56 ms | 1089 | 4e-16 | 2.3 ms | 1089 | 2e-16 |
-| `gre_1107` | 1107 | 180 ms | 1107 | 1e-15 | 11 ms | 1107 | 8e-17 |
-| `mahindas` | 1258 | 59 ms | 1258 | 6e-16 | 5.4 ms | 1258 | 4e-16 |
-| `cz1268` | 1268 | 46 ms | 1268 | 4e-15 | 2.8 ms | 1268 | 4e-16 |
-| `extr1b` | 2836 | 796 ms | **2834** | 9e-13 | 6.8 ms | 2836 (err 1e-11) | 9e-17 |
-| `raefsky6` | 3402 | 1129 ms | **690** | 7e-11 | 108 ms | 3402 (err 2e-14) | 1e-16 |
-| `TSOPF_RS_b9_c6` | 7224 | 32.5 s | 7224 | 4e-15 | 9.0 ms | 7224 | 7e-17 |
-| `fd12` | 7500 | 55.2 s | 7500 | 3e-15 | 31 ms | 7500 | 3e-16 |
-| `wiki-RfA` | 11380 | 173 s | 3474 | 2e-15 | 4.5 s | 3474 | 4e-16 |
-| `onetone2` | 36057 | timeout | | | 124 ms | 36057 | 1e-16 |
+| matrix | n | Eigen factor | Eigen rank | Eigen resid | ours factor | engine | our rank | our resid |
+|---|---:|---:|---:|---:|---:|---|---:|---:|
+| `nasa1824` | 1824 | 535 ms | 1824 | 3e-15 | 19 ms | multifrontal | 1824 | 3e-16 |
+| `bwm2000` | 2000 | 282 ms | 2000 | 1e-14 | 1.0 ms | scalar | 2000 | 6e-16 |
+| `swang2` | 3169 | 3182 ms | 3169 | 4e-15 | 7.7 ms | multifrontal | 3169 | 1e-16 |
+| `raefsky2` | 3242 | 3095 ms | 3242 | 5e-15 | 622 ms | multifrontal | 3242 | 4e-16 |
+| `cell2` | 7055 | 66.6 s | 7054 | 5e-15 | 20 ms | multifrontal | 7054 | 3e-16 |
+| `nemeth01` | 9506 | 92.4 s | 9506 | 2e-15 | 37 ms | multifrontal | 9506 | 3e-16 |
+| `cryg10000` | 10000 | 210 s | 9999 | **1e-8** | 81 ms | multifrontal | 9999 | 1e-14 |
+| `sit100` | 10262 | 216 s | 10261 | 5e-15 | 222 ms | multifrontal | 10261 | 1e-15 |
+| `ted_B_unscaled` | 10605 | 8.4 s | **9183** | 3e-11 | 8.2 ms | scalar | 10605 (err 4e-16) | 2e-23 |
+| `Trefethen_20000b` | 19999 | timeout |  |  | timeout | | | |
+| `spmsrtls` | 29995 | 117 ms | 29995 | 3e-16 | 18 ms | scalar | 29995 | 1e-16 |
+| `as-caida` | 31379 | timeout |  |  | 12.5 s | multifrontal | 7360 | 5e-16 |
+| `nnc1374` | 1374 | 243 ms | **1093** | 6e-12 | 43 ms | multifrontal | 1371 | 3e-15 |
+| `adder_dcop_11` | 1813 | 569 ms | **1793** | 3e-12 | 78 ms | multifrontal | 1813 (err 1e-11) | 1e-16 |
+| `cavity10` | 2597 | 943 ms | 2597 | 4e-15 | 18 ms | multifrontal | 2597 | 3e-16 |
+| `Chebyshev3` | 4101 | 3818 ms | 4100 | 2e-11 | 400 ms | multifrontal | 4099 | 1e-13 |
+| `cavity17` | 4562 | 4194 ms | 4562 | 5e-15 | 39 ms | multifrontal | 4562 | 4e-16 |
+| `shyy41` | 4720 | 7921 ms | 4715 | **4e-6** | 69 ms | multifrontal | 4712 | 2e-16 |
+| `tols1090` | 1090 | 16 ms | 1090 | 7e-17 | 0.28 ms | scalar | 1090 | 7e-17 |
+| `CAG_mat1916` | 1916 | 503 ms | 1916 | 1e-15 | 41 ms | multifrontal | 1916 | 4e-16 |
+| `meg1` | 2904 | 1716 ms | **2890** | 1e-10 | 45 ms | multifrontal | 2904 (err 7e-12) | 7e-16 |
+| `gemat12` | 4929 | 8173 ms | 4929 | 3e-16 | 7.8 ms | scalar | 4929 | 3e-16 |
+| `rw5151` | 5151 | 25.4 s | 5149 | **3e-7** | 331 ms | multifrontal | 5128 | 3e-13 |
+| `raefsky5` | 6316 | 2601 ms | **622** | 6e-10 | 51 ms | multifrontal | 6316 (err 3e-16) | 6e-17 |
+| `lhr10c` | 10672 | 134 s | 10672 | 2e-15 | 134 ms | multifrontal | 10670 | 3e-14 |
+| `foldoc` | 13356 | timeout |  |  | 16.4 s | multifrontal | 12919 | 3e-14 |
+| `circuit204` | 1020 | 121 ms | 1020 | 1e-15 | 2.7 ms | scalar | 1020 | 1e-16 |
+| `SmaGri` | 1059 | 42 ms | 511 | 3e-16 | 3.7 ms | multifrontal | 511 | 6e-16 |
+| `b2_ss` | 1089 | 56 ms | 1089 | 4e-16 | 0.74 ms | scalar | 1089 | 2e-16 |
+| `gre_1107` | 1107 | 180 ms | 1107 | 1e-15 | 8.8 ms | multifrontal | 1107 | 8e-17 |
+| `mahindas` | 1258 | 59 ms | 1258 | 6e-16 | 3.1 ms | multifrontal | 1258 | 4e-16 |
+| `cz1268` | 1268 | 46 ms | 1268 | 4e-15 | 1.5 ms | scalar | 1268 | 4e-16 |
+| `extr1b` | 2836 | 796 ms | **2834** | 9e-13 | 2.3 ms | scalar | 2836 (err 1e-11) | 9e-17 |
+| `raefsky6` | 3402 | 1129 ms | **690** | 7e-11 | 91 ms | multifrontal | 3402 (err 2e-14) | 1e-16 |
+| `TSOPF_RS_b9_c6` | 7224 | 32.5 s | 7224 | 4e-15 | 5.1 ms | scalar | 7224 | 7e-17 |
+| `fd12` | 7500 | 55.2 s | 7500 | 3e-15 | 29 ms | multifrontal | 7500 | 3e-16 |
+| `wiki-RfA` | 11380 | 173 s | 3474 | 2e-15 | 3925 ms | multifrontal | 3474 | 4e-16 |
+| `onetone2` | 36057 | timeout |  |  | 95 ms | multifrontal | 36057 | 1e-16 |
 
 Bold marks an Eigen answer that is wrong: a rank far below the one at which the system solves
 to a forward error of 1e-11 or better (`raefsky5`: 622 of 6316), or a residual on a consistent
 system that shows the rank decision left an ill-conditioned R11 behind (`shyy41`, `rw5151`,
 `cryg10000`). The largest ratios come from the missing row permutation (`TSOPF_RS_b9_c6`:
-16.8M entries in Eigen's R against 133k), the smallest from matrices where Eigen's R is already
-close to the true one (`spmsrtls`, 3×).
+16.8M entries in Eigen's R against 87k), the smallest from matrices where Eigen's R is already
+close to the true one (`spmsrtls`, 6.6×).
 
 ## Options
 
 | option | default | effect |
 |---|---|---|
+| `setEngine(Engine)` | `Auto` | `Multifrontal`, `Scalar`, or `Auto` (see [Two engines](#two-engines)) |
+| `setScalarEngineThreshold(n)` | 25000 | `Auto` takes the scalar engine up to this nnz(R) regardless of density |
+| `setScalarEngineDensity(perCol, cap)` | 38, 500000 | … and beyond it while nnz(R) ≤ min(perCol · n, cap) |
+| `setScalarDeferralLimit(k)` | 64 | `Auto` abandons the scalar engine when its deferred block would exceed k columns |
 | `setOrdering(Ordering)` | `Auto` | `COLAMD`, `AMD` (on AᴴA), `Natural`, or `Auto` (both, smaller predicted R; AMD skipped when AᴴA is too large to form — `setMaxAtAPattern`) |
 | `setScaling(Scaling)` | `Auto` | `RowsAndColumns`, `Columns`, `None`; `Auto` = rows+columns when square |
 | `setRankTolerance(tau)` | 20 (m+n) eps | relative threshold; `0` keeps every nonzero pivot |
 | `setRankVerification(bool)` | on | the check-and-repair loop |
 | `setMaxRepairs(n)` | 8 | refactorizations verification may spend |
 | `setDenseVerificationLimit(r)` | 24 | R11 order up to which verification uses a dense SVD |
+| `setThoroughVerification(bool)` | off | always run the singular-value iteration, even when the condition-estimate bound already clears the threshold 1000× |
 | `setSolution(Solution)` | `MinimumNorm` | or `Basic` |
 | `setMaxNullSpaceScalars(x)` | 5e7 | largest null-space basis a minimum-norm solve forms |
 | `setMaxRefinements(n)` | 3 | refinement steps per solve (stops early when the correction stalls) |
@@ -267,6 +319,8 @@ close to the true one (`spmsrtls`, 3×).
   The alternative — trusting Heath's rule — is wrong by 3 on `nnc1374`.
 - **The minimum-norm solution needs the null space.** Its basis costs one factor-sized solve per
   null vector: 437 of them on `foldoc` make the first solve take ~2.3 s; later solves reuse it.
+- **The scalar engine defers every dependent column.** With many of them the deferred block is
+  a large dense SVD; `Auto` avoids it, but a forced `Engine::Scalar` does not.
 - **Weighted least squares under row scaling** — see above.
 - `matrixR()` is upper trapezoidal only up to the placement of the deferred block (its rows come
   last, its columns after the dead ones); the identity it satisfies is the one at the top of
