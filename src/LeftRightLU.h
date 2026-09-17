@@ -56,6 +56,18 @@
 //   solve          : BTF block back-substitution, each block a forward (L) and
 //                    backward (U) substitution + refinement
 //
+// What is checked at the boundaries, and what is reported rather than trusted:
+//   * factorize() declines (InvalidInput) a matrix of another size than the
+//     analysis, a non-finite value, or a nonzero outside the analyzed pattern;
+//     the alternative to each of those is a write past a panel or a NaN factor
+//     under Success.
+//   * analyzePattern() invalidates any earlier factorization, and a solve()
+//     without usable factors returns NaN with NumericalIssue instead of reading
+//     whatever the arenas hold.
+//   * determinant() is accumulated as mantissa * 2^exponent, so it is inf or 0
+//     only when det(A) itself is; and under static pivoting every determinant
+//     query describes the perturbed operator (see determinant()).
+//
 // This Source Code Form is licensed under the Mozilla Public License v.2.0,
 // matching the surrounding Eigen code it integrates with.
 
@@ -75,6 +87,8 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include "LeftRightLUBlockTriangular.h"
@@ -167,8 +181,7 @@ class LeftRightLUTransposeView
 
   template <typename Rhs, typename Dest>
   void _solve_impl(const MatrixBase<Rhs>& b, MatrixBase<Dest>& x) const {
-    eigen_assert(m_solver && m_solver->isFactorized() &&
-                 "the matrix must be factorized first");
+    eigen_assert(m_solver && "transpose()/adjoint() view without a solver");
     m_solver->template _solve_transposed_impl<Conjugate>(b, x);
   }
 
@@ -341,7 +354,16 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 
   // --- main driver ----------------------------------------------------------
 
+  /** Symbolic analysis. Reads the values too (the matching prefers large
+   *  entries), so the matrix handed to factorize() should be the same pattern
+   *  with, ideally, values of the same character. Invalidates any factorization
+   *  held from an earlier compute(): solve() is refused until factorize() runs. */
   void analyzePattern(const MatrixType& matrix);
+  /** Numeric factorization against the current analysis. Declines, with
+   *  InvalidInput and a message, a matrix of another size, a non-finite value,
+   *  or a nonzero the analyzed pattern cannot hold (a nonzero that falls inside
+   *  the symbolic fill is absorbed exactly). isFactorized() says whether the
+   *  factors are usable afterwards. */
   void factorize(const MatrixType& matrix);
 
   void compute(const MatrixType& matrix) {
@@ -360,9 +382,14 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   inline Index cols() const { return m_size; }
 
   /** \returns the status of the last operation. After compute()/factorize() this
-   *  is Success unless the factorization broke down (singular). After solve() it
-   *  is downgraded to NumericalIssue if the computed solution failed the honesty
-   *  check (non-finite, or relative residual above solveFailureThreshold()). */
+   *  is Success unless the factorization broke down (singular: NumericalIssue),
+   *  the fill guard tripped (NumericalIssue), or the input was declined
+   *  (InvalidInput: a non-finite value, a matrix of another size than the one
+   *  analyzePattern() saw, or a nonzero outside the analyzed pattern). After
+   *  solve() it is downgraded to NumericalIssue if the computed solution failed
+   *  the honesty check (non-finite, or relative residual above
+   *  solveFailureThreshold()), or if there was no factorization to solve with,
+   *  in which case the answer is NaN. lastErrorMessage() says which. */
   ComputationInfo info() const { return m_info; }
 
   /** \returns true once a numeric factorization has completed successfully. */
@@ -755,16 +782,34 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     return w;
   }
 
-  /** \returns the determinant of the original matrix A. */
+  /** \returns the determinant of the matrix this factorization inverts. With
+   *  replacedPivots() == 0 that is det(A). Under static pivoting it is the
+   *  determinant of the PERTURBED operator: a singular matrix whose zero pivot
+   *  was bumped reports a nonzero value here (and Success from factorize());
+   *  replacedPivots() is what says so, and solve() reports the singularity
+   *  through its residual gate. The same holds for logAbsDeterminant() and
+   *  determinantSign().
+   *
+   *  Accumulated as a mantissa and a power-of-two exponent rather than as a
+   *  plain running product: the pivots and the equilibration factors are each
+   *  free to run through 1e+300 on the way to a perfectly representable answer
+   *  (a diagonal alternating 1e-5 and 1e+5 has determinant 1), and a running
+   *  product overflows or underflows on the way there. The result is inf or 0
+   *  only when det(A) itself is outside the representable range; use
+   *  logAbsDeterminant() with determinantSign() there. */
   Scalar determinant() const {
-    Scalar det(1);
+    Scalar mantissa(1);
+    long exponent = 0;
     for (StorageIndex s = 0; s < static_cast<StorageIndex>(m_supernodes.size()); ++s) {
       const ConstStridedPanel diag = diagBlock(s);
-      for (Index k = 0; k < diag.rows(); ++k) det *= diag(k, k);
+      for (Index k = 0; k < diag.rows(); ++k) accumulateScaled(diag(k, k), mantissa, exponent);
     }
     // m_factorizationSign folds in the parity of the matching row permutation and
     // of every in-block row AND column pivot swap, so the sign of det(A) is right.
-    return m_factorizationSign * det / m_scalingDeterminant;
+    // The equilibration scaling is positive and divides out.
+    mantissa *= m_factorizationSign / m_scalingMantissa;
+    exponent -= m_scalingExponent;
+    return scaleByPowerOfTwo(mantissa, exponent);
   }
 
   /** \returns log|det(A)| (PARDISO IPARM(33) log-determinant), accumulated as a
@@ -784,8 +829,9 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     return acc;
   }
 
-  /** \returns the sign of det(A) for real scalar types (+/-1, or 0 if a zero
-   *  pivot was produced). Pairs with logAbsDeterminant(). */
+  /** \returns the sign of det(A): +/-1 for real scalars, the unit phase
+   *  det(A)/|det(A)| for complex ones, or 0 if a zero pivot was produced.
+   *  Pairs with logAbsDeterminant(). */
   Scalar determinantSign() const {
     Scalar s = m_factorizationSign;
     for (StorageIndex sn = 0; sn < static_cast<StorageIndex>(m_supernodes.size()); ++sn) {
@@ -890,6 +936,32 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     return ConstContiguousPanel(m_uStorage.data() + m_uOffset[s], sn.width(), sn.offDiagonalRowCount);
   }
 
+  // Overflow-free running product for determinant(): keeps mantissa * 2^exponent
+  // with |mantissa| renormalized into [0.5, 1) after every factor, so the
+  // magnitude lives in `exponent` and no intermediate can overflow or underflow.
+  // A zero factor leaves mantissa at 0, which is the right answer.
+  static void accumulateScaled(const Scalar& factor, Scalar& mantissa, long& exponent) {
+    mantissa *= factor;
+    const RealScalar mag = numext::abs(mantissa);
+    if (!(mag > RealScalar(0)) || !(numext::isfinite)(mag)) return;
+    int e = 0;
+    std::frexp(mag, &e);
+    mantissa = scaleByPowerOfTwo(mantissa, -e);
+    exponent += e;
+  }
+  // mantissa * 2^exponent, scaling the real and imaginary parts separately so a
+  // complex scalar needs no complex ldexp. Overflows to inf (or underflows to 0)
+  // exactly when the true value is outside the representable range.
+  static Scalar scaleByPowerOfTwo(const Scalar& mantissa, long exponent) {
+    const int e = static_cast<int>(numext::maxi(long(-2 * std::numeric_limits<RealScalar>::max_exponent),
+                                                numext::mini(long(2 * std::numeric_limits<RealScalar>::max_exponent), exponent)));
+    return scaleByPowerOfTwoImpl(mantissa, e, std::integral_constant<bool, NumTraits<Scalar>::IsComplex>());
+  }
+  static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::false_type) { return std::ldexp(m, e); }
+  static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::true_type) {
+    return Scalar(std::ldexp(numext::real(m), e), std::ldexp(numext::imag(m), e));
+  }
+
   void init() {
     m_size = 0;
     m_analysisDone = false;
@@ -935,7 +1007,8 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     m_structurallySymmetric = true;
     m_matchSign = 1;
     m_factorizationSign = Scalar(1);
-    m_scalingDeterminant = RealScalar(1);
+    m_scalingMantissa = RealScalar(1);
+    m_scalingExponent = 0;
     m_nnzL = 0;
     m_nnzU = 0;
   }
@@ -1000,8 +1073,11 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   // readiness push in the dynamic scheduler.
   void buildConsumerLists();
 
-  // Panel position of off-diagonal internal row `r` within supernode `s`.
-  StorageIndex rowPanelPosition(StorageIndex s, StorageIndex r) const {
+  // Panel position of off-diagonal internal row `r` within supernode `s`, or
+  // -1 when `r` is not an off-diagonal row of `s` at all. The numeric phase
+  // relies on that -1: it is how a factorize() input whose pattern has grown
+  // since analyzePattern() is caught instead of scattered past the panel.
+  StorageIndex findRowPanelPosition(StorageIndex s, StorageIndex r) const {
     const Supernode& sn = m_supernodes[s];
     const StorageIndex first = sn.firstRowBlock;
     StorageIndex lo = 0, hi = sn.rowBlockCount;
@@ -1012,10 +1088,17 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
       else
         hi = mid;
     }
+    if (lo >= sn.rowBlockCount) return StorageIndex(-1);
     const RowBlock& block = m_rowBlocks[first + lo];
-    eigen_assert(lo < sn.rowBlockCount && block.firstRow <= r && r <= block.lastRow &&
-                 "rowPanelPosition: row is not an off-diagonal row of this supernode");
+    if (r < block.firstRow || r > block.lastRow) return StorageIndex(-1);
     return block.panelOffset + (r - block.firstRow);
+  }
+  // Same lookup for a row that is known to be in the structure (every
+  // structural query inside the factorization and the solve).
+  StorageIndex rowPanelPosition(StorageIndex s, StorageIndex r) const {
+    const StorageIndex pos = findRowPanelPosition(s, r);
+    eigen_assert(pos >= 0 && "rowPanelPosition: row is not an off-diagonal row of this supernode");
+    return pos;
   }
 
   // numeric: subtract the Schur contribution of a source supernode (left-looking
@@ -1129,6 +1212,26 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 
   // solve helpers (shared design with SupernodalLU, extended for the column
   // permutation Q_s produced by complete pivoting).
+  //
+  // A solve without a successful factorization has nothing to solve with: the
+  // arenas may belong to an earlier matrix of another size, or to a
+  // factorization that was declined. Reading them would be memory-unsafe, so
+  // the solve is refused -- NaN answer, NumericalIssue -- rather than asserted
+  // away, because the same call in a release build must not crash. Returns
+  // true when the factors are usable.
+  template <typename Dest>
+  bool declineWithoutFactors(MatrixBase<Dest>& x) const {
+    if (m_factorized) return true;
+    x.setConstant(Scalar(NumTraits<RealScalar>::quiet_NaN()));
+    m_lastSolveRelativeResidual = NumTraits<RealScalar>::quiet_NaN();
+    m_lastRefinementIterations = 0;
+    m_lastBackwardError = NumTraits<RealScalar>::quiet_NaN();
+    m_lastForwardError = NumTraits<RealScalar>::quiet_NaN();
+    m_info = NumericalIssue;
+    if (m_lastError.empty())
+      m_lastError = "LeftRightLU: solve() called without a successful factorization.";
+    return false;
+  }
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
   template <typename ApplyA>
   void recordSolveStatus(const DenseMatrix& rhs, const DenseMatrix& solution, ApplyA applyA) const;
@@ -1271,7 +1374,9 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
 
   std::vector<RealScalar> m_rowScale;
   std::vector<RealScalar> m_colScale;
-  RealScalar m_scalingDeterminant;
+  // prod_i rowScale[i] * colScale[i] as mantissa * 2^exponent (see determinant()).
+  RealScalar m_scalingMantissa;
+  long m_scalingExponent;
 
   bool m_analysisDone;
   bool m_factorized;
@@ -1568,6 +1673,17 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
   eigen_assert(matrix.rows() == matrix.cols() && "LeftRightLU requires a square matrix");
   m_size = static_cast<StorageIndex>(matrix.rows());
   const StorageIndex n = m_size;
+
+  // A new analysis replaces every map the numeric phase and the solve read
+  // through, so factors from an earlier compute() are no longer addressable --
+  // solving through them would index the old arenas with the new permutation.
+  // Everything cached about the previous matrix goes with them.
+  m_factorized = false;
+  m_conditionValid = false;
+  m_conditionSolves = 0;
+  m_densePenaltyValid = false;
+  m_growthValid = false;
+  m_lastError.clear();
 
   // 0) maximum-transversal matching (MC64-style): place large entries on the
   //    diagonal. All symbolic analysis runs on the matched matrix.
@@ -2167,11 +2283,37 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
     }
   }
 
+  // The numeric phase scatters every entry into a slot the symbolic phase laid
+  // out, and reads the permutation maps by original row and column. A matrix of
+  // another size would index past those maps; a non-finite value would poison
+  // the equilibration (0 * inf) and then every factor it touches, and the
+  // factorization has no zero pivot to trip on -- NaN compares false to
+  // everything -- so it would report Success over a NaN factor. Both are
+  // declined up front. Pattern mismatches are caught in the scatter below.
+  if (matrix.rows() != Index(m_size) || matrix.cols() != Index(m_size)) {
+    m_info = InvalidInput;
+    m_lastError = "LeftRightLU: factorize() received a matrix of a different size than the one "
+                  "analyzePattern() saw; call analyzePattern() (or compute()) on the new matrix.";
+    return;
+  }
+  for (StorageIndex j = 0; j < m_size; ++j)
+    for (typename MatrixType::InnerIterator it(matrix, j); it; ++it)
+      if (!(numext::isfinite)(numext::abs(it.value()))) {
+        m_info = InvalidInput;
+        m_lastError = "LeftRightLU: the matrix contains a non-finite (inf or NaN) value.";
+        return;
+      }
+
   m_originalMatrix = matrix;
 
   computeEquilibration(matrix);
-  m_scalingDeterminant = RealScalar(1);
-  for (StorageIndex i = 0; i < m_size; ++i) m_scalingDeterminant *= m_rowScale[i] * m_colScale[i];
+  {
+    Scalar mantissa(1);
+    m_scalingExponent = 0;
+    for (StorageIndex i = 0; i < m_size; ++i)
+      accumulateScaled(Scalar(m_rowScale[i] * m_colScale[i]), mantissa, m_scalingExponent);
+    m_scalingMantissa = numext::real(mantissa);
+  }
 
   // max|A~| of the equilibrated matrix. The automatic static-pivot threshold
   // needs it, and so does growthFactor() -- so it is computed unconditionally
@@ -2220,7 +2362,14 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
   std::vector<StorageIndex> offCursor;
   if (btf) offCursor.assign(m_offDiagStart.begin(), m_offDiagStart.end() - 1);
 
-  for (StorageIndex j = 0; j < m_size; ++j) {
+  // Every entry must land in a slot the symbolic phase created: an entry with
+  // no slot means this matrix has a nonzero where the analyzed one had none.
+  // That is a caller error (analyzePattern() must see the pattern factorize()
+  // gets), but writing past a panel over it would corrupt the arenas, so it is
+  // reported instead. Entries the analyzed pattern had and this matrix lacks
+  // are simply zeros and need no check.
+  bool patternMismatch = false;
+  for (StorageIndex j = 0; j < m_size && !patternMismatch; ++j) {
     const StorageIndex jj = m_toInternal[j];
     const StorageIndex columnSupernode = m_supernodeOfColumn[jj];
     const Supernode& cs = m_supernodes[columnSupernode];
@@ -2233,7 +2382,16 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
       const Scalar value = it.value() * m_rowScale[origRow] * m_colScale[j];
       if (btf && m_btfBlockOfInternal[static_cast<std::size_t>(ii)] !=
                      m_btfBlockOfInternal[static_cast<std::size_t>(jj)]) {
-        const std::size_t slot = static_cast<std::size_t>(offCursor[static_cast<std::size_t>(jj)]++);
+        // Cross-block entries live above the diagonal blocks (block UPPER
+        // triangular); one below would break the block back-substitution.
+        StorageIndex& cursor = offCursor[static_cast<std::size_t>(jj)];
+        if (cursor >= m_offDiagStart[static_cast<std::size_t>(jj) + 1] ||
+            m_btfBlockOfInternal[static_cast<std::size_t>(ii)] >
+                m_btfBlockOfInternal[static_cast<std::size_t>(jj)]) {
+          patternMismatch = true;
+          break;
+        }
+        const std::size_t slot = static_cast<std::size_t>(cursor++);
         m_offDiagRow[slot] = ii;
         m_offDiagValue[slot] = value;
       } else if (m_supernodeOfColumn[ii] == columnSupernode) {
@@ -2241,18 +2399,33 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorize(const MatrixType
         const std::size_t row = static_cast<std::size_t>(ii) - csFirst;
         m_lStorage[m_lOffset[columnSupernode] + col * csStride + row] += value;
       } else if (ii > jj) {
+        const StorageIndex pos = findRowPanelPosition(columnSupernode, ii);
+        if (pos < 0) {
+          patternMismatch = true;
+          break;
+        }
         const std::size_t col = static_cast<std::size_t>(jj) - csFirst;
-        const std::size_t pos = static_cast<std::size_t>(rowPanelPosition(columnSupernode, ii));
-        m_lStorage[m_lOffset[columnSupernode] + col * csStride + csWidth + pos] += value;
+        m_lStorage[m_lOffset[columnSupernode] + col * csStride + csWidth + static_cast<std::size_t>(pos)] +=
+            value;
       } else {
         const StorageIndex rowSupernode = m_supernodeOfColumn[ii];
         const Supernode& rs = m_supernodes[rowSupernode];
         const std::size_t rsWidth = static_cast<std::size_t>(rs.width());
-        const std::size_t pos = static_cast<std::size_t>(rowPanelPosition(rowSupernode, jj));
+        const StorageIndex pos = findRowPanelPosition(rowSupernode, jj);
+        if (pos < 0) {
+          patternMismatch = true;
+          break;
+        }
         const std::size_t row = static_cast<std::size_t>(ii) - static_cast<std::size_t>(rs.firstColumn);
-        m_uStorage[m_uOffset[rowSupernode] + pos * rsWidth + row] += value;
+        m_uStorage[m_uOffset[rowSupernode] + static_cast<std::size_t>(pos) * rsWidth + row] += value;
       }
     }
+  }
+  if (patternMismatch) {
+    m_info = InvalidInput;
+    m_lastError = "LeftRightLU: factorize() received a matrix with a nonzero outside the pattern "
+                  "analyzePattern() saw; call analyzePattern() (or compute()) on the new matrix.";
+    return;
   }
 
   // 3) LEFT-RIGHT-LOOKING numeric factorization driven by a barrier-free dynamic
@@ -2521,7 +2694,7 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 template <typename Rhs, typename Dest>
 void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
                                                                   MatrixBase<Dest>& x) const {
-  eigen_assert(m_factorized && "the matrix must be factorized first");
+  if (!declineWithoutFactors(x)) return;
   const Index nrhs = b.cols();
   const DenseMatrix rhs = b;
   DenseMatrix solution(m_size, nrhs);
@@ -2668,6 +2841,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::recordSolveStatus(const De
                       relResid <= m_solveFailureThreshold;
   if (usable) {
     m_info = Success;
+    m_lastError.clear();  // an earlier solve's failure does not describe this one
   } else {
     m_info = NumericalIssue;
     m_lastError =
@@ -2979,7 +3153,7 @@ template <typename MatrixType, typename OrderingType, typename Executor>
 template <bool Conjugate, typename Rhs, typename Dest>
 void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(const MatrixBase<Rhs>& b,
                                                                              MatrixBase<Dest>& x) const {
-  eigen_assert(m_factorized && "the matrix must be factorized first");
+  if (!declineWithoutFactors(x)) return;
   const Index nrhs = b.cols();
   const DenseMatrix rhs = b;
   DenseMatrix solution(m_size, nrhs);

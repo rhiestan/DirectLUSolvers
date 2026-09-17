@@ -7,7 +7,10 @@
 //
 // Covers: direct solves, multiple RHS, factor accessors, transpose/adjoint,
 // equilibration, complete vs partial vs no in-block pivoting, log-determinant,
-// honest failure reporting, and parallel(dynamic-scheduler)-vs-serial agreement.
+// honest failure reporting, parallel(dynamic-scheduler)-vs-serial agreement, and
+// the input-validation contract: re-analysis invalidates old factors, non-finite
+// input and pattern/size mismatches are declined, a solve without factors is
+// refused, and determinant() survives intermediate overflow.
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
@@ -15,7 +18,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -548,6 +553,506 @@ void testUnsymmetricPatternFeatures() {
         "unsym pattern: parallel dynamic scheduler", presid);
 }
 
+// ---------------------------------------------------------------------------
+//  Input validation, state invalidation and reporting
+// ---------------------------------------------------------------------------
+
+typedef std::complex<double> cd;
+typedef SparseMatrix<cd> SpMatC;
+
+// Block upper triangular with dense random diagonal blocks and sparse coupling
+// above them: reducible by construction, so BTF finds nb blocks. With
+// weakDiag the diagonal entries are 1e-3 against O(1) off-diagonals, which is
+// what makes complete pivoting actually swap columns inside the blocks.
+template <typename Scalar>
+SparseMatrix<Scalar> reducibleDenseBlocks(int nb, int bs, unsigned seed, bool weakDiag) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  const int n = nb * bs;
+  std::vector<Eigen::Triplet<Scalar>> t;
+  for (int b = 0; b < nb; ++b)
+    for (int i = 0; i < bs; ++i)
+      for (int j = 0; j < bs; ++j) {
+        double v = uni(rng);
+        if (i == j) v = weakDiag ? 1e-3 * uni(rng) : (bs + uni(rng));
+        t.emplace_back(b * bs + i, b * bs + j, Scalar(v));
+      }
+  for (int b = 0; b + 1 < nb; ++b)
+    for (int k = 0; k < bs; ++k) t.emplace_back(b * bs + (k * 7) % bs, (b + 1) * bs + k, Scalar(uni(rng)));
+  SparseMatrix<Scalar> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+// Multiply every entry by a unit phase so the matrix is genuinely complex
+// (values, pivots and determinant all carry a phase).
+SpMatC withPhases(SpMatC A) {
+  for (int j = 0; j < A.outerSize(); ++j)
+    for (SpMatC::InnerIterator it(A, j); it; ++it)
+      it.valueRef() *= cd(std::cos(0.7 * j + it.row()), std::sin(0.7 * j + it.row()));
+  return A;
+}
+
+// A new analyzePattern() replaces every permutation and every panel layout the
+// solve reads through. The factors of the previous matrix must therefore stop
+// being addressable, or a solve() after analyzePattern(B) would index the old
+// arenas with the new maps (which, before this was pinned, reached an Eigen
+// size assertion in debug and out-of-bounds reads in release).
+void testAnalyzePatternInvalidatesFactors() {
+  const SparseMatrix<double> A = laplacian2d(10, 10);
+  const SparseMatrix<double> B = laplacian2d(4, 4);
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.compute(A);
+  checkTrue(solver.isFactorized(), "compute(A) factorizes");
+  solver.analyzePattern(B);
+  checkTrue(!solver.isFactorized(), "analyzePattern(B) invalidates A's factors");
+  checkTrue(solver.info() == Eigen::Success, "analyzePattern(B) itself succeeds");
+
+  const VectorXd x = solver.solve(VectorXd::Ones(16));
+  checkTrue(solver.info() == Eigen::NumericalIssue && !x.allFinite(),
+            "solve() between analyzePattern() and factorize() is refused");
+  checkTrue(std::isinf(solver.conditionEstimate()), "conditionEstimate() has no factorization to describe");
+  checkTrue(std::isnan(solver.growthFactor()), "growthFactor() has no factorization to describe");
+
+  solver.factorize(B);
+  const VectorXd xTrue = VectorXd::Random(16);
+  const VectorXd x2 = solver.solve(B * xTrue);
+  check(solver.info() == Eigen::Success && (x2 - xTrue).norm() / xTrue.norm() < 1e-10,
+        "factorize(B) after the re-analysis solves B", (x2 - xTrue).norm() / xTrue.norm());
+}
+
+// denseRowFillPenalty() is cached per analysis; the cache has to follow the
+// analysis, not the factorization, or a solver reused for a second symbolic
+// analysis answers with the first matrix's penalty.
+void testDenseRowPenaltyFollowsTheAnalysis() {
+  const int n = 400;
+  std::vector<Eigen::Triplet<double>> t;
+  for (int i = 0; i < n; ++i) t.emplace_back(i, i, 4.0);
+  for (int i = 0; i + 1 < n; ++i) {
+    t.emplace_back(i, i + 1, -1.0);
+    t.emplace_back(i + 1, i, -1.0);
+  }
+  for (int d = 0; d < 3; ++d)
+    for (int j = 0; j < n; ++j)
+      if (j != d) {
+        t.emplace_back(d, j, 0.01);
+        t.emplace_back(j, d, 0.01);
+      }
+  SparseMatrix<double> arrow(n, n);
+  arrow.setFromTriplets(t.begin(), t.end());
+  arrow.makeCompressed();
+  const SparseMatrix<double> grid = laplacian2d(20, 20);
+
+  Eigen::LeftRightLU<SparseMatrix<double>> reused, fresh;
+  reused.analyzePattern(arrow);
+  const double arrowPenalty = reused.denseRowFillPenalty(arrow);
+  reused.analyzePattern(grid);
+  fresh.analyzePattern(grid);
+  const double reusedPenalty = reused.denseRowFillPenalty(grid);
+  const double freshPenalty = fresh.denseRowFillPenalty(grid);
+  std::printf("        arrow penalty=%.4f grid: reused=%.4f fresh=%.4f\n", arrowPenalty, reusedPenalty,
+              freshPenalty);
+  checkTrue(reusedPenalty == freshPenalty, "denseRowFillPenalty() is recomputed after a new analysis");
+}
+
+// An inf or NaN entry poisons the equilibration (0 * inf) and then every factor
+// it touches, and NaN never trips a zero-pivot test, so without a check the
+// factorization reported Success over NaN factors. It is declined instead.
+void testNonFiniteInputIsDeclined() {
+  const double bad[2] = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()};
+  const char* names[2] = {"inf", "NaN"};
+  for (int k = 0; k < 2; ++k) {
+    SparseMatrix<double> A = laplacian2d(6, 6);
+    A.coeffRef(7, 7) = bad[k];
+    Eigen::LeftRightLU<SparseMatrix<double>> solver;
+    solver.compute(A);
+    checkTrue(solver.info() == Eigen::InvalidInput && !solver.isFactorized(),
+              std::string("a matrix with an ") + names[k] + " entry is declined (InvalidInput)");
+    checkTrue(!solver.lastErrorMessage().empty(), std::string(names[k]) + ": lastErrorMessage() explains");
+    const VectorXd x = solver.solve(VectorXd::Ones(36));
+    checkTrue(solver.info() != Eigen::Success && !x.allFinite(),
+              std::string(names[k]) + ": solve() after the declined factorization is refused");
+  }
+}
+
+// factorize() scatters into the panels analyzePattern() laid out. A matrix of
+// another size would index past the permutation maps, and an entry with no
+// slot would be written past a panel; both are caught and reported. An entry
+// that lands in a FILL slot the symbolic phase already created is a different
+// matter: it is factored exactly, because the structure is a superset.
+void testFactorizeInputMismatchIsReported() {
+  const SparseMatrix<double> A = laplacian2d(12, 12);
+  const int n = static_cast<int>(A.rows());
+
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.analyzePattern(A);
+  solver.factorize(laplacian2d(5, 5));
+  checkTrue(solver.info() == Eigen::InvalidInput && !solver.isFactorized(),
+            "factorize() with a matrix of another size is refused");
+
+  // Entries far off the band: not in the fill of a 5-point stencil ordered by AMD.
+  SparseMatrix<double> grown = A;
+  grown.coeffRef(0, n - 1) = 0.5;
+  grown.coeffRef(n - 1, 3) = -0.25;
+  grown.makeCompressed();
+  solver.analyzePattern(A);
+  solver.factorize(grown);
+  checkTrue(solver.info() == Eigen::InvalidInput && !solver.isFactorized(),
+            "factorize() with a nonzero outside the analyzed pattern is refused");
+  const VectorXd x = solver.solve(VectorXd::Ones(n));
+  checkTrue(solver.info() != Eigen::Success && !x.allFinite(), "solve() after the refusal is refused too");
+
+  solver.compute(grown);
+  const VectorXd xTrue = VectorXd::Random(n);
+  const VectorXd x2 = solver.solve(grown * xTrue);
+  check(solver.info() == Eigen::Success && (x2 - xTrue).norm() / xTrue.norm() < 1e-10,
+        "compute() on the grown matrix recovers", (x2 - xTrue).norm() / xTrue.norm());
+
+  // Under BTF an entry BELOW the diagonal blocks would break the block
+  // back-substitution even when the column still has spare cross-block slots.
+  const SparseMatrix<double> R = reducibleDenseBlocks<double>(4, 5, 77, false);
+  SparseMatrix<double> lowered = R;
+  lowered.coeffRef(19, 0) = 1.0;  // last block -> first block: below the diagonal blocks
+  lowered.makeCompressed();
+  Eigen::LeftRightLU<SparseMatrix<double>> btf;
+  btf.analyzePattern(R);
+  checkTrue(btf.btfBlockCount() == 4, "reducible test matrix splits into 4 BTF blocks");
+  btf.factorize(lowered);
+  checkTrue(btf.info() == Eigen::InvalidInput, "entry below the BTF diagonal blocks is refused");
+  btf.compute(lowered);
+  const VectorXd xr = VectorXd::Random(20);
+  const VectorXd xl = btf.solve(lowered * xr);
+  check(btf.info() == Eigen::Success && (xl - xr).norm() / xr.norm() < 1e-10,
+        "compute() on the lowered matrix recovers", (xl - xr).norm() / xr.norm());
+
+  // An entry inside the fill is legitimately absorbed: same pattern for the
+  // solver's purposes, exact answer.
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::NaturalOrdering<int>> natural;
+  natural.analyzePattern(A);
+  SparseMatrix<double> filled = A;
+  filled.coeffRef(2, 0) = 0.3;  // (2,0) is fill of the natural-ordered 5-point stencil
+  filled.makeCompressed();
+  natural.factorize(filled);
+  const VectorXd xf = natural.solve(filled * xTrue);
+  check(natural.info() == Eigen::Success && (xf - xTrue).norm() / xTrue.norm() < 1e-10,
+        "a nonzero inside the fill is factored exactly", (xf - xTrue).norm() / xTrue.norm());
+}
+
+// A solve without a successful factorization has nothing to solve with; in a
+// release build it used to read whatever the arenas held (a previous matrix's
+// factors, or none) and could crash. Now it answers NaN with NumericalIssue.
+void testSolveWithoutFactorizationIsRefused() {
+  const SparseMatrix<double> A = laplacian2d(20, 20);
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.compute(laplacian2d(3, 3));  // earlier, smaller factorization in the arenas
+  solver.setMaxFactorNonzeros(10);    // guaranteed to trip on the 20x20 grid
+  solver.compute(A);
+  checkTrue(solver.info() == Eigen::NumericalIssue && !solver.isFactorized(), "fill guard declined");
+
+  const VectorXd x = solver.solve(VectorXd::Ones(400));
+  checkTrue(solver.info() == Eigen::NumericalIssue && x.size() == 400 && !x.allFinite(),
+            "solve() after a declined factorization returns NaN + NumericalIssue");
+  checkTrue(!solver.lastErrorMessage().empty(), "... and keeps the factorization's message");
+  const VectorXd xt = solver.transpose().solve(VectorXd::Ones(400));
+  checkTrue(solver.info() == Eigen::NumericalIssue && !xt.allFinite(),
+            "transpose().solve() after a declined factorization is refused");
+  const VectorXd xa = solver.adjoint().solve(VectorXd::Ones(400));
+  checkTrue(solver.info() == Eigen::NumericalIssue && !xa.allFinite(),
+            "adjoint().solve() after a declined factorization is refused");
+  checkTrue(std::isnan(solver.solveResidual()), "solveResidual() is NaN for a refused solve");
+}
+
+// The solve status describes the LAST solve: a message left by an earlier
+// failed solve must not survive a later successful one.
+void testSolveStatusIsPerSolve() {
+  const SparseMatrix<double> A = laplacian2d(6, 6);
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.setSolveFailureThreshold(1e-300);  // no residual can pass this
+  solver.compute(A);
+  VectorXd x = solver.solve(VectorXd::Ones(36));
+  checkTrue(solver.info() == Eigen::NumericalIssue && !solver.lastErrorMessage().empty(),
+            "impossible gate: solve flagged with a message");
+  solver.setSolveFailureThreshold(1e-6);
+  x = solver.solve(VectorXd::Ones(36));
+  checkTrue(solver.info() == Eigen::Success && solver.lastErrorMessage().empty(),
+            "passing solve clears the earlier failure message");
+}
+
+// determinant() is a product of n pivots divided by a product of 2n scaling
+// factors. Accumulated naively either product can pass through 1e+300 on the
+// way to an answer of 1, and a diagonal half 1e-5 and half 1e+5 does exactly
+// that. logAbsDeterminant() never had the problem; determinant() now agrees
+// with it wherever the answer is representable.
+void testDeterminantSurvivesIntermediateOverflow() {
+  const int n = 400;
+  SparseMatrix<double> A(n, n);
+  for (int i = 0; i < n; ++i) A.insert(i, i) = (i < n / 2) ? 1e-5 : 1e5;  // det = 1 exactly
+  A.makeCompressed();
+
+  Eigen::LeftRightLU<SparseMatrix<double>> equilibrated;
+  equilibrated.compute(A);
+  check(std::abs(equilibrated.determinant() - 1.0) < 1e-10, "determinant() = 1 through Ruiz scaling 1e+1000",
+        equilibrated.determinant());
+
+  Eigen::LeftRightLU<SparseMatrix<double>> raw;
+  raw.setEquilibration(false);
+  raw.setStaticPivotThreshold(0.0);  // the 1e-5 pivots are real pivots, not weak ones
+  raw.compute(A);
+  check(raw.replacedPivots() == 0 && std::abs(raw.determinant() - 1.0) < 1e-10,
+        "determinant() = 1 through pivots 1e-1000", raw.determinant());
+  check(std::abs(raw.logAbsDeterminant()) < 1e-9, "logAbsDeterminant() = 0", raw.logAbsDeterminant());
+
+  // Genuinely out of range: inf and 0, not garbage.
+  SparseMatrix<double> big(n, n);
+  for (int i = 0; i < n; ++i) big.insert(i, i) = 1e5;
+  big.makeCompressed();
+  raw.compute(big);
+  checkTrue(std::isinf(raw.determinant()) && raw.determinant() > 0, "det(1e5 I_400) overflows to +inf");
+  check(std::abs(raw.logAbsDeterminant() - n * std::log(1e5)) < 1e-8 * n, "log|det(1e5 I_400)| is finite",
+        raw.logAbsDeterminant());
+  SparseMatrix<double> small(n, n);
+  for (int i = 0; i < n; ++i) small.insert(i, i) = -1e-5;
+  small.makeCompressed();
+  raw.compute(small);
+  checkTrue(raw.determinant() == 0.0 && raw.determinantSign() == 1.0, "det(-1e-5 I_400) underflows to 0, sign +1");
+}
+
+// Complex determinants against dense Eigen, across every pivoting mode with
+// and without matching: the sign bookkeeping has to carry a phase, and every
+// row or column swap, the matching permutation and the scaling all feed it.
+void testComplexDeterminant() {
+  for (int variant = 0; variant < 4; ++variant) {
+    const SpMatC A = withPhases(variant < 2 ? lu_testing::weakDiagonalAs<cd>(40 + 7 * variant, 5 + variant)
+                                            : reducibleDenseBlocks<cd>(4, 6, 20 + variant, variant == 3));
+    const Eigen::Matrix<cd, -1, -1> Ad = A;
+    const cd ref = Eigen::FullPivLU<Eigen::Matrix<cd, -1, -1>>(Ad).determinant();
+    for (int matching = 0; matching < 2; ++matching)
+      for (int piv = 0; piv < 3; ++piv) {
+        Eigen::LeftRightLU<SpMatC> solver;
+        solver.setMatching(matching == 1);
+        solver.setPivoting(piv == 0 ? lr::Pivoting::None : piv == 1 ? lr::Pivoting::Partial : lr::Pivoting::Complete);
+        solver.compute(A);
+        char name[96];
+        std::snprintf(name, sizeof name, "complex det v%d matching=%d pivoting=%d (blocks %lld)", variant, matching,
+                      piv, (long long)solver.btfBlockCount());
+        if (solver.info() != Eigen::Success || solver.replacedPivots() > 0) {
+          lu_testing::note(std::string(name) + ": perturbed factorization, skipped");
+          continue;
+        }
+        const double growth = solver.growthFactor();
+        const double tol = 1e-9 * std::max(1.0, growth);
+        const cd got = solver.determinant();
+        const cd viaLog = solver.determinantSign() * std::exp(solver.logAbsDeterminant());
+        const double rel = std::max(std::abs(got - ref), std::abs(viaLog - ref)) / std::abs(ref);
+        check(rel < tol, name, rel);
+        check(std::abs(std::abs(solver.determinantSign()) - 1.0) < 1e-12, "determinantSign() has unit modulus",
+              std::abs(solver.determinantSign()));
+      }
+  }
+}
+
+// MC64 matching, BTF and complex arithmetic together: the reducible blocks are
+// solved from the last block backwards for A and forwards for A^H, and every
+// off-diagonal entry is read conjugated in the adjoint path.
+void testReducibleComplexWithMC64() {
+  const SpMatC A = reducibleDenseBlocks<cd>(3, 8, 5, true);
+  const int n = static_cast<int>(A.rows());
+  Eigen::LeftRightLU<SpMatC> solver;
+  solver.setMatchingMethod(Eigen::supernodal_lu::MatchingMethod::MC64);
+  solver.compute(A);
+  checkTrue(solver.btfBlockCount() == 3, "MC64 + BTF: 3 blocks found");
+  const Eigen::VectorXcd xTrue = Eigen::VectorXcd::Random(n);
+  const Eigen::VectorXcd b = A * xTrue;
+  const Eigen::VectorXcd x = solver.solve(b);
+  check(solver.info() == Eigen::Success && (x - xTrue).norm() / xTrue.norm() < 1e-9, "MC64 + BTF complex solve",
+        (x - xTrue).norm() / xTrue.norm());
+  const Eigen::VectorXcd bh = A.adjoint() * xTrue;
+  const Eigen::VectorXcd xh = solver.adjoint().solve(bh);
+  check(solver.info() == Eigen::Success && (xh - xTrue).norm() / xTrue.norm() < 1e-9,
+        "MC64 + BTF complex adjoint solve", (xh - xTrue).norm() / xTrue.norm());
+  const Eigen::Matrix<cd, -1, -1> Ad = A;
+  const cd ref = Eigen::FullPivLU<Eigen::Matrix<cd, -1, -1>>(Ad).determinant();
+  check(std::abs(solver.determinant() - ref) / std::abs(ref) < 1e-9, "MC64 + BTF complex determinant",
+        std::abs(solver.determinant() - ref) / std::abs(ref));
+}
+
+// The determinant is that of the operator the factorization inverts. Under
+// static pivoting that is a perturbed A, so a singular matrix whose zero pivot
+// was bumped reports a nonzero determinant with Success -- and
+// replacedPivots() is what says so. Pinned so the contract stays explicit.
+void testDeterminantUnderStaticPivoting() {
+  SparseMatrix<double> A = laplacian2d(6, 6);
+  for (int j = 0; j < A.outerSize(); ++j)
+    for (SparseMatrix<double>::InnerIterator it(A, j); it; ++it)
+      if (it.row() == 10) it.valueRef() = 0.0;
+  A.prune(0.0);  // row 10 is now empty: singular
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.compute(A);
+  checkTrue(solver.info() == Eigen::Success && solver.replacedPivots() > 0,
+            "singular matrix factorizes with a replaced pivot");
+  checkTrue(std::isfinite(solver.determinant()) && solver.determinant() != 0.0,
+            "determinant() describes the perturbed operator (nonzero)");
+  const VectorXd x = solver.solve(VectorXd::Ones(36));
+  checkTrue(solver.info() == Eigen::NumericalIssue, "... and solve() reports the singularity");
+
+  // With the static threshold off the zero pivot is a hard failure instead.
+  Eigen::LeftRightLU<SparseMatrix<double>> strict;
+  strict.setStaticPivotThreshold(0.0);
+  strict.compute(A);
+  checkTrue(strict.info() == Eigen::NumericalIssue && !strict.isFactorized(),
+            "threshold 0: the zero pivot fails the factorization");
+}
+
+// Uncompressed (reserve + insert) input, including the one ordering that reads
+// the index arrays directly. Matching off routes the raw matrix to the ordering
+// functor, which is where an uncompressed input would otherwise reach COLAMD.
+void testUncompressedInput() {
+  const SparseMatrix<double> A = weakDiagonal(80, 3);
+  const int n = static_cast<int>(A.rows());
+  SparseMatrix<double> Au(n, n);
+  Au.reserve(Eigen::VectorXi::Constant(n, 12));
+  for (int j = 0; j < n; ++j)
+    for (SparseMatrix<double>::InnerIterator it(A, j); it; ++it) Au.insert(it.row(), j) = it.value();
+  checkTrue(!Au.isCompressed(), "test input really is uncompressed");
+  const VectorXd xTrue = VectorXd::Random(n);
+  const VectorXd b = A * xTrue;
+
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::COLAMDOrdering<int>> colamd;
+  colamd.setMatching(false);
+  colamd.compute(Au);
+  VectorXd x = colamd.solve(b);
+  check(colamd.info() == Eigen::Success && (x - xTrue).norm() / xTrue.norm() < 1e-8,
+        "uncompressed input, COLAMD, matching off", (x - xTrue).norm() / xTrue.norm());
+
+  Eigen::LeftRightLU<SparseMatrix<double>> defaults;
+  defaults.setErrorBounds(true);
+  defaults.setExtendedPrecisionResidual(true);
+  defaults.setRefineOnlyIfPerturbed(false);
+  defaults.compute(Au);
+  x = defaults.solve(b);
+  check(defaults.info() == Eigen::Success && (x - xTrue).norm() / xTrue.norm() < 1e-8,
+        "uncompressed input, defaults + bounds + extended residual", (x - xTrue).norm() / xTrue.norm());
+  checkTrue(defaults.lastCorrectDigits() >= 8, "uncompressed input: error bounds computed");
+}
+
+// Degenerate shapes: n = 0, n = 1, zero right-hand sides, a zero matrix.
+void testDegenerateShapes() {
+  {
+    SparseMatrix<double> A(0, 0);
+    A.makeCompressed();
+    Eigen::LeftRightLU<SparseMatrix<double>> solver;
+    solver.setErrorBounds(true);
+    solver.compute(A);
+    const VectorXd x = solver.solve(VectorXd(0));
+    const MatrixXd X = solver.solve(MatrixXd(0, 3));
+    const VectorXd xt = solver.transpose().solve(VectorXd(0));
+    checkTrue(solver.info() == Eigen::Success && x.size() == 0 && X.cols() == 3 && xt.size() == 0,
+              "n=0: compute/solve/transpose survive");
+    checkTrue(solver.determinant() == 1.0 && solver.logAbsDeterminant() == 0.0, "n=0: det = 1");
+  }
+  {
+    SparseMatrix<double> A(1, 1);
+    A.insert(0, 0) = -2.5;
+    A.makeCompressed();
+    Eigen::LeftRightLU<SparseMatrix<double>> solver;
+    solver.compute(A);
+    VectorXd b(1);
+    b << 5.0;
+    const VectorXd x = solver.solve(b);
+    check(std::abs(x[0] + 2.0) < 1e-15 && solver.determinant() == -2.5 && solver.determinantSign() == -1.0,
+          "n=1: solve, determinant, sign", x[0]);
+  }
+  {
+    const SparseMatrix<double> A = laplacian2d(5, 5);
+    Eigen::LeftRightLU<SparseMatrix<double>> solver;
+    solver.setRefineOnlyIfPerturbed(false);
+    solver.setErrorBounds(true);
+    solver.compute(A);
+    const MatrixXd X = solver.solve(MatrixXd(25, 0));
+    checkTrue(solver.info() == Eigen::Success && X.rows() == 25 && X.cols() == 0, "zero right-hand sides survive");
+  }
+  {
+    SparseMatrix<double> Z(5, 5);
+    Z.makeCompressed();
+    Eigen::LeftRightLU<SparseMatrix<double>> solver;
+    solver.compute(Z);
+    checkTrue(solver.info() == Eigen::NumericalIssue && !solver.isFactorized(), "zero matrix is declined");
+    const VectorXd x = solver.solve(VectorXd::Ones(5));
+    checkTrue(solver.info() == Eigen::NumericalIssue && !x.allFinite(), "zero matrix: solve refused");
+  }
+}
+
+// Supernode width caps of 1, 2 and 3 make every diagonal block trivial and
+// push all the work into the panels and the scheduler, serial and parallel.
+void testTinyBlockSizes() {
+  const SparseMatrix<double> A = randomUnsymmetricPattern(300, 0.03, 4);
+  const int n = static_cast<int>(A.rows());
+  const VectorXd xTrue = VectorXd::Random(n);
+  const VectorXd b = A * xTrue;
+  for (int bs : {1, 2, 3}) {
+    Eigen::LeftRightLU<SparseMatrix<double>> serial;
+    serial.setMaxBlockSize(bs);
+    serial.compute(A);
+    VectorXd x = serial.solve(b);
+    char name[64];
+    std::snprintf(name, sizeof name, "maxBlockSize=%d serial", bs);
+    check(serial.info() == Eigen::Success && (x - xTrue).norm() / xTrue.norm() < 1e-8, name,
+          (x - xTrue).norm() / xTrue.norm());
+
+    Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>, Eigen::supernodal_lu::StdThreadExecutor>
+        parallel;
+    parallel.setMaxBlockSize(bs);
+    parallel.compute(A);
+    x = parallel.solve(b);
+    std::snprintf(name, sizeof name, "maxBlockSize=%d parallel", bs);
+    check(parallel.info() == Eigen::Success && (x - xTrue).norm() / xTrue.norm() < 1e-8, name,
+          (x - xTrue).norm() / xTrue.norm());
+    checkTrue(parallel.nnzL() == serial.nnzL() && parallel.nnzU() == serial.nnzU(),
+              "parallel and serial agree on fill");
+  }
+}
+
+// A sparse right-hand side goes through SparseSolverBase's column-by-column
+// path; it must give the dense answer.
+void testSparseRightHandSide() {
+  const SparseMatrix<double> A = laplacian2d(8, 8);
+  Eigen::LeftRightLU<SparseMatrix<double>> solver;
+  solver.compute(A);
+  SparseMatrix<double> B(64, 3);
+  B.insert(3, 0) = 1.0;
+  B.insert(10, 1) = 2.0;
+  B.insert(63, 2) = -1.0;
+  B.makeCompressed();
+  const SparseMatrix<double> X = solver.solve(B);
+  const MatrixXd Xd = solver.solve(MatrixXd(B));
+  check((MatrixXd(X) - Xd).norm() < 1e-12 * Xd.norm(), "sparse rhs matches dense rhs", (MatrixXd(X) - Xd).norm());
+  check((A * Xd - MatrixXd(B)).norm() < 1e-10, "sparse rhs solve is correct", (A * Xd - MatrixXd(B)).norm());
+}
+
+// The parallel scheduler's failure path: a zero pivot on one lane must stop
+// every lane, report NumericalIssue, leave nothing factorized, and leave the
+// solver reusable.
+void testParallelSingularPath() {
+  SparseMatrix<double> A = laplacian2d(40, 40);
+  for (int j = 0; j < A.outerSize(); ++j)
+    for (SparseMatrix<double>::InnerIterator it(A, j); it; ++it)
+      if (it.row() == 800 || it.col() == 800) it.valueRef() = 0.0;
+  A.prune(0.0);
+  Eigen::LeftRightLU<SparseMatrix<double>, Eigen::AMDOrdering<int>, Eigen::supernodal_lu::StdThreadExecutor>
+      parallel;
+  parallel.setStaticPivotThreshold(0.0);
+  parallel.compute(A);
+  checkTrue(parallel.info() == Eigen::NumericalIssue && !parallel.isFactorized(),
+            "parallel scheduler reports the zero pivot and stops");
+  const SparseMatrix<double> G = laplacian2d(40, 40);
+  parallel.compute(G);
+  const VectorXd b = G * VectorXd::Ones(1600);
+  const VectorXd x = parallel.solve(b);
+  check(parallel.info() == Eigen::Success && (x - VectorXd::Ones(1600)).norm() < 1e-8,
+        "solver is reusable after the parallel failure", (x - VectorXd::Ones(1600)).norm());
+}
+
 }  // namespace
 
 int main() {
@@ -582,6 +1087,23 @@ int main() {
   testOrderingConventions();
   testStructurallySingular();
   testUnsymmetricPatternFeatures();
+
+  std::printf("Input validation, state and reporting:\n");
+  testAnalyzePatternInvalidatesFactors();
+  testDenseRowPenaltyFollowsTheAnalysis();
+  testNonFiniteInputIsDeclined();
+  testFactorizeInputMismatchIsReported();
+  testSolveWithoutFactorizationIsRefused();
+  testSolveStatusIsPerSolve();
+  testDeterminantSurvivesIntermediateOverflow();
+  testComplexDeterminant();
+  testReducibleComplexWithMC64();
+  testDeterminantUnderStaticPivoting();
+  testUncompressedInput();
+  testDegenerateShapes();
+  testTinyBlockSizes();
+  testSparseRightHandSide();
+  testParallelSingularPath();
 
   return lu_testing::summarize("LeftRightLU correctness");
 }

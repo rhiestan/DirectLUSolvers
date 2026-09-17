@@ -66,7 +66,15 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
 
 4. **Log-determinant** (PARDISO `IPARM(33)`): `logAbsDeterminant()` returns `log|det(A)|` as
    a sum of logs (stays finite where `determinant()` would overflow), paired with
-   `determinantSign()`.
+   `determinantSign()` (±1 for real scalars, the unit phase for complex ones). `determinant()`
+   itself accumulates a mantissa and a power-of-two exponent rather than a running product, so
+   it is `inf` or `0` only when `det(A)` really is outside the representable range — a diagonal
+   that is half `1e-5` and half `1e+5` has determinant exactly 1, and a running product passes
+   through `1e-1000` on the way there. All three describe the operator the factorization
+   inverts: under static pivoting (`replacedPivots() > 0`) that is a *perturbed* `A`, so a
+   singular matrix whose zero pivot was bumped reports a nonzero determinant alongside
+   `Success` from `factorize()`. `replacedPivots()` is what says so, and `solve()` reports the
+   singularity through its residual gate.
 
 5. **Block triangular form** (Dulmage–Mendelsohn; this is what `KLU` is built around, and
    neither `SupernodalLU` nor `Eigen::SparseLU` has it). Many unsymmetric matrices —
@@ -307,6 +315,29 @@ Practical notes:
   into a clean error before any factor memory is touched, and its message now names the
   pattern symmetry as a contributing cause.
 
+## Input validation and failure reporting
+
+The numeric phase scatters every entry of the matrix into a slot the symbolic phase laid out,
+and the solve reads through the permutation maps of the current analysis. Three inputs would
+break that silently — a write past a panel, or a NaN factor under `Success` — and are declined
+instead, with `info() == InvalidInput` and a `lastErrorMessage()` naming the cause:
+
+- `factorize()` on a matrix of a **different size** than `analyzePattern()` saw;
+- a matrix containing a **non-finite value** (`inf` or `NaN`; the equilibration would turn it
+  into `0 * inf`, and NaN never trips a zero-pivot test);
+- a matrix with a **nonzero outside the analyzed pattern**. A nonzero that happens to fall
+  inside the symbolic fill has a slot and is factored exactly; one that does not, or one below
+  the diagonal blocks of the block triangular form, is refused. Call `analyzePattern()` or
+  `compute()` on the new matrix.
+
+Two state rules go with them. `analyzePattern()` **invalidates** any factorization held from an
+earlier `compute()`: `isFactorized()` turns false, and the cached condition estimate, growth
+factor and dense-row penalty go with it. And a `solve()` — plain, `transpose()` or `adjoint()`
+— **without usable factors** (after a declined factorization, or between `analyzePattern()` and
+`factorize()`) returns a NaN answer with `NumericalIssue` rather than reading whatever the
+factor arenas hold. `lastErrorMessage()` describes the last operation only: a successful solve
+clears the message an earlier failed one left.
+
 ## Performance notes (honest summary)
 
 Measured 2026-08-26 with `DirectLUSolvers/test/compare_testdata.cpp`, single-threaded
@@ -415,6 +446,18 @@ ctest --test-dir build -R "test_leftright_lu|test_btf" --output-on-failure
 adjoint, all three pivoting modes, the forced column-swap path (matching off + weak diagonal)
 with its solve/transpose/determinant folding, log-determinant, equilibration, honest failure
 reporting, and parallel(dynamic-scheduler)-vs-serial agreement plus a deadlock-stress loop.
+
+An `Input validation, state and reporting` block pins the contract of the section of the same
+name: re-analysis invalidates the old factors; `inf`/`NaN` input, a size mismatch and a nonzero
+outside the analyzed pattern (including one below the BTF diagonal blocks) are declined, while
+a nonzero inside the fill is absorbed exactly; a solve without factors is refused with NaN; the
+failure message is per solve; `determinant()` through pivots and scalings of `1e±1000`
+(against `inf`/`0` where the answer really is out of range); complex determinants against
+dense Eigen across every pivoting mode with and without matching, MC64 with BTF on a complex
+reducible matrix; the determinant of a perturbed (static-pivoted) factorization; uncompressed
+input including COLAMD with matching off; `n = 0`, `n = 1`, zero right-hand sides and a zero
+matrix; supernode width caps of 1–3 serial and parallel; a sparse right-hand side; and the
+parallel scheduler's zero-pivot path.
 
 An `Unsymmetric nonzero patterns` block covers that input class specifically: accuracy on
 random unsymmetric patterns and on upwind advection grids, `patternSymmetry()` against a
