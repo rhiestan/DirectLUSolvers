@@ -13,3 +13,4 @@ compile_commands.json
 # Downloaded matrix corpora (fetched on demand, never committed)
 test/matrices/cache/
 *.mtx.gz
+/analysis/benchmark_results.csv

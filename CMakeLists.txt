@@ -487,6 +487,18 @@ dlu_test_runtime_path(bench_solvers "${DLU_MKL_BIN}")
 add_executable(bench_multifrontal_qr test/bench_multifrontal_qr.cpp)
 target_link_libraries(bench_multifrontal_qr PRIVATE dlu_test_common)
 
+# Every solver here plus Eigen's direct and iterative solvers, against the
+# setfos-matrix-corpus sample categories (see setfos_matrix_pipeline.py at the
+# repo root and setfosmatrices_samples/). Not registered with a `benchmark`
+# CTest run by default -- it depends on a sample directory that is regenerated
+# by a separate Python pipeline, not part of this repo's own test fixtures.
+set(DLU_SETFOS_SAMPLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../setfosmatrices_samples"
+    CACHE PATH "Directory holding the setfos-matrix-corpus sample categories")
+add_executable(bench_setfos_samples test/bench_setfos_samples.cpp)
+target_link_libraries(bench_setfos_samples PRIVATE dlu_test_common)
+target_compile_definitions(bench_setfos_samples PRIVATE
+                           "DLU_SETFOS_SAMPLES_DIR=\"${DLU_SETFOS_SAMPLES_DIR}\"")
+
 # The regression suite also has a synthetic-only mode that needs no testdata and
 # runs in well under a second -- worth having in the "quick" set so the fill
 # guard is exercised even on a checkout without the benchmark matrices.
