@@ -86,9 +86,12 @@
 //   rank r < n            by default the MINIMUM-NORM least-squares solution
 //                         (pinv(A) b up to the rank decision): the basic solution
 //                         from R11 projected orthogonally onto the complement of
-//                         the null space. Solution::Basic returns the basic one
-//                         (dead columns zero), which is cheaper and sparse in the
-//                         dead columns.
+//                         the null space, then refined again -- the projection
+//                         cancels |x_basic| down to |x_minnorm|, and the basic
+//                         solution is arbitrarily larger when the pivot columns
+//                         are nearly dependent. Solution::Basic returns the basic
+//                         one (dead columns zero), which is cheaper and sparse in
+//                         the dead columns.
 //
 // Refinement residuals are computed in double-double (see
 // LeftRightLUExtendedResidual.h). That is exact on the SCALED matrix only
@@ -647,6 +650,10 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   void internalToLive(const Vector& z, Vector& v) const;
   void upperAdjointSolve(const Vector& g, Vector& h) const;
   void upperMultiply(const Vector& z, Vector& u) const;
+  // The same two kernels for several vectors at once, front by front as
+  // level-3 operations.
+  void upperSolveBlock(const DenseMatrix& c, DenseMatrix& z) const;
+  void upperMultiplyBlock(const DenseMatrix& z, DenseMatrix& u, bool includeDead) const;
   void ensureNullSpace() const;
   RealScalar inverseNormEstimate() const;  // Hager-Higham ||R11^-1||_1, cached
   void toOriginal(const Vector& z, Vector& x) const {
@@ -765,6 +772,15 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
     o.setMaxFactorNonzeros(m_maxFactorNonzeros);
     o.setMaxAtAPattern(m_maxAtA);
     copyExecutorTo(o, std::is_copy_constructible<Executor>());
+  }
+  // The options a solve() reads; the cached column-scaled solver takes them
+  // fresh at every use rather than as they were when it was built.
+  template <typename Other>
+  void copySolveOptionsTo(Other& o) const {
+    o.setSolution(m_solution);
+    o.setMaxRefinements(m_maxRefinements);
+    o.setExtendedPrecisionResidual(m_extendedResidual);
+    o.setMaxNullSpaceScalars(m_maxNullSpaceScalars);
   }
   template <typename Other>
   void copyExecutorTo(Other& o, std::true_type) const { o.executor() = m_executor; }
@@ -1419,7 +1435,10 @@ void MultifrontalQR<MatrixType, Executor>::factorizeScaled(const MatrixType& mat
   RealScalar maxColNorm(0);
   m_scaledFrobenius = RealScalar(0);
   for (Index c = 0; c < m_cols; ++c) {
-    const RealScalar cn = m_scaled.col(c).norm();
+    // Summed by hand: a sparse reduction asserts on a matrix with no rows.
+    RealScalar sq(0);
+    for (typename MatrixType::InnerIterator it(m_scaled, c); it; ++it) sq += numext::abs2(it.value());
+    const RealScalar cn = numext::sqrt(sq);
     if (!(numext::isfinite)(cn)) {
       m_info = NumericalIssue;
       m_lastError = "MultifrontalQR: the matrix has non-finite entries";
@@ -2189,6 +2208,77 @@ void MultifrontalQR<MatrixType, Executor>::upperMultiply(const Vector& z, Vector
 }
 
 template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::upperSolveBlock(const DenseMatrix& c, DenseMatrix& z) const {
+  // Solves R11 Z_live = C - R12 Z_dead for every column of C at once; z's dead
+  // rows are inputs (the rotated front's dead directions are taken as zero).
+  const Index nf = Index(m_factors.size()), nrhs = c.cols();
+  DenseMatrix rhs, gathered;
+  for (Index f = nf - 1; f >= 0; --f) {
+    const FrontFactor& ff = m_factors[std::size_t(f)];
+    const Index k = ff.rank, w = Index(ff.cols.size());
+    if (ff.rotated) {
+      DenseMatrix y = DenseMatrix::Zero(w, nrhs);
+      y.topRows(k) = ff.sigma.template cast<Scalar>().cwiseInverse().asDiagonal() * c.middleRows(m_liveOffset[std::size_t(f)], k);
+      const DenseMatrix x = ff.rotV * y;
+      for (Index j = 0; j < w; ++j) z.row(ff.cols[std::size_t(j)]) = x.row(j);
+      continue;
+    }
+    if (k == 0) continue;
+    rhs = c.middleRows(m_liveOffset[std::size_t(f)], k);
+    if (w > k) {
+      gathered.resize(w - k, nrhs);
+      for (Index col = k; col < w; ++col) gathered.row(col - k) = z.row(ff.cols[std::size_t(col)]);
+      rhs.noalias() -= ff.R.rightCols(w - k) * gathered;
+    }
+    ff.R.topLeftCorner(k, k).template triangularView<Upper>().solveInPlace(rhs);
+    for (Index t = 0; t < k; ++t) z.row(ff.cols[std::size_t(t)]) = rhs.row(t);
+  }
+  const Index ns = scalarLive();
+  if (ns > 0) {
+    DenseMatrix wk = c.topRows(ns);
+    for (Index d = ns; d < m_cols; ++d)
+      for (Index p = m_sf.Rp[std::size_t(d)]; p < m_sf.Rp[std::size_t(d) + 1]; ++p)
+        wk.row(m_sf.Ri[std::size_t(p)]) -= m_sf.Rx[std::size_t(p)] * z.row(d);
+    for (Index k = ns - 1; k >= 0; --k) {
+      const Index last = m_sf.Rp[std::size_t(k) + 1] - 1;
+      z.row(k) = wk.row(k) / m_sf.Rx[std::size_t(last)];
+      for (Index p = m_sf.Rp[std::size_t(k)]; p < last; ++p) wk.row(m_sf.Ri[std::size_t(p)]) -= m_sf.Rx[std::size_t(p)] * z.row(k);
+    }
+  }
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::upperMultiplyBlock(const DenseMatrix& z, DenseMatrix& u, bool includeDead) const {
+  // U = [R11 R12] Z, rows by pivot; deferred columns as given. With includeDead
+  // the dead columns' R12 entries take part (Q1^H A Z for a Z of internal
+  // columns), without them only the live coordinates count (R11 acting on them).
+  const Index nf = Index(m_factors.size()), nrhs = z.cols();
+  u.setZero(m_rank, nrhs);
+  const Index ns = scalarLive();
+  for (Index k = 0; k < (ns > 0 ? m_cols : 0); ++k)
+    for (Index p = m_sf.Rp[std::size_t(k)]; p < m_sf.Rp[std::size_t(k) + 1]; ++p)
+      u.row(m_sf.Ri[std::size_t(p)]) += m_sf.Rx[std::size_t(p)] * z.row(k);
+  DenseMatrix x;
+  for (Index f = 0; f < nf; ++f) {
+    const FrontFactor& ff = m_factors[std::size_t(f)];
+    const Index k = ff.rank, w = Index(ff.cols.size());
+    if (k == 0) continue;
+    x.resize(w, nrhs);
+    for (Index col = 0; col < w; ++col) x.row(col) = z.row(ff.cols[std::size_t(col)]);
+    if (ff.rotated) {
+      u.middleRows(m_liveOffset[std::size_t(f)], k) = ff.sigma.template cast<Scalar>().asDiagonal() * (ff.rotV.leftCols(k).adjoint() * x);
+      continue;
+    }
+    if (!includeDead)
+      for (Index col = 0; col < w; ++col) {
+        const bool dead = col >= k && col < k + ff.dead;
+        if (dead || m_internalToPivot[std::size_t(ff.cols[std::size_t(col)])] == StorageIndex(-1)) x.row(col).setZero();
+      }
+    u.middleRows(m_liveOffset[std::size_t(f)], k).noalias() = ff.R * x;
+  }
+}
+
+template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::liveToInternal(const Vector& v, Vector& z) const {
   z.setZero(m_cols);
   for (Index p = 0; p < m_rank; ++p)
@@ -2394,13 +2484,17 @@ void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::ve
 
 template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::ensureNullSpace() const {
-  if (m_nullSpaceReady) return;
-  m_nullSpaceReady = true;
   const Index k = m_cols - m_rank;
+  const bool tooLarge = double(m_cols) * double(k) > m_maxNullSpaceScalars;
+  // A basis refused under a smaller setMaxNullSpaceScalars() is tried again
+  // once the cap allows it.
+  if (m_nullSpaceReady && !(m_nullSpaceTooLarge && !tooLarge)) return;
+  m_nullSpaceReady = true;
+  m_nullSpaceTooLarge = false;
   m_nullSpace.resize(m_cols, 0);
   m_nullDim = 0;
   if (k <= 0) return;
-  if (double(m_cols) * double(k) > m_maxNullSpaceScalars) {
+  if (tooLarge) {
     m_nullSpaceTooLarge = true;
     return;
   }
@@ -2462,6 +2556,27 @@ void MultifrontalQR<MatrixType, Executor>::ensureNullSpace() const {
   Z.resize(0, 0);
   for (Index j = 0; j < k; ++j) N.col(j) /= N.col(j).norm();
   eigen_assert(col == k);
+  // Each column is an accurate null vector (its row-space part is eps kappa(A)
+  // relative), but when R11 is ill-conditioned they are all dominated by the
+  // same direction -- R11's near-null vector -- and the basis they form has
+  // sigma_min ~ 1/|R11^-1 R12|. Orthonormalizing that loses the SPAN to
+  // eps/sigma_min, and the projection would leave a null-space component of
+  // that size in every minimum-norm solution. So: orthonormalize, then take
+  // the row-space part out of each vector again, and orthonormalize the now
+  // well-conditioned basis once more. That part is R11^-1 Q1^H A n, and
+  // Q1^H A = [R11 R12] exactly, so it costs one blocked multiply and one
+  // blocked solve with R -- no Householder vectors -- and R n is tiny, so the
+  // solve is well conditioned.
+  N = HouseholderQR<DenseMatrix>(N).householderQ() * DenseMatrix::Identity(m_cols, k);
+  {
+    Z.resize(m_cols, k);  // internal order, scaled coordinates
+    for (Index c2 = 0; c2 < m_cols; ++c2) Z.row(m_sym.origToInternal[std::size_t(c2)]) = N.row(c2) / Scalar(m_colScale[c2]);
+    DenseMatrix U, DZ = DenseMatrix::Zero(m_cols, k);
+    upperMultiplyBlock(Z, U, true);
+    upperSolveBlock(U, DZ);
+    for (Index c2 = 0; c2 < m_cols; ++c2) N.row(c2) -= DZ.row(m_sym.origToInternal[std::size_t(c2)]) * Scalar(m_colScale[c2]);
+    Z.resize(0, 0);
+  }
   HouseholderQR<DenseMatrix> qr(N);
   m_nullQR = std::move(qr);
   m_nullDim = k;
@@ -2579,6 +2694,37 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
     };
 
     basicSolve(bs, z);
+    // The residual estimate of the augmented system, refined along with the
+    // solution (Bjorck): [I B; B^H 0][r; z] = [b; 0], B the live columns.
+    // One step: f = b - r - B z, g = -B^H r; dr = Q [h; d2], dz = R11^-1 (d1 - h)
+    // with R11^H h = g and d = Q^H f. `rr` holds b - (current solution) on entry;
+    // dz comes back in internal coordinates (dead columns zero) and e is dr in
+    // slot space.
+    Vector rv, e;
+    if (augmented) {
+      toOriginal(z, zo);
+      rv = bs - m_scaled * zo;
+    }
+    auto bjorckStep = [&](Vector& dzOut) {
+      Vector fv = rr - rv;
+      Vector gzero = Vector::Zero(n);
+      if (m_extendedResidual) {
+        left_right_lu::residualExtendedTransposed<true>(m_scaled, gzero, rv, g);
+      } else {
+        g = -(m_scaled.adjoint() * rv);
+      }
+      toInternal(g, gi);
+      for (Index q = 0; q < n; ++q)
+        if (m_internalToPivot[std::size_t(q)] == StorageIndex(-1)) gi[q] = Scalar(0);
+      toSlots(fv, e);
+      applyQAdjoint(e);
+      upperAdjointSolve(gi, h);
+      for (Index p = 0; p < r; ++p) c[p] = e[m_pivotSlot[std::size_t(p)]] - h[p];
+      dzOut.setZero(n);
+      upperSolve(c, dzOut);
+      for (Index p = 0; p < r; ++p) e[m_pivotSlot[std::size_t(p)]] = h[p];
+      applyQ(e);
+    };
     Index steps = 0;
     if (m_maxRefinements > 0 && r > 0) {
       RealScalar prevNorm = NumTraits<RealScalar>::highest();
@@ -2593,32 +2739,9 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
           if (dn <= eps * z.template lpNorm<Infinity>()) break;
         }
       } else {
-        // Bjorck's refinement of the augmented system [I B; B^H 0][r; z] = [b; 0],
-        // B the live columns: f = b - r - B z, g = -B^H r, and the correction
-        // is dr = Q [h; d2], dz = R11^-1 (d1 - h) with R11^H h = g, d = Q^H f.
-        toOriginal(z, zo);
-        Vector rv = bs - m_scaled * zo;
-        Vector e;
         for (; steps < m_maxRefinements; ++steps) {
           residual(z, rr);
-          Vector fv = rr - rv;
-          Vector gzero = Vector::Zero(n);
-          if (m_extendedResidual) {
-            left_right_lu::residualExtendedTransposed<true>(m_scaled, gzero, rv, g);
-          } else {
-            g = -(m_scaled.adjoint() * rv);
-          }
-          toInternal(g, gi);
-          for (Index q = 0; q < n; ++q)
-            if (m_internalToPivot[std::size_t(q)] == StorageIndex(-1)) gi[q] = Scalar(0);
-          toSlots(fv, e);
-          applyQAdjoint(e);
-          upperAdjointSolve(gi, h);
-          for (Index p = 0; p < r; ++p) c[p] = e[m_pivotSlot[std::size_t(p)]] - h[p];
-          dz.setZero(n);
-          upperSolve(c, dz);
-          for (Index p = 0; p < r; ++p) e[m_pivotSlot[std::size_t(p)]] = h[p];
-          applyQ(e);
+          bjorckStep(dz);
           const RealScalar dn = dz.template lpNorm<Infinity>();
           if (!(numext::isfinite)(dn) || dn >= prevNorm) break;
           z += dz;
@@ -2636,9 +2759,44 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
       // x - N N^H x = Q diag(0, I) Q^H x with N the first nullDim columns of Q,
       // applied in factored form. Q is exactly unitary, so one pass suffices.
       const auto Qseq = m_nullQR.householderQ();
-      x.applyOnTheLeft(Qseq.adjoint());
-      x.head(m_nullDim).setZero();
-      x.applyOnTheLeft(Qseq);
+      auto projectOffNull = [&](Vector& v) {
+        v.applyOnTheLeft(Qseq.adjoint());
+        v.head(m_nullDim).setZero();
+        v.applyOnTheLeft(Qseq);
+      };
+      projectOffNull(x);
+      // The projection cancels |x_basic| down to |x_minnorm| and leaves an
+      // error of eps |x_basic| (in rounding, and in the row-space part of the
+      // basic solve's own error) -- arbitrarily larger than eps kappa(A)
+      // |x_minnorm| when the pivot columns are nearly dependent. So the
+      // augmented refinement is continued on the PROJECTED solution: the same
+      // step (A N = 0, so A x changes exactly as B z would), with each
+      // correction projected before it is added, and the stopping rule now
+      // relative to the small |x| rather than the large |z|. The residual
+      // estimate is refined along, which a plain b - A x correction would not
+      // do: its error is eps |A| |x_basic| too.
+      if (m_maxRefinements > 0 && r > 0) {
+        RealScalar prevNorm = NumTraits<RealScalar>::highest();
+        Index steps2 = 0;
+        Vector xs, zi, dxo;
+        for (; steps2 < m_maxRefinements; ++steps2) {
+          xs = x.cwiseQuotient(m_colScale.template cast<Scalar>());
+          toInternal(xs, zi);
+          residual(zi, rr);
+          bjorckStep(dz);
+          toOriginal(dz, dxo);
+          dxo.array() *= m_colScale.array().template cast<Scalar>();
+          projectOffNull(dxo);
+          const RealScalar dn = dxo.template lpNorm<Infinity>();
+          if (!(numext::isfinite)(dn) || dn >= prevNorm) break;
+          x += dxo;
+          projectOffNull(x);  // |x| is small now, so this cleanup is accurate
+          for (Index i = 0; i < m; ++i) rv[i] += slotOfRow(e, i);
+          prevNorm = RealScalar(0.5) * dn;
+          if (dn <= eps * x.template lpNorm<Infinity>()) break;
+        }
+        m_lastRefinements = (std::max)(m_lastRefinements, steps2);
+      }
     }
     dest.col(col) = x;
   }
@@ -2672,6 +2830,7 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
       // the rank.
       ensureUnweighted();
       if (m_unweightedState == 1) {
+        copySolveOptionsTo(*m_unweighted);  // options may have changed since it was built
         xc = m_unweighted->solve(bc);
         dest.col(col) = xc;
         rOrig = residualOf(xc);

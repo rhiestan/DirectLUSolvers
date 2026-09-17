@@ -474,6 +474,529 @@ void testEdgeCases() {
   check(std::abs(qc.solve(bc)[0] - 1.0) < 1e-15, "single column: least squares", qc.solve(bc)[0]);
 }
 
+// ---------------------------------------------------------------------------
+// Rank-deficient matrices of every shape and scalar type, checked the same way:
+// rank against a dense SVD of the SCALED matrix at the solver's own threshold,
+// the factor identity, the minimum-norm solution against pinv(A) b, the
+// least-squares optimality condition, and the null-space basis.
+// ---------------------------------------------------------------------------
+
+template <typename Scalar>
+bool isPermutation(const Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>>& qr) {
+  const auto p = qr.colsPermutation();
+  std::vector<char> seen(std::size_t(p.size()), 0);
+  for (Index i = 0; i < p.size(); ++i) {
+    const Index v = p.indices()(i);
+    if (v < 0 || v >= p.size() || seen[std::size_t(v)]) return false;
+    seen[std::size_t(v)] = 1;
+  }
+  return true;
+}
+
+template <typename Scalar>
+void checkRankDeficient(const std::string& tag, const Eigen::SparseMatrix<Scalar>& A, const Vec<Scalar>& b,
+                        Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>>& qr, double solveTol = 1e-9) {
+  const Index n = A.cols();
+  qr.compute(A);
+  checkTrue(qr.info() == Eigen::Success, tag + ": factorize");
+  if (qr.info() != Eigen::Success) {
+    lu_testing::note(qr.lastErrorMessage());
+    return;
+  }
+  Dense<Scalar> Ad(A);
+  Dense<Scalar> As = qr.rowScaling().template cast<Scalar>().asDiagonal() * Ad * qr.colScaling().template cast<Scalar>().asDiagonal();
+  Eigen::JacobiSVD<Dense<Scalar>> svd(As);
+  Index ref = 0;
+  for (Index i = 0; i < svd.singularValues().size(); ++i)
+    if (svd.singularValues()[i] > qr.absoluteRankThreshold()) ++ref;
+  check(qr.rank() == ref, tag + ": rank == SVD rank (" + std::to_string(ref) + ")", double(qr.rank()));
+  checkTrue(qr.rankIsVerified(), tag + ": rank verified");
+  checkTrue(isPermutation(qr), tag + ": colsPermutation is a permutation");
+  check(Index(qr.deadColumns().size()) + qr.deferredNullity() + qr.rank() == n, tag + ": dead + nullity + rank == n",
+        double(qr.deadColumns().size()));
+  if (n <= 400) check(factorIdentity(qr, A) < 1e-11, tag + ": R^H R == (APD)^H APD", factorIdentity(qr, A));
+  const Vec<Scalar> x = qr.solve(b);
+  const Vec<Scalar> ref_x = pinvSolve<Scalar>(Ad, b, 1e-11);
+  check(relErr(x, ref_x) < solveTol, tag + ": min-norm == pinv(A) b", relErr(x, ref_x));
+  const double opt = (Ad.adjoint() * (Ad * x - b)).norm() / std::max(1.0, b.norm());
+  check(opt < 1e-10, tag + ": A^H r == 0", opt);
+  if (qr.rank() < n) {
+    const Dense<Scalar>& N = qr.nullSpace();
+    check(N.cols() == n - qr.rank(), tag + ": null space dimension", double(N.cols()));
+    if (N.cols() > 0) {
+      check((Ad * N).norm() < 1e-10 * std::max(1.0, Ad.norm()), tag + ": A N == 0", (Ad * N).norm());
+      const double orth = (N.adjoint() * N - Dense<Scalar>::Identity(N.cols(), N.cols())).norm();
+      check(orth < 1e-11, tag + ": N orthonormal", orth);
+    }
+  }
+}
+
+// A sparse matrix with duplicated (complex-scaled) and empty columns, and
+// duplicated and empty rows, in every shape.
+template <typename Scalar>
+Eigen::SparseMatrix<Scalar> dependentColumns(int m, int n, unsigned seed, int period) {
+  Dense<Scalar> Ad = Dense<Scalar>(randomSparse<Scalar>(m, n, 0.06, seed));
+  for (int j = 0; j < n; ++j) {
+    if (j % period == 2) Ad.col(j).setZero();
+    if (j % period == period - 1) Ad.col(j) = Scalar(0.5) * Ad.col(j - 1) - Scalar(1.5) * Ad.col(j - 2);
+  }
+  if (m > 8) {
+    Ad.row(7) = Scalar(3) * Ad.row(3);
+    Ad.row(m / 2).setZero();
+  }
+  Eigen::SparseMatrix<Scalar> A = Ad.sparseView();
+  A.makeCompressed();
+  return A;
+}
+
+template <typename Scalar>
+Vec<Scalar> randomVector(int m, unsigned seed) {
+  std::mt19937 rng(seed);
+  Vec<Scalar> b(m);
+  for (int i = 0; i < m; ++i) b[i] = randomScalar<Scalar>(rng);
+  return b;
+}
+
+template <typename Scalar>
+void testDeficientShapes(const char* tag) {
+  using Solver = Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>>;
+  {
+    Solver qr;
+    qr.setEngine(g_engine);
+    checkRankDeficient<Scalar>(std::string(tag) + " tall 200x90", dependentColumns<Scalar>(200, 90, 91, 8), randomVector<Scalar>(200, 15), qr);
+    check(qr.leastSquaresOptimality() < 1e-13, std::string(tag) + " tall 200x90: optimality", qr.leastSquaresOptimality());
+    qr.setSolution(Eigen::multifrontal_qr::Solution::Basic);
+    const Vec<Scalar> b = randomVector<Scalar>(200, 15);
+    const Vec<Scalar> xb = qr.solve(b);
+    Dense<Scalar> Ad(dependentColumns<Scalar>(200, 90, 91, 8));
+    check((Ad.adjoint() * (Ad * xb - b)).norm() < 1e-10, std::string(tag) + " tall 200x90: basic solution is least squares",
+          (Ad.adjoint() * (Ad * xb - b)).norm());
+  }
+  {
+    Solver qr;
+    qr.setEngine(g_engine);
+    checkRankDeficient<Scalar>(std::string(tag) + " wide 50x120", dependentColumns<Scalar>(50, 120, 31, 11), randomVector<Scalar>(50, 5), qr);
+  }
+  {
+    Solver qr;
+    qr.setEngine(g_engine);
+    checkRankDeficient<Scalar>(std::string(tag) + " square 90x90", dependentColumns<Scalar>(90, 90, 21, 7), randomVector<Scalar>(90, 4), qr);
+  }
+}
+
+// The Kahan matrix with unitary diagonal phase factors on both sides: the same
+// singular values and the same hidden dependency, but every Householder
+// reflector, the verification and the deferred block's SVD run in complex
+// arithmetic.
+void testComplexHiddenRankDeficiency() {
+  typedef std::complex<double> cd;
+  const int n = 100;
+  const double theta = 1.2, c = std::cos(theta), s = std::sin(theta);
+  std::vector<Eigen::Triplet<cd>> t;
+  double sk = 1.0;
+  for (int i = 0; i < n; ++i) {
+    const cd rowPhase = std::polar(1.0, 0.7 * i);
+    t.emplace_back(i, i, rowPhase * sk * (1.0 + 1e-10 * i) * std::polar(1.0, -0.3 * i));
+    for (int j = i + 1; j < n; ++j) t.emplace_back(i, j, rowPhase * (-c * sk) * std::polar(1.0, -0.3 * j));
+    sk *= s;
+  }
+  Eigen::SparseMatrix<cd> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  Dense<cd> Ad(A);
+  Eigen::JacobiSVD<Dense<cd>> svd(Ad);
+  const double tau = 1e-10;
+  const Index refRank = numericalRank<cd>(Ad, tau);
+  check(refRank < n, "complex Kahan: reference rank is deficient", double(refRank));
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<cd>> qr;
+  qr.setEngine(g_engine);
+  qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
+  qr.setOrdering(Eigen::multifrontal_qr::Ordering::Natural);
+  qr.setRankTolerance(tau / svd.singularValues()[0] * Ad.colwise().norm().maxCoeff());
+  qr.compute(A);
+  check(qr.rank() == refRank, "complex Kahan: verified rank matches SVD", double(qr.rank()));
+  checkTrue(qr.rankIsVerified(), "complex Kahan: rank verified");
+  check(factorIdentity(qr, A) < 1e-11, "complex Kahan: R^H R == (APD)^H APD", factorIdentity(qr, A));
+  const Vec<cd> b = Vec<cd>::Ones(n);
+  const Vec<cd> x = qr.solve(b), ref = pinvSolve<cd>(Ad, b, tau);
+  check(relErr(x, ref) < 1e-5, "complex Kahan: equals truncated pinv(A) b", relErr(x, ref));
+}
+
+// A Kahan block coupled (weakly) into a Laplacian: the deferred column is one
+// of many, under every ordering, and the deferred front sits inside a real
+// elimination tree instead of being the whole matrix.
+template <typename Scalar>
+Eigen::SparseMatrix<Scalar> embeddedKahan(int k, int grid, unsigned seed) {
+  const double theta = 1.2, c = std::cos(theta), s = std::sin(theta);
+  std::vector<Eigen::Triplet<Scalar>> t;
+  double sk = 1.0;
+  for (int i = 0; i < k; ++i) {
+    t.emplace_back(i, i, Scalar(sk * (1.0 + 1e-10 * i)));
+    for (int j = i + 1; j < k; ++j) t.emplace_back(i, j, Scalar(-c * sk));
+    sk *= s;
+  }
+  const auto L = lu_testing::laplacian2dAs<Scalar>(grid, grid);
+  const int n = k + int(L.cols());
+  for (int j = 0; j < L.outerSize(); ++j)
+    for (typename Eigen::SparseMatrix<Scalar>::InnerIterator it(L, j); it; ++it) t.emplace_back(k + int(it.row()), k + j, it.value());
+  std::mt19937 rng(seed);
+  for (int e = 0; e < 60; ++e) {
+    const int i = int(rng() % unsigned(k)), j = k + int(rng() % unsigned(L.cols()));
+    t.emplace_back(i, j, Scalar(1e-13) * randomScalar<Scalar>(rng));  // far below the Kahan block's smallest singular value
+    t.emplace_back(j, i, Scalar(1e-13) * randomScalar<Scalar>(rng));
+  }
+  Eigen::SparseMatrix<Scalar> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  return A;
+}
+
+template <typename Scalar>
+void testEmbeddedHiddenDeficiency(const char* tag) {
+  const auto A = embeddedKahan<Scalar>(100, 12, 13);
+  const Vec<Scalar> b = Vec<Scalar>::Ones(A.rows());
+  using O = Eigen::multifrontal_qr::Ordering;
+  for (O o : {O::COLAMD, O::AMD, O::Natural}) {
+    Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>> qr;
+    qr.setEngine(g_engine);
+    qr.setOrdering(o);
+    qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
+    qr.setRankTolerance(1e-10);
+    qr.setThoroughVerification(true);
+    checkRankDeficient<Scalar>(std::string(tag) + " (ordering " + std::to_string(int(o)) + ")", A, b, qr, 1e-4);
+    check(qr.deferredNullity() == 1, std::string(tag) + ": deficiency found in the deferred block", double(qr.deferredNullity()));
+  }
+}
+
+// Serial and parallel factorizations must agree bit for bit also when the
+// verification defers columns and refactors.
+void testParallelIdenticalWithDeferral() {
+  const auto A = embeddedKahan<double>(100, 30, 14);
+  const Eigen::VectorXd b = Eigen::VectorXd::Ones(A.rows());
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> s;
+  s.setEngine(g_engine);
+  s.setScaling(Eigen::multifrontal_qr::Scaling::None);
+  s.setRankTolerance(1e-10);
+  s.compute(A);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>, Eigen::supernodal_lu::PooledExecutor> p;
+  p.setEngine(g_engine);
+  p.setScaling(Eigen::multifrontal_qr::Scaling::None);
+  p.setRankTolerance(1e-10);
+  p.executor() = Eigen::supernodal_lu::PooledExecutor(4);
+  p.compute(A);
+  check(s.rank() == A.cols() - 1 && p.rank() == s.rank(), "parallel with deferral: rank n-1 on both", double(p.rank()));
+  const Eigen::VectorXd xs = s.solve(b), xp = p.solve(b);
+  check((xs - xp).norm() == 0.0, "parallel with deferral: bit-identical to serial", (xs - xp).norm());
+}
+
+// A front wide enough for the chunked trailing update to run across lanes.
+void testLargeFrontParallel() {
+  if (g_engine != Eigen::multifrontal_qr::Engine::Multifrontal) return;
+  const auto A = lu_testing::laplacian3d(16, 16, 16);
+  const Eigen::VectorXd b = Eigen::VectorXd::LinSpaced(A.rows(), -1.0, 1.0);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> s;
+  s.compute(A);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>, Eigen::supernodal_lu::PooledExecutor> p;
+  p.executor() = Eigen::supernodal_lu::PooledExecutor(8);
+  p.compute(A);
+  const Eigen::VectorXd xs = s.solve(b), xp = p.solve(b);
+  check((xs - xp).norm() == 0.0, "laplacian3d 16^3, 8 lanes: bit-identical to serial", (xs - xp).norm());
+  check((A * xs - b).norm() / b.norm() < 1e-12, "laplacian3d 16^3: residual", (A * xs - b).norm() / b.norm());
+}
+
+// Several right-hand sides at once must equal the columns solved one by one.
+void testMultipleRightHandSides() {
+  const auto A = dependentColumns<double>(80, 60, 41, 9);
+  const int m = int(A.rows());
+  Eigen::MatrixXd B(m, 3);
+  for (int j = 0; j < 3; ++j) B.col(j) = randomVector<double>(m, 6 + unsigned(j));
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
+  const Eigen::MatrixXd X = qr.solve(B);
+  double worst = 0.0;
+  for (int j = 0; j < 3; ++j) {
+    const Eigen::VectorXd xj = qr.solve(Eigen::VectorXd(B.col(j)));
+    worst = std::max(worst, (X.col(j) - xj).norm() / xj.norm());
+  }
+  check(worst < 1e-13, "multiple rhs: equals column-by-column solves", worst);
+}
+
+// factorize() again on the same pattern, after a factorization that deferred
+// columns: the deferred structure stays, the new values decide the rank.
+void testRefactorizeAfterDeferral() {
+  const int n = 100;
+  const double theta = 1.2, c = std::cos(theta), s = std::sin(theta);
+  std::vector<Eigen::Triplet<double>> t;
+  double sk = 1.0;
+  for (int i = 0; i < n; ++i) {
+    t.emplace_back(i, i, sk * (1.0 + 1e-10 * i));
+    for (int j = i + 1; j < n; ++j) t.emplace_back(i, j, -c * sk);
+    sk *= s;
+  }
+  Eigen::SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  Eigen::MatrixXd Ad(A);
+  const double tau = 1e-10;
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(Ad);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
+  qr.setOrdering(Eigen::multifrontal_qr::Ordering::Natural);
+  qr.setRankTolerance(tau / svd.singularValues()[0] * Ad.colwise().norm().maxCoeff());
+  qr.compute(A);
+  const Index r1 = qr.rank();
+  check(r1 < n && !qr.deferredColumns().empty(), "refactorize: first factorization deferred columns", double(qr.deferredColumns().size()));
+  // same pattern, well-conditioned values
+  Eigen::SparseMatrix<double> B = A;
+  for (int j = 0; j < n; ++j)
+    for (Eigen::SparseMatrix<double>::InnerIterator it(B, j); it; ++it) it.valueRef() = it.row() == j ? 1.0 : 0.01;
+  qr.factorize(B);
+  checkTrue(qr.info() == Eigen::Success, "refactorize: factorize(B) succeeds");
+  check(qr.rank() == n && qr.rankIsVerified(), "refactorize: B is full rank and verified", double(qr.rank()));
+  const Eigen::VectorXd xt = Eigen::VectorXd::LinSpaced(n, -1.0, 1.0), bb = B * xt;
+  check(relErr<double>(qr.solve(bb), xt) < 1e-10, "refactorize: B forward error", relErr<double>(qr.solve(bb), xt));
+  check(factorIdentity(qr, B) < 1e-11, "refactorize: B factor identity", factorIdentity(qr, B));
+  qr.factorize(A);
+  check(qr.rank() == r1, "refactorize: A again, same rank", double(qr.rank()));
+  const Eigen::VectorXd b1 = Eigen::VectorXd::Ones(n);
+  check(relErr<double>(qr.solve(b1), pinvSolve<double>(Ad, b1, tau)) < 1e-6, "refactorize: A again, equals truncated pinv(A) b",
+        relErr<double>(qr.solve(b1), pinvSolve<double>(Ad, b1, tau)));
+}
+
+// Explicit zeros and an uncompressed input; analyzePattern on one, factorize on the other.
+void testExplicitZerosAndUncompressed() {
+  const int n = 80;
+  const auto A = randomSparse<double>(n, n, 0.04, 61);
+  Eigen::SparseMatrix<double> B(n, n);
+  B.reserve(Eigen::VectorXi::Constant(n, 8));
+  for (int j = 0; j < n; ++j) {
+    for (Eigen::SparseMatrix<double>::InnerIterator it(A, j); it; ++it) B.insert(it.row(), j) = it.value();
+    B.coeffRef((j * 7 + 3) % n, j) += 0.0;  // an explicit zero (or an existing entry)
+  }
+  checkTrue(!B.isCompressed(), "explicit zeros: input is uncompressed");
+  const Eigen::VectorXd xt = Eigen::VectorXd::LinSpaced(n, 1.0, 2.0), b = B * xt;
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(B);
+  check(qr.info() == Eigen::Success && qr.rank() == n, "explicit zeros: full rank", double(qr.rank()));
+  check(relErr<double>(qr.solve(b), xt) < 1e-11, "explicit zeros: forward error", relErr<double>(qr.solve(b), xt));
+  Eigen::SparseMatrix<double> C = B;
+  C.makeCompressed();
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> q2;
+  q2.setEngine(g_engine);
+  q2.analyzePattern(C);
+  q2.factorize(B);
+  checkTrue(q2.info() == Eigen::Success, "explicit zeros: analyzePattern(compressed) + factorize(uncompressed)");
+  check(relErr<double>(q2.solve(b), xt) < 1e-11, "explicit zeros: mixed forward error", relErr<double>(q2.solve(b), xt));
+}
+
+// Dead columns at every position relative to the Householder panels.
+void testBlockSizes() {
+  const auto A = dependentColumns<double>(150, 120, 71, 5);
+  const Eigen::VectorXd b = randomVector<double>(150, 9);
+  for (int bs : {1, 2, 3, 5}) {
+    Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+    qr.setEngine(g_engine);
+    qr.setBlockSize(bs);
+    qr.setAmalgamation(bs % 2 == 0);
+    checkRankDeficient<double>("block size " + std::to_string(bs) + (bs % 2 ? ", no amalgamation" : ""), A, b, qr);
+  }
+}
+
+// The Neumann Laplacian: one exact null vector spread over every column.
+void testNeumannLaplacian() {
+  constexpr int g = 15;
+  const int n = g * g;
+  std::vector<Eigen::Triplet<double>> t;
+  auto id = [](int x, int y) { return y * g + x; };
+  for (int y = 0; y < g; ++y)
+    for (int x = 0; x < g; ++x) {
+      const int i = id(x, y);
+      int deg = 0;
+      if (x > 0) { t.emplace_back(i, id(x - 1, y), -1.0); ++deg; }
+      if (x + 1 < g) { t.emplace_back(i, id(x + 1, y), -1.0); ++deg; }
+      if (y > 0) { t.emplace_back(i, id(x, y - 1), -1.0); ++deg; }
+      if (y + 1 < g) { t.emplace_back(i, id(x, y + 1), -1.0); ++deg; }
+      t.emplace_back(i, i, double(deg));
+    }
+  Eigen::SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  const Eigen::VectorXd b = A * Eigen::VectorXd::LinSpaced(n, 0.0, 1.0);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  checkRankDeficient<double>("Neumann Laplacian", A, b, qr);
+  const Eigen::MatrixXd& N = qr.nullSpace();
+  if (N.cols() == 1) check(N.col(0).cwiseAbs().maxCoeff() - N.col(0).cwiseAbs().minCoeff() < 1e-10, "Neumann Laplacian: null vector is constant",
+                           N.col(0).cwiseAbs().maxCoeff() - N.col(0).cwiseAbs().minCoeff());
+}
+
+// A rank tolerance large enough to kill or defer many columns: the factor
+// identity on the live columns and a finite, LS-optimal solution still hold.
+void testLargeRankTolerance() {
+  const int n = 150;
+  Eigen::MatrixXd Ad(randomSparse<double>(n, n, 0.03, 101, false));
+  for (int i = 0; i < n; ++i) Ad(i, i) += 1e-6 * (i % 3);
+  Eigen::SparseMatrix<double> A = Ad.sparseView();
+  A.makeCompressed();
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.setRankTolerance(1e-2);
+  qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
+  qr.compute(A);
+  checkTrue(qr.info() == Eigen::Success && qr.rank() < n, "large tolerance: factorizes, rank deficient");
+  checkTrue(isPermutation(qr), "large tolerance: colsPermutation is a permutation");
+  check(factorIdentity(qr, A) < 1e-11, "large tolerance: R^H R == (APD)^H APD on live columns", factorIdentity(qr, A));
+  checkTrue(qr.solve(Eigen::VectorXd::Ones(n)).allFinite(), "large tolerance: finite solution");
+}
+
+// Non-finite entries are refused, not factored.
+void testNonFiniteInput() {
+  auto A = randomSparse<double>(30, 30, 0.1, 81);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  A.valuePtr()[5] = std::numeric_limits<double>::infinity();
+  qr.compute(A);
+  checkTrue(qr.info() != Eigen::Success, "inf entry: not a success");
+  A.valuePtr()[5] = std::numeric_limits<double>::quiet_NaN();
+  qr.compute(A);
+  checkTrue(qr.info() != Eigen::Success, "nan entry: not a success");
+}
+
+// One solver object reused across shapes.
+void testReuseAcrossShapes() {
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  const auto A = randomSparse<double>(100, 100, 0.03, 201);
+  qr.compute(A);
+  const Eigen::VectorXd ones = Eigen::VectorXd::Ones(100);
+  check(relErr<double>(qr.solve(A * ones), ones) < 1e-10, "reuse: 100x100", relErr<double>(qr.solve(A * ones), ones));
+  const auto B = randomSparse<double>(30, 50, 0.1, 207);
+  qr.compute(B);
+  const Eigen::VectorXd bb = B * Eigen::VectorXd::LinSpaced(50, 1.0, 2.0);
+  check(qr.rank() == 30 && (B * qr.solve(bb) - bb).norm() / bb.norm() < 1e-12, "reuse: 30x50 after 100x100",
+        (B * qr.solve(bb) - bb).norm() / bb.norm());
+  const auto C = randomSparse<double>(60, 40, 0.1, 203);
+  qr.compute(C);
+  const Eigen::VectorXd xc = Eigen::VectorXd::LinSpaced(40, 1.0, 2.0);
+  check(relErr<double>(qr.solve(C * xc), xc) < 1e-10, "reuse: 60x40 after 30x50", relErr<double>(qr.solve(C * xc), xc));
+}
+
+// Matrices with no rows or no columns -- also with assertions enabled, where a
+// sparse reduction over zero rows would assert.
+void testEmptyShapes() {
+  auto run = [&](int m, int n, const std::string& tag) {
+    Eigen::SparseMatrix<double> A(m, n);
+    A.makeCompressed();
+    Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+    qr.setEngine(g_engine);
+    qr.compute(A);
+    checkTrue(qr.info() == Eigen::Success && qr.rank() == 0, tag + ": rank 0");
+    const Eigen::VectorXd x = qr.solve(Eigen::VectorXd::Ones(m));
+    checkTrue(x.size() == n && x.norm() == 0.0, tag + ": solution is 0");
+    checkTrue(qr.nullSpace().cols() == n, tag + ": null space is everything");
+  };
+  run(0, 0, "0x0");
+  run(0, 5, "0x5");
+  run(5, 0, "5x0");
+  Eigen::SparseMatrix<double> R(1, 5);
+  for (int j = 0; j < 5; ++j) R.insert(0, j) = j + 1.0;
+  R.makeCompressed();
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(R);
+  Eigen::VectorXd b1(1);
+  b1 << 55.0;
+  check(qr.rank() == 1 && relErr<double>(qr.solve(b1), pinvSolve<double>(Eigen::MatrixXd(R), b1, 1e-12)) < 1e-13, "1x5: min-norm solution",
+        relErr<double>(qr.solve(b1), pinvSolve<double>(Eigen::MatrixXd(R), b1, 1e-12)));
+}
+
+// Options changed AFTER compute() must apply to later solves -- also on the
+// cached column-scaled fallback factorization an inconsistent square solve
+// builds, and to the "null space too large" decision when the cap is raised.
+void testOptionsChangedAfterCompute() {
+  const int n = 60;
+  Eigen::MatrixXd Ad(randomSparse<double>(n, n, 0.05, 51));
+  for (int j = 0; j < n; ++j)
+    if (j % 10 == 5) Ad.col(j) = 2.0 * Ad.col(j - 1);
+  Eigen::SparseMatrix<double> A = Ad.sparseView();
+  A.makeCompressed();
+  const Eigen::VectorXd b = Eigen::VectorXd::Ones(n);  // inconsistent: A is square and singular
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
+  const Eigen::VectorXd xmin = qr.solve(b);
+  checkTrue(!qr.isWeightedLeastSquares(), "options after compute: unweighted fallback in use");
+  qr.setSolution(Eigen::multifrontal_qr::Solution::Basic);
+  const Eigen::VectorXd xb = qr.solve(b);
+  double deadNorm = 0.0;
+  for (auto c : qr.deadColumns()) deadNorm += std::abs(xb[c]);
+  check(deadNorm == 0.0, "options after compute: Basic after MinimumNorm zeroes the dead columns", deadNorm);
+  check((A.transpose() * (A * xb - b)).norm() < 1e-10, "options after compute: basic solution is least squares",
+        (A.transpose() * (A * xb - b)).norm());
+  qr.setSolution(Eigen::multifrontal_qr::Solution::MinimumNorm);
+  qr.setMaxRefinements(0);
+  const Eigen::VectorXd x0 = qr.solve(b);  // solve() is lazy: it must be evaluated to run
+  check(qr.iterativeRefinements() == 0, "options after compute: setMaxRefinements(0) honoured", double(qr.iterativeRefinements()));
+  check(x0.allFinite(), "options after compute: unrefined solution is finite", x0.norm());
+
+  const auto B = randomSparse<double>(30, 50, 0.1, 207);
+  const Eigen::VectorXd bb = B * Eigen::VectorXd::LinSpaced(50, 1.0, 2.0);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qb;
+  qb.setEngine(g_engine);
+  qb.compute(B);
+  qb.setMaxNullSpaceScalars(10);
+  const Eigen::VectorXd xbasic = qb.solve(bb);
+  checkTrue(!qb.lastSolveMessage().empty() && qb.nullSpace().cols() == 0, "null-space cap: basic solution, message set");
+  qb.setMaxNullSpaceScalars(5e7);
+  const Eigen::VectorXd xm = qb.solve(bb);
+  checkTrue(qb.lastSolveMessage().empty(), "null-space cap lifted: min-norm solution again");
+  check(xm.norm() < xbasic.norm() * (1 - 1e-6), "null-space cap lifted: shorter than the basic solution", xm.norm() / xbasic.norm());
+}
+
+// The minimum-norm solution is the basic solution projected off the null
+// space, and the basic solution can be arbitrarily larger than the answer:
+// here 1e12 times (two columns 1e-12 apart), and 1e6 times on ordinary random
+// wide systems whose pivot columns happen to be nearly dependent. The
+// projection alone would leave eps |x_basic|; the accuracy must be
+// eps kappa(A) |x_minnorm| regardless.
+void testMinimumNormAccuracy() {
+  for (double delta : {1e-9, 1e-12}) {
+    Eigen::MatrixXd Ad(2, 3);
+    Ad << 1, 1, 0, 1, 1 + delta, 1;  // rank 2; columns 1,2 nearly parallel, column 3 completes the range
+    Eigen::SparseMatrix<double> A = Ad.sparseView();
+    A.makeCompressed();
+    Eigen::VectorXd b(2);
+    b << 1, 2;
+    Eigen::JacobiSVD<Eigen::MatrixXd, Eigen::ComputeThinU | Eigen::ComputeThinV> svd(Ad);
+    const Eigen::VectorXd ref = svd.solve(b);
+    Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+    qr.setEngine(g_engine);
+    qr.setOrdering(Eigen::multifrontal_qr::Ordering::Natural);
+    qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
+    qr.compute(A);
+    const Eigen::VectorXd x = qr.solve(b);
+    const std::string tag = "min-norm accuracy 2x3, delta " + std::to_string(delta);
+    check(qr.rank() == 2 && qr.rankIsVerified(), tag + ": full row rank", double(qr.rank()));
+    check(relErr<double>(x, ref) < 1e-12, tag + ": equals pinv(A) b", relErr<double>(x, ref));
+    check((Ad * x - b).norm() < 1e-13, tag + ": consistent residual", (Ad * x - b).norm());
+  }
+  // Ordinary random wide systems: the error follows kappa(R11), not kappa(A).
+  double worstErr = 0.0, worstKappaA = 0.0;
+  for (unsigned seed = 202; seed < 212; ++seed) {
+    const auto B = randomSparse<double>(30, 50, 0.1, seed);
+    const Eigen::MatrixXd Bd(B);
+    const Eigen::VectorXd bb = B * Eigen::VectorXd::LinSpaced(50, 1.0, 2.0);
+    Eigen::JacobiSVD<Eigen::MatrixXd, Eigen::ComputeThinU | Eigen::ComputeThinV> svd(Bd);
+    worstKappaA = std::max(worstKappaA, svd.singularValues()[0] / svd.singularValues()[29]);
+    Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+    qr.setEngine(g_engine);
+    qr.compute(B);
+    worstErr = std::max(worstErr, relErr<double>(qr.solve(bb), svd.solve(bb)));
+  }
+  lu_testing::note("wide 30x50: worst kappa(A) " + std::to_string(worstKappaA));
+  check(worstErr < 1e-13 * worstKappaA, "min-norm accuracy, wide 30x50 (10 seeds): error ~ eps kappa(A)", worstErr);
+}
+
 }  // namespace
 
 void testAutoEngine() {
@@ -493,6 +1016,38 @@ void testAutoEngine() {
   qr.compute(A);
   Eigen::VectorXd xs = qr.solve(b);
   check(relErr<double>(xs, xm) < 1e-13, "engines agree", relErr<double>(xs, xm));
+}
+
+// Engine::Auto starts on the scalar engine and, past setScalarDeferralLimit()
+// dependent columns, hands the matrix to the multifrontal one mid-factorize.
+void testAutoEngineDeferralSwitch() {
+  using Eigen::multifrontal_qr::Engine;
+  const int n = 400;
+  std::vector<Eigen::Triplet<double>> t;
+  for (int i = 0; i < n; ++i) {
+    t.emplace_back(i, i, 2.0 + 0.01 * i);
+    if (i > 0) t.emplace_back(i - 1, i, -1.0);
+  }
+  Eigen::SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  Eigen::MatrixXd Ad(A);
+  for (int i = 2; i < n; i += 3) Ad.col(i) = 2.0 * Ad.col(i - 1);  // 133 dependent columns
+  A = Ad.sparseView();
+  A.makeCompressed();
+  const Eigen::VectorXd b = A * Eigen::VectorXd::LinSpaced(n, 1.0, 2.0);
+  const Eigen::VectorXd ref = pinvSolve<double>(Ad, b, 1e-12);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setScalarEngineThreshold(1000000);  // the scalar engine would be chosen on size alone
+  qr.compute(A);
+  checkTrue(qr.engineUsed() == Engine::Multifrontal, "auto engine: >64 deferrals hand over to multifrontal");
+  check(qr.rank() == numericalRank<double>(Ad, 1e-12) && qr.rankIsVerified(), "auto engine switch: verified rank", double(qr.rank()));
+  check(relErr<double>(qr.solve(b), ref) < 1e-9, "auto engine switch: equals pinv(A) b", relErr<double>(qr.solve(b), ref));
+  check(factorIdentity(qr, A) < 1e-11, "auto engine switch: R^H R == (APD)^H APD", factorIdentity(qr, A));
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qs;
+  qs.setEngine(Engine::Scalar);  // forced: every dependent column goes through the deferred block
+  qs.compute(A);
+  check(qs.rank() == qr.rank() && qs.deferredNullity() == n - qs.rank(), "forced scalar: same rank, all in the deferred block", double(qs.rank()));
+  check(relErr<double>(qs.solve(b), ref) < 1e-9, "forced scalar: equals pinv(A) b", relErr<double>(qs.solve(b), ref));
 }
 
 int main() {
@@ -524,8 +1079,29 @@ int main() {
     testIllConditioned();
     testParallelIdentical();
     testEdgeCases();
+    std::printf("--- rank deficiency, every shape ---\n");
+    testDeficientShapes<double>("real");
+    testDeficientShapes<std::complex<double>>("complex");
+    testComplexHiddenRankDeficiency();
+    testEmbeddedHiddenDeficiency<double>("embedded Kahan");
+    testEmbeddedHiddenDeficiency<std::complex<double>>("complex embedded Kahan");
+    testNeumannLaplacian();
+    testBlockSizes();
+    testLargeRankTolerance();
+    std::printf("--- solves, reuse, options ---\n");
+    testMultipleRightHandSides();
+    testRefactorizeAfterDeferral();
+    testExplicitZerosAndUncompressed();
+    testNonFiniteInput();
+    testReuseAcrossShapes();
+    testEmptyShapes();
+    testParallelIdenticalWithDeferral();
+    testLargeFrontParallel();
+    testOptionsChangedAfterCompute();
+    testMinimumNormAccuracy();
   }
   std::printf("=== engine selection ===\n");
   testAutoEngine();
+  testAutoEngineDeferralSwitch();
   return lu_testing::summarize("MultifrontalQR");
 }

@@ -174,11 +174,27 @@ block stops at 1373, and the repair loop can then only report failure; the SVD r
 | rank r < n, `Solution::Basic` | the basic solution: dead columns and null directions zero |
 
 The minimum-norm answer is the basic one projected orthogonally off the null space, in the
-*original* (unscaled) inner product. The null-space basis `[-R11⁻¹R12; I]` is formed once per
-factorization with all right-hand sides in one block solve per front, orthonormalized, and kept
-in factored form; `nullSpace()` materializes it on request. Its size is capped by
-`setMaxNullSpaceScalars` (default 5e7); beyond it the basic solution is returned and
-`lastSolveMessage()` says so.
+*original* (unscaled) inner product, **then refined again**. The projection cancels
+`|x_basic|` down to `|x_minnorm|`, and the basic solution can be arbitrarily larger than the
+minimum-norm one — on a 2×3 matrix with two columns 1e-12 apart it is 1e12 times larger, on
+random 30×50 sparse systems 1e6 times — so the projection alone leaves an error of
+`eps |x_basic|`. The augmented refinement therefore continues on the projected solution (each
+correction projected before it is added, the residual estimate refined along), which brings the
+error back to `eps κ(A) |x_minnorm|`: 1e-15 on both examples.
+
+The null-space basis `[-R11⁻¹R12; I]` is formed once per factorization with all right-hand
+sides in one block solve per front, orthonormalized, and kept in factored form; `nullSpace()`
+materializes it on request. When R11 is ill-conditioned every column of that basis is
+dominated by R11's near-null vector, and orthonormalizing a basis with `σ_min ~ 1/|R11⁻¹R12|`
+loses its *span* to `eps/σ_min`; so after the first orthonormalization each vector's row-space
+part is removed again (a basic solve of the tiny `A n`, which is well conditioned) and the
+basis is orthonormalized once more. Its size is capped by `setMaxNullSpaceScalars` (default
+5e7); beyond it the basic solution is returned and `lastSolveMessage()` says so, and raising
+the cap later makes the next solve build it.
+
+Options read by `solve()` — `setSolution`, `setMaxRefinements`, `setExtendedPrecisionResidual`,
+`setMaxNullSpaceScalars` — take effect on the next solve, including on the column-scaled
+fallback factorization described below.
 
 Refinement residuals are computed in **double-double** ([`LeftRightLUExtendedResidual.h`]
 (../src/LeftRightLUExtendedResidual.h)). That is exact on the scaled matrix only because every
@@ -324,8 +340,9 @@ close to the true one (`spmsrtls`, 6.6×).
   AᴴA is that dense. `setMaxFactorNonzeros` turns that into an immediate refusal.
 - **Verification refactors.** Each repair is a full numeric refactorization; `rw5151` needs 7.
   The alternative — trusting Heath's rule — is wrong by 3 on `nnc1374`.
-- **The minimum-norm solution needs the null space.** Its basis costs one factor-sized solve per
-  null vector: 437 of them on `foldoc` make the first solve take ~2.3 s; later solves reuse it.
+- **The minimum-norm solution needs the null space.** Its basis costs two factor-sized solves
+  per null vector (the second removes the row-space part the orthonormalization lets back in);
+  437 of them on `foldoc` make the first solve take seconds; later solves reuse it.
 - **The scalar engine defers every dependent column.** With many of them the deferred block is
   a large dense SVD; `Auto` avoids it, but a forced `Engine::Scalar` does not.
 - **The first inconsistent solve on a square rank-deficient matrix factors it again** (column
