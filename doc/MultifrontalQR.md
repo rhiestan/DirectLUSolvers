@@ -190,9 +190,16 @@ refinement correctly moves away from it.)
 
 **Row scaling and least squares.** Scaling rows turns a least-squares problem into a
 *weighted* one — the solver minimizes `‖Dr (A x − b)‖`. For a consistent system the two agree,
-which is why `Scaling::Auto` scales rows only for square matrices and columns alone otherwise.
-Set `Scaling::RowsAndColumns` for a rectangular matrix when the rank decision matters more than
-the least-squares weights.
+so `Scaling::Auto` scales rows only for a square matrix — and the one case where a square
+system can be inconsistent, a rank-deficient matrix, is handled when it happens: when `solve()`
+finds the residual clearly above rounding level, it factors the matrix once more with column
+scaling alone (cached for later solves) and answers that column from it. On a 200×200 matrix
+with an empty column and `b = 1`, the row-scaled answer has `‖Aᵀr‖ = 1.5`; the fallback's equals
+`pinv(A) b` to 4e-15. Consistent systems — every benchmark here — never pay for it. When column
+scaling alone decides a *different* rank (rows spanning many orders of magnitude), the fallback
+is discarded, the row-scaled answer stands, and `isWeightedLeastSquares()` says so. For a
+rectangular matrix `Auto` scales columns only; set `Scaling::RowsAndColumns` when the rank
+decision matters more than the least-squares weights.
 
 **Diagnostics.** `solveResidual()` is `‖b − Ax‖/‖b‖` in the original matrix; for an inconsistent
 system that is the optimal residual, not an error. `leastSquaresOptimality()` is
@@ -295,7 +302,7 @@ close to the true one (`spmsrtls`, 6.6×).
 | `setScalarEngineDensity(perCol, cap)` | 38, 500000 | … and beyond it while nnz(R) ≤ min(perCol · n, cap) |
 | `setScalarDeferralLimit(k)` | 64 | `Auto` abandons the scalar engine when its deferred block would exceed k columns |
 | `setOrdering(Ordering)` | `Auto` | `COLAMD`, `AMD` (on AᴴA), `Natural`, or `Auto` (both, smaller predicted R; AMD skipped when AᴴA is too large to form — `setMaxAtAPattern`) |
-| `setScaling(Scaling)` | `Auto` | `RowsAndColumns`, `Columns`, `None`; `Auto` = rows+columns when square |
+| `setScaling(Scaling)` | `Auto` | `RowsAndColumns`, `Columns`, `None`; `Auto` = rows+columns when square, with a column-scaled fallback for inconsistent least-squares solves (see [Row scaling](#what-solve-returns)) |
 | `setRankTolerance(tau)` | 20 (m+n) eps | relative threshold; `0` keeps every nonzero pivot |
 | `setRankVerification(bool)` | on | the check-and-repair loop |
 | `setMaxRepairs(n)` | 8 | refactorizations verification may spend |
@@ -321,6 +328,8 @@ close to the true one (`spmsrtls`, 6.6×).
   null vector: 437 of them on `foldoc` make the first solve take ~2.3 s; later solves reuse it.
 - **The scalar engine defers every dependent column.** With many of them the deferred block is
   a large dense SVD; `Auto` avoids it, but a forced `Engine::Scalar` does not.
+- **The first inconsistent solve on a square rank-deficient matrix factors it again** (column
+  scaling only, then cached), so that its least-squares answer is unweighted.
 - **Weighted least squares under row scaling** — see above.
 - `matrixR()` is upper trapezoidal only up to the placement of the deferred block (its rows come
   last, its columns after the dead ones); the identity it satisfies is the one at the top of

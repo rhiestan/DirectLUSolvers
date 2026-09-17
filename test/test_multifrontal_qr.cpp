@@ -390,6 +390,53 @@ void testGraphMatrices() {
   check(rankMismatch == 0, "graph matrices: rank == SVD rank (" + std::to_string(runs) + " runs)", double(rankMismatch));
 }
 
+// Square, rank deficient, and INCONSISTENT: exactly where row scaling would turn
+// least squares into weighted least squares. Scaling::Auto must refactor without
+// it and return pinv(A) b.
+void testSquareInconsistentLeastSquares() {
+  const int n = 200;
+  std::vector<Eigen::Triplet<double>> t;
+  for (int j = 0; j < n; ++j) {
+    if (j == n / 2) continue;  // an empty column
+    t.emplace_back(j, j, 3.0);
+    if (j > 0) t.emplace_back(j - 1, j, 1.0);
+  }
+  Eigen::SparseMatrix<double> A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  const Eigen::VectorXd b = Eigen::VectorXd::Ones(n);
+  Eigen::MatrixXd Ad(A);
+  const Eigen::VectorXd ref = pinvSolve<double>(Ad, b, 1e-12);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.compute(A);
+  const Eigen::VectorXd x = qr.solve(b);
+  check(qr.rank() == n - 1, "square inconsistent: rank n-1", double(qr.rank()));
+  checkTrue(!qr.isWeightedLeastSquares(), "square inconsistent: least squares is unweighted");
+  check((A.transpose() * (A * x - b)).norm() < 1e-12, "square inconsistent: A^T r == 0",
+        (A.transpose() * (A * x - b)).norm());
+  check(relErr<double>(x, ref) < 1e-12, "square inconsistent: equals pinv(A) b", relErr<double>(x, ref));
+
+  // Rows spanning 1e+-40 and one empty column: column scaling alone decides a
+  // different rank, so the row-scaled factorization is kept -- and said to be
+  // weighted.
+  auto B = randomSparse<double>(n, n, 0.03, 17);
+  std::vector<Eigen::Triplet<double>> u;
+  std::mt19937 rng(23);
+  std::uniform_int_distribution<int> e(-40, 40);
+  std::vector<double> rs(n);
+  for (int i = 0; i < n; ++i) rs[i] = std::pow(10.0, e(rng));
+  for (int j = 0; j < n; ++j)
+    for (Eigen::SparseMatrix<double>::InnerIterator it(B, j); it; ++it)
+      if (j != 7) u.emplace_back(int(it.row()), j, it.value() * rs[it.row()]);
+  Eigen::SparseMatrix<double> C(n, n);
+  C.setFromTriplets(u.begin(), u.end());
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qc;
+  qc.setEngine(g_engine);
+  qc.compute(C);
+  check(qc.rank() == n - 1, "badly row-scaled, singular: rank n-1", double(qc.rank()));
+  checkTrue(qc.isWeightedLeastSquares(), "badly row-scaled, singular: reported as weighted");
+}
+
 void testParallelIdentical() {
   const auto A = lu_testing::laplacian2d(40, 40);
   Eigen::VectorXd b = Eigen::VectorXd::LinSpaced(A.rows(), 0.0, 1.0);
@@ -471,6 +518,7 @@ int main() {
     testExactRankDeficiency();
     testHiddenRankDeficiency();
     testBadScaling();
+    testSquareInconsistentLeastSquares();
     testGraphMatrices();
     std::printf("--- accuracy / parallel / edge ---\n");
     testIllConditioned();

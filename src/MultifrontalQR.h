@@ -100,8 +100,12 @@
 //
 // Scaling rows changes a least-squares problem into a WEIGHTED one: the solver
 // minimizes ||Dr (A x - b)|| instead of ||A x - b||. For a consistent system the
-// two coincide, which is why Scaling::Auto scales rows only for square matrices
-// and columns alone otherwise. Column scaling never changes the solution set.
+// two coincide. Scaling::Auto therefore scales rows only for a square matrix,
+// and when solve() meets an inconsistent right-hand side of a rank-deficient
+// one, it factors the matrix once more with columns alone (cached) and answers
+// from that -- unless that factorization decides a different rank. Column
+// scaling never changes the solution set. isWeightedLeastSquares() reports the
+// remaining case.
 //
 // Usage:
 //   #include <MultifrontalQR>
@@ -124,7 +128,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <type_traits>
 #include <random>
 #include <string>
 #include <vector>
@@ -157,8 +163,14 @@ enum class Solution { MinimumNorm, Basic };
 
 /** Equilibration before factoring. All factors are powers of two.
  *
- *   Auto            RowsAndColumns for a square matrix, Columns otherwise (row
- *                   scaling turns least squares into WEIGHTED least squares).
+ *   Auto            Columns for a rectangular matrix, RowsAndColumns for a
+ *                   square one. Row scaling turns least squares into WEIGHTED
+ *                   least squares, which matters only for an inconsistent
+ *                   right-hand side of a rank-deficient matrix -- so when solve()
+ *                   meets one, it factors the matrix once more with Columns
+ *                   (cached) and answers from that, unless that factorization
+ *                   decides a different rank. isWeightedLeastSquares() says
+ *                   when it did.
  *   RowsAndColumns  row max-norm scaling, then column 2-norm scaling.
  *   Columns         column 2-norm scaling only.
  *   None            factor A as given; rank decided on the raw column norms.
@@ -430,6 +442,24 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   multifrontal_qr::Solution solution() const { return m_solution; }
   void setScaling(multifrontal_qr::Scaling s) { m_scaling = s; }
   multifrontal_qr::Scaling scaling() const { return m_scaling; }
+  /** The scaling the last factorize() kept (Auto resolves to one). */
+  multifrontal_qr::Scaling scalingUsed() const { return m_scalingUsed; }
+  /** True when a least-squares answer for an inconsistent right-hand side
+   *  minimizes ||diag(rowScaling()) (A x - b)|| rather than ||A x - b||.
+   *  Consistent systems are unaffected either way.
+   *
+   *  Always false for a full-rank or column-scaled factorization, always true
+   *  for an explicit Scaling::RowsAndColumns on a rank-deficient matrix. Under
+   *  Scaling::Auto it is true only when a column-scaled factorization decides a
+   *  different rank; asking forces that factorization if solve() has not
+   *  already needed it. */
+  bool isWeightedLeastSquares() const {
+    using multifrontal_qr::Scaling;
+    if (m_scalingUsed != Scaling::RowsAndColumns || m_rank >= m_rows) return false;
+    if (m_scaling != Scaling::Auto) return true;
+    ensureUnweighted();
+    return m_unweightedState == 2;
+  }
 
   /** Relative rank tolerance tau: a column is dead when its remaining norm is at
    *  most tau * max column norm (after scaling). A negative value (default)
@@ -598,7 +628,8 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   void orderColumns(const MatrixType& A, const std::vector<char>& isDeferred, multifrontal_qr::Ordering ordering,
                     std::vector<StorageIndex>& ordered) const;
   double atAPatternSize(const MatrixType& A) const;
-  void computeScaling(const MatrixType& A);
+  void computeScaling(const MatrixType& A, multifrontal_qr::Scaling mode);
+  void factorizeScaled(const MatrixType& matrix, multifrontal_qr::Scaling mode);
   void factorOnce();
   void processFront(Index f, bool intraParallel, RealScalar& dropped, bool& nonFinite, Index& frontEntries);
   void verifyRank(bool& needsRepair, std::vector<StorageIndex>& newDeferred);
@@ -640,6 +671,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   Index m_slotCount = 0;
   multifrontal_qr::Solution m_solution = multifrontal_qr::Solution::MinimumNorm;
   multifrontal_qr::Scaling m_scaling = multifrontal_qr::Scaling::Auto;
+  multifrontal_qr::Scaling m_scalingUsed = multifrontal_qr::Scaling::None;
   RealScalar m_relTol = RealScalar(-1);
   bool m_verifyRank = true;
   bool m_thoroughVerification = false;
@@ -700,6 +732,44 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   mutable RealScalar m_lastOptimality = RealScalar(0);
   mutable Index m_lastRefinements = 0;
   mutable std::string m_solveNote;
+
+  // The column-scaled factorization an inconsistent least-squares solve falls
+  // back to (see Scaling::Auto). Built on first need; 0 = not yet decided,
+  // 1 = available (or not needed), 2 = its rank differs, so answers stay
+  // row-weighted.
+  typedef typename std::conditional<std::is_copy_constructible<Executor>::value, Executor,
+                                    supernodal_lu::SerialExecutor>::type FallbackExecutor;
+  typedef MultifrontalQR<MatrixType, FallbackExecutor> UnweightedSolver;
+  mutable std::shared_ptr<UnweightedSolver> m_unweighted;
+  mutable int m_unweightedState = 0;
+  void ensureUnweighted() const;
+  template <typename Other>
+  void copyOptionsTo(Other& o) const {
+    o.setEngine(m_engine);
+    o.setScalarEngineThreshold(m_scalarThreshold);
+    o.setScalarEngineDensity(m_scalarDensity, m_scalarCap);
+    o.setScalarDeferralLimit(m_scalarDeferLimit);
+    o.setOrdering(m_ordering);
+    o.setSolution(m_solution);
+    o.setRankTolerance(m_relTol);
+    o.setRankVerification(m_verifyRank);
+    o.setThoroughVerification(m_thoroughVerification);
+    o.setMaxRepairs(m_maxRepairs);
+    o.setDenseVerificationLimit(m_denseVerifyLimit);
+    o.setMaxRefinements(m_maxRefinements);
+    o.setExtendedPrecisionResidual(m_extendedResidual);
+    o.setMaxNullSpaceScalars(m_maxNullSpaceScalars);
+    o.setAmalgamation(m_amalgamate);
+    o.setBlockSize(m_blockSize);
+    o.setIntraFrontParallelism(m_intraParallel);
+    o.setMaxFactorNonzeros(m_maxFactorNonzeros);
+    o.setMaxAtAPattern(m_maxAtA);
+    copyExecutorTo(o, std::is_copy_constructible<Executor>());
+  }
+  template <typename Other>
+  void copyExecutorTo(Other& o, std::true_type) const { o.executor() = m_executor; }
+  template <typename Other>
+  void copyExecutorTo(Other&, std::false_type) const {}
 };
 
 // ============================================================================
@@ -1260,17 +1330,17 @@ void MultifrontalQR<MatrixType, Executor>::releaseNumeric() {
   m_nullDim = 0;
   m_conditionEstimate = RealScalar(-1);
   m_inverseNormEstimate = RealScalar(-1);
+  m_unweighted.reset();
+  m_unweightedState = 0;
   m_sigmaIsBound = false;
   m_nnzR = m_nnzH = m_largestFront = 0;
 }
 
 template <typename MatrixType, typename Executor>
-void MultifrontalQR<MatrixType, Executor>::computeScaling(const MatrixType& A) {
+void MultifrontalQR<MatrixType, Executor>::computeScaling(const MatrixType& A, multifrontal_qr::Scaling mode) {
   using multifrontal_qr::Scaling;
   using multifrontal_qr::detail::inversePowerOfTwo;
   const Index m = A.rows(), n = A.cols();
-  Scaling mode = m_scaling;
-  if (mode == Scaling::Auto) mode = (m == n) ? Scaling::RowsAndColumns : Scaling::Columns;
   m_rowScale.setOnes(m);
   m_colScale.setOnes(n);
   if (mode == Scaling::RowsAndColumns) {
@@ -1304,6 +1374,34 @@ void MultifrontalQR<MatrixType, Executor>::computeScaling(const MatrixType& A) {
 template <typename MatrixType, typename Executor>
 void MultifrontalQR<MatrixType, Executor>::factorize(const MatrixType& matrix) {
   eigen_assert(matrix.rows() == m_rows && matrix.cols() == m_cols && "factorize() needs the analyzed pattern");
+  using multifrontal_qr::Scaling;
+  const bool square = m_rows == m_cols;
+  Scaling mode = m_scaling;
+  if (mode == Scaling::Auto) mode = square ? Scaling::RowsAndColumns : Scaling::Columns;
+  factorizeScaled(matrix, mode);
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::ensureUnweighted() const {
+  if (m_unweightedState != 0) return;
+  m_unweightedState = 2;
+  // The scaling is by powers of two, so the original matrix comes back exactly.
+  MatrixType A = m_scaled;
+  for (Index c = 0; c < m_cols; ++c)
+    for (typename MatrixType::InnerIterator it(A, c); it; ++it)
+      it.valueRef() /= (m_rowScale[it.row()] * m_colScale[c]);
+  auto qr = std::make_shared<UnweightedSolver>();
+  copyOptionsTo(*qr);
+  qr->setScaling(multifrontal_qr::Scaling::Columns);
+  qr->compute(A);
+  if (qr->info() == Success && qr->rank() == m_rank) {
+    m_unweighted = std::move(qr);
+    m_unweightedState = 1;
+  }
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::factorizeScaled(const MatrixType& matrix, multifrontal_qr::Scaling mode) {
   m_info = Success;
   m_lastError.clear();
   m_factorized = false;
@@ -1311,7 +1409,8 @@ void MultifrontalQR<MatrixType, Executor>::factorize(const MatrixType& matrix) {
   m_repairs = 0;
   releaseNumeric();
 
-  computeScaling(matrix);
+  m_scalingUsed = mode;
+  computeScaling(matrix, mode);
   if (m_scaled.nonZeros() != analyzedNonZeros()) {
     m_info = InvalidInput;
     m_lastError = "MultifrontalQR: factorize() was given a different sparsity pattern than analyzePattern()";
@@ -2554,14 +2653,32 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
     for (typename MatrixType::InnerIterator it(m_scaled, cc); it; ++it)
       anorm += numext::abs2(it.value() / (m_rowScale[it.row()] * m_colScale[cc]));
   anorm = numext::sqrt(anorm);
+  const bool mayBeWeighted = m_scaling == multifrontal_qr::Scaling::Auto &&
+                             m_scalingUsed == multifrontal_qr::Scaling::RowsAndColumns && r < m;
   for (Index col = 0; col < nrhs; ++col) {
     Vector bc = b.col(col).template cast<Scalar>();
     Vector xc = dest.col(col);
-    Vector xs = xc.cwiseQuotient(m_colScale.template cast<Scalar>());
-    Vector rs = m_scaled * xs;                                   // Dr A x
-    Vector rOrig = bc - rs.cwiseQuotient(m_rowScale.template cast<Scalar>());
+    auto residualOf = [&](const Vector& xv) -> Vector {
+      Vector xs = xv.cwiseQuotient(m_colScale.template cast<Scalar>());
+      Vector rs = m_scaled * xs;  // Dr A x
+      return bc - rs.cwiseQuotient(m_rowScale.template cast<Scalar>());
+    };
+    Vector rOrig = residualOf(xc);
     const RealScalar bn = bc.norm();
-    const RealScalar rn = rOrig.norm();
+    RealScalar rn = rOrig.norm();
+    if (mayBeWeighted && rn > RealScalar(100) * eps * (anorm * xc.norm() + bn)) {
+      // Inconsistent: the row-scaled answer minimizes a weighted residual.
+      // Answer from the column-scaled factorization instead, if it agrees on
+      // the rank.
+      ensureUnweighted();
+      if (m_unweightedState == 1) {
+        xc = m_unweighted->solve(bc);
+        dest.col(col) = xc;
+        rOrig = residualOf(xc);
+        rn = rOrig.norm();
+        m_lastRefinements = (std::max)(m_lastRefinements, m_unweighted->iterativeRefinements());
+      }
+    }
     worstRes = (std::max)(worstRes, bn > RealScalar(0) ? rn / bn : rn);
     // The optimality ratio is 0/0 noise once r is at rounding level -- a
     // consistent system solved to 1e-16 would read as far from optimal -- so it
