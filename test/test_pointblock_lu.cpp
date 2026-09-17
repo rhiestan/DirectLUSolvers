@@ -20,6 +20,8 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -552,6 +554,306 @@ void testComplexScalars() {
   lu_testing::check(s.growthFactor() < 10.0, "and complex growth is benign", s.growthFactor());
 }
 
+// ---------------------------------------------------------------------------
+//  Determinants with real pivoting, and complex ones
+// ---------------------------------------------------------------------------
+//
+// testDeterminant() above uses diagonally dominant matrices, on which partial
+// pivoting never swaps a row and the permutation parity is never exercised.
+// weakDiagonal() forces row swaps in nearly every column, and the ordering
+// contributes its own parity.
+
+void testDeterminantWithPivoting() {
+  std::printf("\n-- determinant with row pivoting and a column ordering --\n");
+  for (int n : {5, 9, 20}) {
+    const SpMat A = lu_testing::weakDiagonal(n, 3u + unsigned(n));
+    const double ref = Eigen::MatrixXd(A).determinant();
+    Eigen::PointBlockLU<SpMat, Eigen::COLAMDOrdering<int>> colamd;
+    Eigen::PointBlockLU<SpMat, Eigen::AMDOrdering<int>> amd;
+    colamd.compute(A);
+    amd.compute(A);
+    lu_testing::check(std::abs(colamd.determinant() - ref) <= 1e-8 * std::abs(ref),
+                      "det n=" + std::to_string(n) + ", COLAMD", std::abs(colamd.determinant() - ref) / std::abs(ref));
+    lu_testing::check(std::abs(amd.determinant() - ref) <= 1e-8 * std::abs(ref),
+                      "det n=" + std::to_string(n) + ", AMD", std::abs(amd.determinant() - ref) / std::abs(ref));
+  }
+  {  // where determinant() overflows, logAbsDeterminant() still answers
+    const int n = 400;
+    SpMat A(n, n);
+    for (int i = 0; i < n; ++i) A.insert(i, i) = 10.0;
+    A.makeCompressed();
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(A);
+    lu_testing::check(std::abs(s.logAbsDeterminant() - n * std::log(10.0)) < 1e-9, "logAbsDeterminant of 10^400",
+                      s.logAbsDeterminant());
+    lu_testing::checkTrue(std::isinf(s.determinant()), "determinant() overflows to inf, not to garbage");
+  }
+}
+
+void testComplexDeterminant() {
+  std::printf("\n-- complex determinant carries its phase --\n");
+  typedef std::complex<double> Complex;
+  typedef Eigen::SparseMatrix<Complex> SpCplx;
+  {
+    SpCplx A(1, 1);
+    A.insert(0, 0) = Complex(0.0, 1.0);
+    A.makeCompressed();
+    Eigen::PointBlockLU<SpCplx> s;
+    s.compute(A);
+    lu_testing::check(std::abs(s.determinant() - Complex(0.0, 1.0)) < 1e-14, "det [i] == i",
+                      std::abs(s.determinant() - Complex(0.0, 1.0)));
+  }
+  for (int n : {4, 7, 15}) {
+    std::mt19937 rng(5u + unsigned(n));
+    std::uniform_real_distribution<double> uni(-1.0, 1.0);
+    Eigen::MatrixXcd D = Eigen::MatrixXcd::Zero(n, n);
+    for (int i = 0; i < n; ++i) {
+      D(i, i) = Complex(n + uni(rng), uni(rng));
+      for (int j = 0; j < n; ++j)
+        if (uni(rng) > 0.3) D(i, j) += Complex(uni(rng), uni(rng));
+    }
+    SpCplx A = D.sparseView();
+    A.makeCompressed();
+    Eigen::PointBlockLU<SpCplx> s;
+    s.compute(A);
+    const Complex ref = D.determinant(), got = s.determinant();
+    lu_testing::check(std::abs(got - ref) <= 1e-8 * std::abs(ref), "complex det n=" + std::to_string(n) + " vs dense",
+                      std::abs(got - ref) / std::abs(ref));
+    lu_testing::check(std::abs(std::abs(s.determinantSign()) - 1.0) < 1e-14, "complex determinantSign() has modulus 1",
+                      std::abs(s.determinantSign()));
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Things a replay must not do, and inputs the solver must not trip over
+// ---------------------------------------------------------------------------
+
+void testReplayNeedsTheSamePattern() {
+  std::printf("\n-- a factorize() with a different pattern is not replayed --\n");
+  // A replay scatters values into the RECORDED pattern and never reads the
+  // input's, so an entry outside it would simply be dropped. With the residual
+  // check off nothing else would notice.
+  const int n = 30;
+  std::vector<Eigen::Triplet<double>> t;
+  for (int i = 0; i < n; ++i) {
+    t.emplace_back(i, i, 4.0);
+    if (i > 0) t.emplace_back(i, i - 1, -1.0);
+    if (i + 1 < n) t.emplace_back(i, i + 1, -1.0);
+  }
+  SpMat A(n, n);
+  A.setFromTriplets(t.begin(), t.end());
+  A.makeCompressed();
+  const VectorXd xTrue = irrationalSolution(n);
+  auto expectFullFactorization = [&](const SpMat& B, const std::string& what) {
+    for (double threshold : {1e-6, 0.0}) {
+      Eigen::PointBlockLU<SpMat> s;
+      s.setSolveFailureThreshold(threshold);
+      s.analyzePattern(A);
+      s.factorize(A);
+      s.factorize(B);
+      const std::string tag = what + (threshold > 0 ? "" : ", residual check off");
+      lu_testing::checkTrue(s.refactorizations() == 0, tag + ": not replayed");
+      const VectorXd x = s.solve(VectorXd(B * xTrue));
+      lu_testing::check(s.info() == Eigen::Success && (x - xTrue).norm() / xTrue.norm() < 1e-12, tag + ": right answer",
+                        (x - xTrue).norm() / xTrue.norm());
+      s.factorize(B);
+      lu_testing::checkTrue(s.refactorizations() == 1, tag + ": the new pattern is replayed from then on");
+    }
+  };
+  auto grown = t;
+  grown.emplace_back(25, 2, 3.0);
+  SpMat B(n, n);
+  B.setFromTriplets(grown.begin(), grown.end());
+  B.makeCompressed();
+  expectFullFactorization(B, "entry added");
+  auto shrunk = t;
+  shrunk.erase(shrunk.begin() + 5);
+  SpMat C(n, n);
+  C.setFromTriplets(shrunk.begin(), shrunk.end());
+  C.makeCompressed();
+  expectFullFactorization(C, "entry dropped");
+  auto moved = t;
+  moved[5] = Eigen::Triplet<double>(0, 7, moved[5].value());
+  SpMat E(n, n);
+  E.setFromTriplets(moved.begin(), moved.end());
+  E.makeCompressed();
+  expectFullFactorization(E, "entry moved (same nnz)");
+}
+
+void testUncompressedInput() {
+  std::printf("\n-- an uncompressed input, under every ordering, and replayed --\n");
+  const int n = 40;
+  SpMat A(n, n);
+  A.reserve(Eigen::VectorXi::Constant(n, 6));
+  std::mt19937 rng(9);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  for (int j = 0; j < n; ++j) {
+    A.insert(j, j) = 10.0 + uni(rng);
+    for (int k = 0; k < 3; ++k) {
+      const int i = (j * 7 + k * 11 + 3) % n;
+      if (i != j) A.coeffRef(i, j) = uni(rng);
+    }
+  }
+  lu_testing::checkTrue(!A.isCompressed(), "the input really is uncompressed");
+  const VectorXd xTrue = irrationalSolution(n);
+  const VectorXd b = A * xTrue;
+  solvesCorrectly<Eigen::COLAMDOrdering<int>>("uncompressed, COLAMD", A, 1e-12);
+  solvesCorrectly<Eigen::AMDOrdering<int>>("uncompressed, AMD", A, 1e-12);
+  solvesCorrectly<Eigen::NaturalOrdering<int>>("uncompressed, Natural", A, 1e-12);
+  Eigen::PointBlockLU<SpMat> s;
+  s.compute(A);
+  s.factorize(A);
+  lu_testing::checkTrue(s.refactorizations() == 1, "uncompressed: the second factorize is a replay");
+  const VectorXd x = s.solve(b);
+  lu_testing::check((x - xTrue).norm() / xTrue.norm() < 1e-12, "uncompressed replay: right answer",
+                    (x - xTrue).norm() / xTrue.norm());
+  SpMat C = A;
+  C.makeCompressed();
+  s.factorize(C);
+  lu_testing::checkTrue(s.refactorizations() == 2, "its compressed twin is the same pattern, so replayed too");
+  const VectorXd xc = s.solve(b);
+  lu_testing::check((xc - xTrue).norm() / xTrue.norm() < 1e-12, "compressed twin: right answer",
+                    (xc - xTrue).norm() / xTrue.norm());
+}
+
+void testPivotThresholdZero() {
+  std::printf("\n-- pivot threshold 0 prefers any nonzero diagonal, never a zero one --\n");
+  Eigen::MatrixXd D(2, 2);
+  D << 0, 1, 1, 0;  // the structural diagonal is zero; the matrix is a permutation
+  SpMat A = D.sparseView();
+  A.makeCompressed();
+  VectorXd b(2);
+  b << 1, 2;
+  for (double residualGate : {1e-6, 0.0}) {
+    Eigen::PointBlockLU<SpMat> s;
+    s.setPivotThreshold(0.0);
+    s.setSolveFailureThreshold(residualGate);
+    s.compute(A);
+    lu_testing::checkTrue(s.info() == Eigen::Success, "threshold 0: factorizes");
+    const VectorXd x = s.solve(b);
+    lu_testing::checkTrue(s.info() == Eigen::Success && x.allFinite(), "threshold 0: finite answer, Success");
+    lu_testing::check((A * x - b).norm() < 1e-14, "threshold 0: right answer", (A * x - b).norm());
+  }
+}
+
+void testSingularAndNonFiniteInput() {
+  std::printf("\n-- singular and non-finite input never passes as Success --\n");
+  auto sparse = [](const Eigen::MatrixXd& D) {
+    SpMat A = D.sparseView();
+    A.makeCompressed();
+    return A;
+  };
+  {
+    Eigen::MatrixXd D = Eigen::MatrixXd::Random(5, 5);
+    D.row(2).setZero();
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(sparse(D));
+    lu_testing::checkTrue(s.info() != Eigen::Success, "a zero row is declined");
+  }
+  {
+    SpMat Z(3, 3);
+    Z.makeCompressed();
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(Z);
+    lu_testing::checkTrue(s.info() != Eigen::Success, "the zero matrix is declined");
+  }
+  {
+    // Exactly dependent columns with a full pattern: elimination produces a
+    // rounding-sized pivot rather than a zero one, so the factorization goes
+    // through and the residual check is what has to catch it.
+    Eigen::MatrixXd D = Eigen::MatrixXd::Random(6, 6);
+    D.col(3) = 2.0 * D.col(1);
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(sparse(D));
+    if (s.info() == Eigen::Success) {
+      const VectorXd x = s.solve(VectorXd::Ones(6));
+      (void)x;
+    }
+    lu_testing::checkTrue(s.info() != Eigen::Success, "dependent columns: flagged by factorize() or by solve()");
+  }
+  for (int which = 0; which < 2; ++which) {
+    Eigen::MatrixXd D = Eigen::MatrixXd::Random(5, 5) + 5.0 * Eigen::MatrixXd::Identity(5, 5);
+    D(1, 3) = which == 0 ? std::numeric_limits<double>::infinity() : std::numeric_limits<double>::quiet_NaN();
+    Eigen::PointBlockLU<SpMat> s;
+    s.compute(sparse(D));
+    lu_testing::checkTrue(s.info() != Eigen::Success && !s.lastErrorMessage().empty(),
+                          which == 0 ? "an inf entry is declined, with a message" : "a nan entry is declined, with a message");
+  }
+}
+
+void testSolveStatusIsPerSolve() {
+  std::printf("\n-- solve() diagnostics describe THIS solve --\n");
+  const SpMat A = lu_testing::upwind2d(6, 6);
+  const VectorXd b = VectorXd::LinSpaced(A.rows(), 0.1, 1.7);
+  Eigen::PointBlockLU<SpMat> s;
+  s.setSolveFailureThreshold(1e-300);
+  s.compute(A);
+  VectorXd x = s.solve(b);
+  lu_testing::checkTrue(s.info() == Eigen::NumericalIssue && !s.lastErrorMessage().empty(),
+                        "an impossible threshold flags the solve");
+  s.setSolveFailureThreshold(1e-6);
+  x = s.solve(b);
+  lu_testing::checkTrue(s.info() == Eigen::Success, "a sane threshold passes the next solve");
+  lu_testing::checkTrue(s.lastErrorMessage().empty(), "and the earlier solve's message is gone");
+  // Several right-hand sides at once, with the error bounds on. The second
+  // column starts with a zero, and the first grid cell couples to nothing but
+  // itself, so that row of the system is 0 = 0: its Oettli-Prager denominator
+  // is exactly zero, and a backward error that scored it as 1 would report a
+  // system solved to 1e-16 as having no correct digit.
+  Eigen::PointBlockLU<SpMat> m;
+  m.setErrorBounds(true);
+  m.compute(A);
+  Eigen::MatrixXd B(A.rows(), 3);
+  for (int j = 0; j < 3; ++j) B.col(j) = VectorXd::LinSpaced(A.rows(), -1.0 + j, 1.0 + 0.3 * j);
+  const Eigen::MatrixXd X = m.solve(B);
+  lu_testing::checkTrue(m.info() == Eigen::Success, "multiple rhs with error bounds: Success");
+  lu_testing::check(m.lastBackwardError() < 1e-14, "a trivially satisfied row does not count as backward error",
+                    m.lastBackwardError());
+  lu_testing::check(m.lastCorrectDigits() >= 14, "and full digits are claimed", double(m.lastCorrectDigits()));
+  double worst = 0.0;
+  for (int j = 0; j < 3; ++j) {
+    const VectorXd xj = m.solve(VectorXd(B.col(j)));
+    worst = (std::max)(worst, (X.col(j) - xj).norm() / xj.norm());
+  }
+  lu_testing::check(worst < 1e-14, "multiple rhs equal the columns solved one by one", worst);
+  const Eigen::MatrixXd Y = m.solve(B.leftCols(2));
+  lu_testing::check((A * Y - B.leftCols(2)).norm() < 1e-12, "a block expression as right-hand side",
+                    (A * Y - B.leftCols(2)).norm());
+}
+
+void testReplayUnderValueDrift() {
+  std::printf("\n-- thirty replays under growing value drift, no residual safety net --\n");
+  // weakDiagonal() pivots off the diagonal nearly everywhere, so as the values
+  // drift the recorded pivot rows are exactly the ones that could stop being
+  // the right choice. The answer's error must stay at eps * kappa whether the
+  // plan is replayed or rejected.
+  const int n = 60;
+  const SpMat A = lu_testing::weakDiagonal(n, 21u);
+  Eigen::PointBlockLU<SpMat> s;
+  s.setSolveFailureThreshold(0.0);
+  s.analyzePattern(A);
+  s.factorize(A);
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<double> uni(-1.0, 1.0);
+  double worst = 0.0;
+  int replays = 0;
+  for (int step = 0; step < 30; ++step) {
+    SpMat B = A;
+    for (int k = 0; k < B.nonZeros(); ++k) B.valuePtr()[k] *= std::exp(0.1 * uni(rng) * step);
+    const VectorXd xTrue = irrationalSolution(n);
+    const Eigen::Index before = s.refactorizations();
+    s.factorize(B);
+    lu_testing::checkTrue(s.info() == Eigen::Success, "drift step " + std::to_string(step) + " factorizes");
+    if (s.refactorizations() > before) ++replays;
+    const VectorXd x = s.solve(VectorXd(B * xTrue));
+    const Eigen::MatrixXd Bd(B);
+    const double kappa = Bd.norm() * Bd.inverse().norm();
+    worst = (std::max)(worst, (x - xTrue).norm() / xTrue.norm() / kappa);
+  }
+  lu_testing::note("replays: " + std::to_string(replays) + " of 30");
+  lu_testing::check(worst < 1e-12, "error / kappa stays at eps level over every step (worst)", worst);
+}
+
 void testTestdata() {
   std::printf("\n-- testdata corpus (skipped when testdata/ is absent) --\n");
   int seen = 0;
@@ -597,6 +899,14 @@ int main() {
   testGrowthFactorTracksPivotThreshold();
   testReplayRefreshesTheResidualCheck();
   testComplexScalars();
+  testDeterminantWithPivoting();
+  testComplexDeterminant();
+  testReplayNeedsTheSamePattern();
+  testUncompressedInput();
+  testPivotThresholdZero();
+  testSingularAndNonFiniteInput();
+  testSolveStatusIsPerSolve();
+  testReplayUnderValueDrift();
   testTestdata();
   return lu_testing::summarize("test_pointblock_lu");
 }

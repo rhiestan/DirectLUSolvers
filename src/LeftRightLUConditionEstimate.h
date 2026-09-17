@@ -253,6 +253,11 @@ typename NumTraits<typename MatrixT::Scalar>::Real componentwiseBackwardError(co
     const Matrix<Scalar, Dynamic, 1> residual = b.col(c) - A * x.col(c);
     for (Index i = 0; i < n; ++i) {
       const RealScalar r = numext::abs(residual[i]);
+      // A row with no residual needs no perturbation, whatever its scale. The
+      // underflow guard below would otherwise score a row that is trivially
+      // satisfied (b_i = 0, every x it touches 0, so denom = 0) as
+      // safe1 / safe1 = 1 -- "no digit correct" for a system solved exactly.
+      if (r == RealScalar(0)) continue;
       const RealScalar term =
           (denom[i] > safe2) ? r / denom[i] : (r + safe1) / (denom[i] + safe1);
       if (term > worst) worst = term;

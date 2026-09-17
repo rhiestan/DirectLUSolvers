@@ -112,7 +112,14 @@ reports how many replays have happened since the last full factorization.
 A replay is **rejected** — and a full factorization redone automatically — when a pivot falls
 below `setMinPivotRatio()` (default 1e-8) of the magnitude it had when the plan was recorded.
 That check is what makes replaying safe as the caller's values drift;
-`setForceFullFactorization(true)` disables replaying altogether.
+`setForceFullFactorization(true)` disables replaying altogether. A `factorize()` whose sparsity
+pattern differs from the recorded one (an entry added, dropped or moved) is not replayed either:
+a replay scatters values into the recorded pattern and would drop an entry outside it without a
+trace, so the pattern is compared — the same O(nnz) comparison the residual check's copy of `A`
+already needs — and a changed one gets a full factorization.
+
+`determinant()` is `determinantSign() · exp(logAbsDeterminant())`; for a complex matrix the
+sign is the unit-modulus phase of the determinant, not ±1.
 
 ## How much of the answer you may believe
 

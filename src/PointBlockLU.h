@@ -223,8 +223,9 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   void analyzePattern(const MatrixType& matrix);
 
   /** Numeric factorization. The first call after analyzePattern() searches for
-   *  the pattern and the pivots; later calls replay them (see refactorizations()
-   *  and forceFullFactorization()). */
+   *  the pattern and the pivots; later calls on the same sparsity pattern replay
+   *  them (see refactorizations() and forceFullFactorization()). A call with a
+   *  different pattern of the same size does a full factorization again. */
   void factorize(const MatrixType& matrix);
 
   void compute(const MatrixType& matrix) {
@@ -273,11 +274,12 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
 
   // --- options --------------------------------------------------------------
 
-  /** Partial-pivoting threshold in (0, 1]. A candidate diagonal entry is kept
+  /** Partial-pivoting threshold in [0, 1]. A candidate diagonal entry is kept
    *  as the pivot when |a_kk| >= threshold * max|a_ik| over the column, so 1.0
    *  is strict partial pivoting (most stable, most fill) and a small value
    *  prefers the diagonal (less fill, and a pivot sequence that survives
-   *  refactorization better). Default 1.0. */
+   *  refactorization better); 0 takes any nonzero diagonal. A zero diagonal is
+   *  never taken. Default 1.0. */
   void setPivotThreshold(const RealScalar& threshold) {
     m_pivotThreshold = numext::mini(RealScalar(1), numext::maxi(RealScalar(0), threshold));
   }
@@ -304,7 +306,8 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   RealScalar minPivotRatio() const { return m_minPivotRatio; }
 
   /** log|det(A)| as a sum of logs (stays finite where determinant() overflows),
-   *  paired with determinantSign(). */
+   *  paired with determinantSign(): +-1 for a real matrix, the unit-modulus
+   *  phase of the determinant for a complex one. */
   Scalar logAbsDeterminant() const;
   Scalar determinantSign() const;
   Scalar determinant() const;
@@ -441,7 +444,7 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   }
 
   void computeScaling(const MatrixType& matrix);
-  void storeInput(const MatrixType& matrix);
+  bool storeInput(const MatrixType& matrix);  // true when the pattern is the one already held
   bool fullFactorize(const MatrixType& matrix);
   bool replayFactorize(const MatrixType& matrix);
   void replayColumn(const MatrixType& matrix, StorageIndex k, Scalar* work, bool& reject);
@@ -595,25 +598,48 @@ void PointBlockLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& ma
 // one already held -- which in a Newton loop is every call after the first. The
 // index arrays are compared rather than assumed identical: the values would
 // otherwise be married to the wrong pattern, and a residual computed against the
-// wrong A is worse than no residual at all.
+// wrong A is worse than no residual at all. The answer -- was this the pattern
+// already held? -- is also what decides whether the recorded plan may be
+// replayed at all: a replay scatters the new values into the RECORDED pattern
+// and never looks at the input's, so an entry outside it would be dropped
+// without a trace.
 template <typename MatrixType, typename OrderingType>
-void PointBlockLU<MatrixType, OrderingType>::storeInput(const MatrixType& matrix) {
-  const bool sameShape = m_inputHeld && matrix.isCompressed() && m_originalMatrix.isCompressed() &&
-                         m_originalMatrix.rows() == matrix.rows() &&
-                         m_originalMatrix.cols() == matrix.cols() &&
-                         m_originalMatrix.nonZeros() == matrix.nonZeros();
-  if (sameShape &&
-      std::equal(matrix.outerIndexPtr(), matrix.outerIndexPtr() + matrix.outerSize() + 1,
-                 m_originalMatrix.outerIndexPtr()) &&
-      std::equal(matrix.innerIndexPtr(), matrix.innerIndexPtr() + matrix.nonZeros(),
-                 m_originalMatrix.innerIndexPtr())) {
-    std::copy(matrix.valuePtr(), matrix.valuePtr() + matrix.nonZeros(),
-              m_originalMatrix.valuePtr());
-    return;
+bool PointBlockLU<MatrixType, OrderingType>::storeInput(const MatrixType& matrix) {
+  bool same = m_inputHeld && m_originalMatrix.isCompressed() &&
+              m_originalMatrix.rows() == matrix.rows() && m_originalMatrix.cols() == matrix.cols() &&
+              m_originalMatrix.nonZeros() == matrix.nonZeros();
+  if (same && matrix.isCompressed()) {
+    same = std::equal(matrix.outerIndexPtr(), matrix.outerIndexPtr() + matrix.outerSize() + 1,
+                      m_originalMatrix.outerIndexPtr()) &&
+           std::equal(matrix.innerIndexPtr(), matrix.innerIndexPtr() + matrix.nonZeros(),
+                      m_originalMatrix.innerIndexPtr());
+    if (same) {
+      std::copy(matrix.valuePtr(), matrix.valuePtr() + matrix.nonZeros(), m_originalMatrix.valuePtr());
+      return true;
+    }
+  } else if (same) {
+    // Uncompressed input: the same comparison, column by column.
+    for (Index j = 0; same && j < matrix.outerSize(); ++j) {
+      typename MatrixType::InnerIterator it(matrix, j);
+      typename MatrixType::InnerIterator held(m_originalMatrix, j);
+      for (; it && held; ++it, ++held)
+        if (it.index() != held.index()) {
+          same = false;
+          break;
+        }
+      if (it || held) same = false;
+    }
+    if (same) {
+      Scalar* dst = m_originalMatrix.valuePtr();
+      for (Index j = 0; j < matrix.outerSize(); ++j)
+        for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) *dst++ = it.value();
+      return true;
+    }
   }
   m_originalMatrix = matrix;
   m_originalMatrix.makeCompressed();
   m_inputHeld = true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +771,10 @@ void PointBlockLU<MatrixType, OrderingType>::factorize(const MatrixType& matrix)
     return;
   }
 
-  storeInput(matrix);
+  // A plan describes one pattern. A different one (an entry added, dropped or
+  // moved, whatever the caller promised) gets a full factorization, not a
+  // replay that would silently ignore the difference.
+  if (!storeInput(matrix)) m_planRecorded = false;
   computeScaling(matrix);
 
   // Replay the recorded plan when there is one. A rejected replay (a pivot that
@@ -842,9 +871,14 @@ bool PointBlockLU<MatrixType, OrderingType>::fullFactorize(const MatrixType& mat
     // Prefer the structural diagonal when it is within the threshold of the
     // best candidate: it keeps the pivot sequence closer to the caller's own
     // numbering, which is what makes a recorded plan survive value changes.
-    if (m_pinv[static_cast<std::size_t>(col)] < 0 &&
-        numext::abs(m_work[static_cast<std::size_t>(col)]) >= best * m_pivotThreshold)
-      ipiv = col;
+    // Never a zero one, whatever the threshold: with threshold 0 the test
+    // below would otherwise accept a diagonal that is absent or cancelled and
+    // divide the column by it.
+    {
+      const RealScalar diag = numext::abs(m_work[static_cast<std::size_t>(col)]);
+      if (m_pinv[static_cast<std::size_t>(col)] < 0 && diag > RealScalar(0) && diag >= best * m_pivotThreshold)
+        ipiv = col;
+    }
 
     const Scalar pivot = m_work[static_cast<std::size_t>(ipiv)];
     m_uRow.push_back(k);  // U's diagonal goes last in the column
@@ -1111,6 +1145,7 @@ void PointBlockLU<MatrixType, OrderingType>::recordSolveStatus(const RhsT& b,
       finite && (!(m_solveFailureThreshold > RealScalar(0)) || rel <= m_solveFailureThreshold);
   if (usable) {
     m_info = Success;
+    m_lastError.clear();  // a message from an earlier, failed solve would describe this one
     return;
   }
   m_info = NumericalIssue;
@@ -1262,12 +1297,15 @@ typename MatrixType::Scalar PointBlockLU<MatrixType, OrderingType>::logAbsDeterm
 template <typename MatrixType, typename OrderingType>
 typename MatrixType::Scalar PointBlockLU<MatrixType, OrderingType>::determinantSign() const {
   eigen_assert(m_factorized && "PointBlockLU: determinantSign() before factorize()");
-  int sign = point_block::permutationParity(m_pinv) * point_block::permutationParity(m_colOf);
+  // The permutations contribute +-1; each pivot contributes its unit phase
+  // d / |d|, which for a real scalar is its sign and for a complex one the
+  // phase the determinant carries (|det| alone would drop it).
+  Scalar sign(point_block::permutationParity(m_pinv) * point_block::permutationParity(m_colOf));
   for (StorageIndex k = 0; k < m_size; ++k) {
     const Scalar d = m_uVal[static_cast<std::size_t>(m_uPtr[static_cast<std::size_t>(k) + 1] - 1)];
-    if (numext::real(d) < RealScalar(0)) sign = -sign;
+    sign *= d / numext::abs(d);
   }
-  return Scalar(sign);
+  return sign;
 }
 
 template <typename MatrixType, typename OrderingType>
