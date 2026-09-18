@@ -130,6 +130,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -206,12 +208,64 @@ namespace detail {
 
 // 2^e with e chosen so that value * 2^e lies in [0.5, 1): the power of two
 // closest to 1/value from below. Zero and non-finite values scale by 1.
+// Equilibration calls this once per row and twice per column, and frexp/ldexp
+// are library calls, so IEEE doubles whose answer is a normal number read the
+// exponent straight from the bits; frexp/ldexp handle the rest.
 template <typename RealScalar>
 RealScalar inversePowerOfTwo(RealScalar value) {
   if (!(value > RealScalar(0)) || !(numext::isfinite)(value)) return RealScalar(1);
+  if constexpr (std::is_same<RealScalar, double>::value && std::numeric_limits<double>::is_iec559) {
+    std::uint64_t bits;
+    std::memcpy(&bits, &value, sizeof bits);
+    const int biased = int((bits >> 52) & 0x7ff);  // value in [2^(b-1023), 2^(b-1022))
+    if (biased >= 1 && biased <= 2044) {
+      bits = std::uint64_t(2045 - biased) << 52;  // 2^(1022-b), a normal double
+      double result;
+      std::memcpy(&result, &bits, sizeof result);
+      return result;
+    }
+  }
   int e = 0;
   std::frexp(value, &e);  // value = f * 2^e, f in [0.5, 1)
   return std::ldexp(RealScalar(1), -e);
+}
+
+// Orthonormalizes the columns of a tall, thin X in place: classical Gram-Schmidt
+// with one reorthogonalization ("twice is enough"), which touches X a few times
+// and allocates nothing beyond one small coefficient vector. Numerically
+// dependent columns, and columns whose norm overflows, go through Householder QR
+// instead. Returns false, with X untouched, when X has non-finite entries.
+template <typename DenseMatrix>
+bool orthonormalizeColumns(DenseMatrix& X) {
+  using Scalar = typename DenseMatrix::Scalar;
+  using RealScalar = typename NumTraits<Scalar>::Real;
+  const Index r = X.rows(), p = X.cols();
+  Matrix<Scalar, Dynamic, 1> c(p);
+  bool dependent = false;
+  for (Index j = 0; j < p && !dependent; ++j) {
+    const RealScalar n0 = X.col(j).norm();
+    if (!(numext::isfinite)(n0)) {
+      if (!X.allFinite()) return false;
+      dependent = true;  // finite entries whose squares overflow
+      break;
+    }
+    for (int pass = 0; pass < 2 && j > 0; ++pass) {
+      c.head(j).noalias() = X.leftCols(j).adjoint() * X.col(j);
+      X.col(j).noalias() -= X.leftCols(j) * c.head(j);
+    }
+    const RealScalar n1 = X.col(j).norm();
+    if (!(n1 > RealScalar(r) * NumTraits<RealScalar>::epsilon() * n0)) {
+      dependent = true;
+      break;
+    }
+    X.col(j) /= n1;
+  }
+  if (dependent) {
+    // Columns already processed span the same space as the originals, so the
+    // Householder basis of the partly orthonormalized X is a valid answer.
+    X = HouseholderQR<DenseMatrix>(X).householderQ() * DenseMatrix::Identity(r, p);
+  }
+  return true;
 }
 
 }  // namespace detail
@@ -631,7 +685,8 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   void orderColumns(const MatrixType& A, const std::vector<char>& isDeferred, multifrontal_qr::Ordering ordering,
                     std::vector<StorageIndex>& ordered) const;
   double atAPatternSize(const MatrixType& A) const;
-  void computeScaling(const MatrixType& A, multifrontal_qr::Scaling mode);
+  void computeScaling(const MatrixType& A, multifrontal_qr::Scaling mode, RealScalar& maxColNorm,
+                      RealScalar& squaredNormSum);
   void factorizeScaled(const MatrixType& matrix, multifrontal_qr::Scaling mode);
   void factorOnce();
   void processFront(Index f, bool intraParallel, RealScalar& dropped, bool& nonFinite, Index& frontEntries);
@@ -1353,7 +1408,10 @@ void MultifrontalQR<MatrixType, Executor>::releaseNumeric() {
 }
 
 template <typename MatrixType, typename Executor>
-void MultifrontalQR<MatrixType, Executor>::computeScaling(const MatrixType& A, multifrontal_qr::Scaling mode) {
+void MultifrontalQR<MatrixType, Executor>::computeScaling(const MatrixType& A, multifrontal_qr::Scaling mode,
+                                                          RealScalar& maxColNorm, RealScalar& squaredNormSum) {
+  // Also returns the largest column 2-norm of the scaled matrix and the sum of
+  // the squared column norms, taken while the scaled values are written.
   using multifrontal_qr::Scaling;
   using multifrontal_qr::detail::inversePowerOfTwo;
   const Index m = A.rows(), n = A.cols();
@@ -1380,11 +1438,37 @@ void MultifrontalQR<MatrixType, Executor>::computeScaling(const MatrixType& A, m
       m_colScale[c] = pre * inversePowerOfTwo(numext::sqrt(sq));
     }
   }
-  m_scaled = A;
-  m_scaled.makeCompressed();
-  for (Index c = 0; c < n; ++c)
-    for (typename MatrixType::InnerIterator it(m_scaled, c); it; ++it)
-      it.valueRef() *= (m_rowScale[it.row()] * m_colScale[c]);
+  // A compressed input contributes only its structure; the values are written
+  // scaled in the same pass that takes the column norms.
+  const Scalar* in;
+  if (A.isCompressed()) {
+    const Index nnz = A.nonZeros();
+    m_scaled.resize(m, n);
+    m_scaled.resizeNonZeros(nnz);
+    std::copy(A.outerIndexPtr(), A.outerIndexPtr() + n + 1, m_scaled.outerIndexPtr());
+    std::copy(A.innerIndexPtr(), A.innerIndexPtr() + nnz, m_scaled.innerIndexPtr());
+    in = A.valuePtr();
+  } else {
+    m_scaled = A;
+    m_scaled.makeCompressed();
+    in = m_scaled.valuePtr();
+  }
+  const StorageIndex* outer = m_scaled.outerIndexPtr();
+  const StorageIndex* inner = m_scaled.innerIndexPtr();
+  Scalar* out = m_scaled.valuePtr();
+  maxColNorm = RealScalar(0);
+  squaredNormSum = RealScalar(0);
+  for (Index c = 0; c < n; ++c) {
+    const RealScalar cs = m_colScale[c];
+    RealScalar sq(0);
+    for (Index p = outer[c]; p < outer[c + 1]; ++p) {
+      out[p] = in[p] * (m_rowScale[inner[p]] * cs);
+      sq += numext::abs2(out[p]);
+    }
+    const RealScalar cn = numext::sqrt(sq);
+    maxColNorm = (std::max)(maxColNorm, cn);
+    squaredNormSum += cn * cn;
+  }
 }
 
 template <typename MatrixType, typename Executor>
@@ -1426,26 +1510,26 @@ void MultifrontalQR<MatrixType, Executor>::factorizeScaled(const MatrixType& mat
   releaseNumeric();
 
   m_scalingUsed = mode;
-  computeScaling(matrix, mode);
+  RealScalar maxColNorm(0);
+  computeScaling(matrix, mode, maxColNorm, m_scaledFrobenius);
   if (m_scaled.nonZeros() != analyzedNonZeros()) {
     m_info = InvalidInput;
     m_lastError = "MultifrontalQR: factorize() was given a different sparsity pattern than analyzePattern()";
     return;
   }
-  RealScalar maxColNorm(0);
-  m_scaledFrobenius = RealScalar(0);
-  for (Index c = 0; c < m_cols; ++c) {
-    // Summed by hand: a sparse reduction asserts on a matrix with no rows.
-    RealScalar sq(0);
-    for (typename MatrixType::InnerIterator it(m_scaled, c); it; ++it) sq += numext::abs2(it.value());
-    const RealScalar cn = numext::sqrt(sq);
-    if (!(numext::isfinite)(cn)) {
-      m_info = NumericalIssue;
-      m_lastError = "MultifrontalQR: the matrix has non-finite entries";
-      return;
+  // A non-finite column norm makes the sum non-finite, so the columns are only
+  // examined one by one when the sum is -- which it also is when the squares of
+  // finite norms overflow.
+  if (!(numext::isfinite)(m_scaledFrobenius)) {
+    for (Index c = 0; c < m_cols; ++c) {
+      RealScalar sq(0);
+      for (typename MatrixType::InnerIterator it(m_scaled, c); it; ++it) sq += numext::abs2(it.value());
+      if (!(numext::isfinite)(numext::sqrt(sq))) {
+        m_info = NumericalIssue;
+        m_lastError = "MultifrontalQR: the matrix has non-finite entries";
+        return;
+      }
     }
-    maxColNorm = (std::max)(maxColNorm, cn);
-    m_scaledFrobenius += cn * cn;
   }
   m_scaledFrobenius = numext::sqrt(m_scaledFrobenius);
   m_absTol = rankTolerance() * (maxColNorm > RealScalar(0) ? maxColNorm : RealScalar(1));
@@ -2400,8 +2484,9 @@ void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::ve
     X.resize(r, p);
     for (Index j = 0; j < p; ++j)
       for (Index i = 0; i < r; ++i) X(i, j) = Scalar(RealScalar(gauss(rng)));
-    X = HouseholderQR<DenseMatrix>(X).householderQ() * DenseMatrix::Identity(r, p);
+    multifrontal_qr::detail::orthonormalizeColumns(X);
     Vector g, h, z, u, v;
+    DenseMatrix Y(r, p), rotated(r, p);
     RealVector previous;
     for (int it = 0; it < 8; ++it) {
       for (Index j = 0; j < p; ++j) {
@@ -2412,13 +2497,11 @@ void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::ve
         internalToLive(z, v);
         X.col(j) = v;
       }
-      if (!X.allFinite()) {
+      if (!multifrontal_qr::detail::orthonormalizeColumns(X)) {
         // (R11^H R11)^-1 overflowed: R11 is singular to working precision.
         m_sigma = RealVector::Zero(1);
         break;
       }
-      X = HouseholderQR<DenseMatrix>(X).householderQ() * DenseMatrix::Identity(r, p);
-      DenseMatrix Y(r, p);
       for (Index j = 0; j < p; ++j) {
         liveToInternal(X.col(j), z);
         upperMultiply(z, u);
@@ -2426,7 +2509,8 @@ void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::ve
       }
       JacobiSVD<DenseMatrix, ComputeThinV> svd(Y);
       RealVector sv = svd.singularValues().reverse();
-      X = X * svd.matrixV().rowwise().reverse();
+      rotated.noalias() = X * svd.matrixV().rowwise().reverse();
+      X.swap(rotated);
       m_sigma = sv;
       if (previous.size() == sv.size() && numext::abs(sv[0] - previous[0]) <= RealScalar(0.1) * sv[0]) break;
       previous = sv;

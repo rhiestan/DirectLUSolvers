@@ -860,6 +860,32 @@ void testNonFiniteInput() {
   A.valuePtr()[5] = std::numeric_limits<double>::quiet_NaN();
   qr.compute(A);
   checkTrue(qr.info() != Eigen::Success, "nan entry: not a success");
+  // Every column norm finite, but their squares overflow when summed: not a
+  // non-finite matrix.
+  Eigen::SparseMatrix<double> B(30, 30);
+  for (int i = 0; i < 30; ++i) B.insert(i, i) = 1e154;
+  B.makeCompressed();
+  qr.setScaling(Eigen::multifrontal_qr::Scaling::None);
+  qr.compute(B);
+  checkTrue(qr.lastErrorMessage().find("non-finite") == std::string::npos,
+            "huge finite entries: not reported as non-finite");
+}
+
+// An uncompressed input factors exactly as its compressed copy does.
+void testUncompressedInput() {
+  auto A = randomSparse<double>(80, 60, 0.06, 83);
+  Eigen::SparseMatrix<double> U = A;
+  U.uncompress();
+  U.coeffRef(0, 0) += 0.0;  // keeps the pattern, leaves the storage uncompressed
+  checkTrue(!U.isCompressed(), "uncompressed input: storage really uncompressed");
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qa, qu;
+  qa.setEngine(g_engine);
+  qu.setEngine(g_engine);
+  qa.compute(A);
+  qu.compute(U);
+  const Eigen::VectorXd b = A * Eigen::VectorXd::LinSpaced(60, 1.0, 2.0);
+  checkTrue(qu.info() == Eigen::Success && qu.rank() == qa.rank() && qu.solve(b) == qa.solve(b),
+            "uncompressed input: same rank and bit-identical solution");
 }
 
 // One solver object reused across shapes.
@@ -1093,6 +1119,7 @@ int main() {
     testRefactorizeAfterDeferral();
     testExplicitZerosAndUncompressed();
     testNonFiniteInput();
+    testUncompressedInput();
     testReuseAcrossShapes();
     testEmptyShapes();
     testParallelIdenticalWithDeferral();
