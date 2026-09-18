@@ -805,7 +805,7 @@ void testBlockSizes() {
 
 // The Neumann Laplacian: one exact null vector spread over every column.
 void testNeumannLaplacian() {
-  constexpr int g = 15;
+  static constexpr int g = 15;
   const int n = g * g;
   std::vector<Eigen::Triplet<double>> t;
   auto id = [](int x, int y) { return y * g + x; };
