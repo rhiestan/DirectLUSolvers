@@ -320,11 +320,23 @@ untouched — confirmed at 15 repetitions, where the noise is well below the eff
 
 | matrix | blocks | analyze off→on | factor off→on | total |
 |---|---:|---|---|---|
+| `setfos_2` | 7 | 34.46 → **54.84** ms | 188.5 → 180.3 ms | 0.95x |
 | `Bindel/ted_B_unscaled` | 4245 | 10.64 → **13.49** ms | 3.82 → 3.78 ms | 0.84x |
 | `tomography` | 37 | 3.76 → **4.46** ms | 3.55 → 3.67 ms | 0.90x |
 | `CPM/cz1268` | 2 | 1.97 → **2.29** ms | 1.02 → 1.01 ms | 0.91x |
 
-Worst confirmed case is ~27% of the symbolic phase and ~16% of a cold factor+solve — and
+**`setfos_2` is the shape that pays most, and it is worth understanding.** Its BTF finds six
+singleton blocks and one block holding the other 3042 columns — so it is reducible by a hair,
+buys 0.5% of fill, and still leaves `analyzePattern` 59% slower. The reason is that any
+`nblocks > 1` takes the per-block path, which *re-extracts each block as its own matrix* before
+ordering it: on a near-irreducible matrix that means rebuilding essentially the whole matrix
+(18.5 ms of the 21 ms BTF adds here; the SCC sweep itself is 1.0 ms and the ordering is
+unchanged at ~5.4 ms). The "one `O(n + nnz)` sweep" above is what a truly irreducible matrix
+pays — one block, no extraction. A matrix that splits into one giant block plus a few singletons
+pays the sweep *and* a full copy.
+
+Worst confirmed cases are ~59% of the symbolic phase (`setfos_2`) and ~16% of a cold
+factor+solve (`ted_B_unscaled`) — and
 `analyzePattern` is exactly the phase a refactorization workflow skips, so in a Newton loop with
 a fixed pattern it amortizes to nothing. Three repetitions is too few to trust the per-group
 *extremes* (a single row's min swung 0.68x-1.91x between runs at `--reps 3`); the medians are
