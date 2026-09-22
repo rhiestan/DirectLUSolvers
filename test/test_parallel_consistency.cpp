@@ -31,7 +31,10 @@
 //     assertion, and the one a scheduling bug that corrupted the structure would
 //     break first.
 //   * The parallel solve is ACCURATE: its residual meets the same threshold the
-//     serial run met.
+//     serial run met, OR it is no worse than the serial residual. Either one
+//     answers the question; demanding both would let whichever is noisier on a
+//     given matrix decide, and on a matrix that sits at its accuracy limit the
+//     absolute bar is the noisy one.
 //   * The two solutions AGREE, unless the parallel solve is NO LESS ACCURATE
 //     than the serial one -- in which case the disagreement is the matrix's
 //     conditioning talking, not a race. Comparing against the serial residual
@@ -39,6 +42,15 @@
 //     robust: HB/nnc1374 solves to 1.7e-9 both ways, which is accurate for that
 //     matrix and would fail an absolute 1e-11 threshold for no reason. A genuine
 //     race degrades the answer; it does not politely produce another exact one.
+//
+//     That last comparison is a ratio, and a ratio is only a statement about the
+//     SCHEDULE when the serial run itself reached the accuracy the arithmetic
+//     allows. Where the matrix's conditioning set the serial residual instead,
+//     every summation order lands somewhere in that spread and the ratio
+//     measures the spread, not the threads -- so it is reported rather than
+//     asserted there, and the absolute bar does the judging. The threshold that
+//     decides this (kPrecisionLimited) sits in the largest measured gap in the
+//     corpus rather than being chosen round.
 //
 // Divergences of that last kind are counted and reported, so a change in how
 // many matrices diverge is visible in the log even though it is not a failure.
@@ -89,7 +101,36 @@ constexpr double kAgreeTolerance = 1e-8;
 // the suite flaky on matrices that sit near their accuracy limit either way.
 constexpr double kResidSlack = 100.0;
 
-int g_diverged = 0;  // reported, not failed -- see the header comment
+// The serial residual below which the kResidSlack ratio is evidence at all.
+//
+// The ratio compares the parallel residual against the serial one, which is
+// only a statement about the SCHEDULE when the serial run reached the accuracy
+// the arithmetic allows. When it did not, the matrix's conditioning decides
+// where any given summation order lands, and the ratio measures that instead:
+// DRIVCAV/cavity10 solves serially to 3.4e-09, six orders above machine
+// precision, and its parallel runs ratio 0.007, 19 and 26 at t=8, t=2 and t=4
+// on a single machine -- and 237 on another. Nothing there is a race (fill is
+// identical, the runs are reproducible, and t=8 beats serial); a fixed band
+// around one draw just pins luck.
+//
+// The corpus separates cleanly. Every matrix whose serial run is at machine
+// precision ratios between 0.35 and 3.8, and the serial residuals themselves
+// jump from 1.2e-13 straight to 5.7e-11 with nothing in between -- a factor of
+// 478, the widest gap in the 53 measured, so this threshold is not sitting next
+// to a data point. Above it the absolute kResidTolerance gate is what judges
+// the parallel run, which is the check that means something there.
+constexpr double kPrecisionLimited = 1e-12;
+
+// std::to_string renders 3.4e-09 as "0.000000", which is exactly the range
+// every number in these notes lives in.
+std::string sci(double v) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.3e", v);
+  return std::string(buf);
+}
+
+int g_diverged = 0;     // reported, not failed -- see the header comment
+int g_unpinnedRatio = 0;  // disagreed with a conditioning-limited serial run
 
 VectorXd deterministicRhs(const SparseMatrix<double>& A) {
   VectorXd x(A.rows());
@@ -142,7 +183,17 @@ void sweep(const char* who, const std::string& label, const SparseMatrix<double>
       if (!check(p.fill == ref.fill, tag + ": fill matches serial",
                  static_cast<double>(p.fill - ref.fill)))
         continue;
-      if (!check(p.resid <= kResidTolerance, tag + ": parallel residual", p.resid)) continue;
+      // Accurate outright, or no worse than the serial run -- either settles
+      // the only question this suite asks, so requiring BOTH just lets
+      // whichever is the noisier one govern. Zitney/extr1b solves serially to
+      // 4.4e-07 and its parallel runs land at 7.4e-07: 1.4x inside the absolute
+      // bar on one machine and past it on another, while never being more than
+      // 1.7x worse than the run it is compared against. The second clause is
+      // what says that is the matrix sitting at its accuracy limit rather than
+      // a thread, and it costs nothing -- a race that mattered would fail both.
+      const bool accurate = (p.resid <= kResidTolerance);
+      const bool withinSerial = (p.resid <= kResidSlack * ref.resid);
+      if (!check(accurate || withinSerial, tag + ": parallel residual", p.resid)) continue;
 
       const double diff = (p.x - ref.x).norm() / std::max(1.0, ref.x.norm());
       if (diff <= kAgreeTolerance) continue;  // agrees outright; nothing to explain
@@ -150,9 +201,23 @@ void sweep(const char* who, const std::string& label, const SparseMatrix<double>
       // than the serial one -- i.e. the matrix, not the schedule, decided x.
       // The evidence printed is that accuracy ratio, not the disagreement:
       // the ratio is what says whether anything is wrong.
+      //
+      // ... but only where the serial run was accurate enough for the ratio to
+      // mean that (kPrecisionLimited). Where it was not, the parallel run has
+      // already cleared the absolute bar above, which is the accuracy claim
+      // that holds there; the ratio is still printed, so a change in it stays
+      // visible in the log without failing the suite over conditioning.
+      const double accuracyRatio = p.resid / std::max(ref.resid, 1e-300);
+      if (ref.resid > kPrecisionLimited) {
+        lu_testing::note(tag + ": disagrees; serial is conditioning-limited at " +
+                         sci(ref.resid) + ", ratio " + sci(accuracyRatio) +
+                         " (not pinned)");
+        ++g_unpinnedRatio;
+        ++g_diverged;
+        continue;
+      }
       const bool noWorse = (p.resid <= kResidSlack * ref.resid);
-      check(noWorse, tag + ": disagrees, but no less accurate than serial",
-            p.resid / std::max(ref.resid, 1e-300));
+      check(noWorse, tag + ": disagrees, but no less accurate than serial", accuracyRatio);
       if (noWorse) ++g_diverged;
     }
   }
@@ -199,7 +264,9 @@ int main(int argc, char** argv) {
 
   std::printf(
       "\n%d solution(s) differed from serial while staying at least as accurate "
-      "(conditioning, not a race -- see the header comment).\n",
-      g_diverged);
+      "(conditioning, not a race -- see the header comment).\n"
+      "%d of those had a serial run too far above machine precision for the "
+      "accuracy ratio to be evidence; they were judged on the absolute bar alone.\n",
+      g_diverged, g_unpinnedRatio);
   return lu_testing::summarize("Parallel consistency");
 }

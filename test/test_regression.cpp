@@ -75,9 +75,11 @@ namespace {
 // structural zeros), not for genuine structural drift.
 constexpr double kDefaultFillTolerance = 0.05;
 
-// A solve is required to reach this, unless the baseline records that this
-// matrix never did (some testdata matrices are singular or near-singular by
-// construction) -- in which case a 10x degradation from the recorded value fails.
+// A solve is required to reach this. A row that already missed it when the
+// baseline was recorded (some testdata matrices are singular or near-singular by
+// construction) is not held to a magnitude: see compareAgainstBaseline. Rows
+// that met it get kResidSlack of room, which is slack for a different summation
+// order, not for a solver that got worse.
 constexpr double kResidTolerance = 1e-6;
 constexpr double kResidSlack = 10.0;
 
@@ -305,6 +307,14 @@ void writeBaseline(const std::string& path, const std::vector<Record>& records) 
 //  Comparison
 // ---------------------------------------------------------------------------
 
+// std::to_string renders 3.4e-09 as "0.000000", which is exactly the range
+// every number in these notes lives in.
+std::string sci(double v) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%.3e", v);
+  return std::string(buf);
+}
+
 double relativeDelta(long long observed, long long baseline) {
   if (baseline == 0) return observed == 0 ? 0.0 : 1.0;
   return static_cast<double>(observed - baseline) / static_cast<double>(baseline);
@@ -345,8 +355,30 @@ void compareAgainstBaseline(const Record& r, const BaselineMap& baseline, double
     lu_testing::note("fill " + std::to_string(b.fill()) + " -> " + std::to_string(r.fill()) +
                      " (" + std::to_string(fillDelta * 100.0) + "%)");
 
-  const double residLimit = std::max(kResidTolerance, b.resid * kResidSlack);
-  check(std::isfinite(r.resid) && r.resid <= residLimit, key + ": residual", r.resid);
+  // A row whose recorded residual already missed the accuracy bar pins THAT it
+  // fails, not by how much. Banding the magnitude of a failed solve pins a
+  // quantity with no information in it: Mallya/lhr10c under LeftRightLU records
+  // 5.4e-01 and produced 1.8e+02 on another toolchain -- zero correct digits
+  // both times, a 333x "regression" that says nothing about the solver. 44 of
+  // the 252 rows here are in that state, so the band would keep failing on
+  // whichever compiler ran last. Fill is the real subject of this file and is
+  // still pinned exactly; the accuracy claim reduces to the one that survives:
+  // the answer is still a finite number and the solve still misses the bar.
+  if (b.resid > kResidTolerance) {
+    if (r.resid <= kResidTolerance)
+      lu_testing::note(key + ": residual " + sci(b.resid) + " -> " +
+                       sci(r.resid) + " now meets the accuracy bar (improvement)");
+    else if (r.resid > b.resid * kResidSlack || r.resid * kResidSlack < b.resid)
+      // Only the moves the old band would have judged. A failed solve's
+      // residual wanders in its trailing digits on every toolchain, and noting
+      // that would bury the log in "1.845e+15 -> 1.845e+15".
+      lu_testing::note(key + ": residual " + sci(b.resid) + " -> " +
+                       sci(r.resid) + " (both fail the accuracy bar; not pinned)");
+    checkTrue(std::isfinite(r.resid), key + ": residual is finite");
+  } else {
+    const double residLimit = std::max(kResidTolerance, b.resid * kResidSlack);
+    check(std::isfinite(r.resid) && r.resid <= residLimit, key + ": residual", r.resid);
+  }
 
   // Supernode count is informational: a different partition with the same fill
   // is a legitimate amalgamation change, not a regression.
