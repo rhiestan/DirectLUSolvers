@@ -1,4 +1,5 @@
-// MC64 maximum-product matching: optimality, duals, and integration.
+// MC64 maximum-product matching: optimality, duals, integration -- and the
+// tie order of the cheaper transversal that shares its call sites.
 //
 //   ctest --test-dir build -R test_mc64 --output-on-failure
 //
@@ -26,6 +27,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "LeftRightLU.h"
@@ -246,6 +248,103 @@ void testStructurallySingular() {
   checkTrue(valid, "structurally singular matrix still yields a valid permutation");
 }
 
+// The transversal must order tied magnitudes by row index, not by whatever
+// std::sort leaves in front.
+//
+// WHY THIS IS A CORRECTNESS TEST AND NOT A STYLE ONE
+//
+// maximumWeightMatching ranks each column's candidate rows by |value| and feeds
+// that list to the greedy seed and the augmenting-path search. std::sort is not
+// stable, so ranking on magnitude ALONE leaves rows of equal |value| in an order
+// that is the standard library's choice: libstdc++ and the MSVC STL disagree,
+// and the disagreement is not academic -- ties are the common case (HB/mahindas
+// has them in 564 of 1258 columns, 443 at the column maximum, i.e. exactly where
+// the greedy seed looks). A different tie order is a different, equally heavy
+// matching, hence a different row permutation, hence a different pattern for the
+// fill-reducing ordering to work on: fill, supernode count and pivoting all
+// move, by up to 87% of fill across the pinned corpus. It made the fill
+// baselines pass on Windows and fail on Linux.
+//
+// THE ORACLE
+//
+// Nothing here reimplements the matching. Each matrix is paired with a copy in
+// which every tied magnitude is nudged by a relative 1e-9, downwards with
+// increasing row index -- far below the gap between distinct magnitudes, so the
+// ranking is otherwise untouched, and enough to leave the copy with no ties at
+// all. A tie-free ranking is the same under every comparator and every standard
+// library, and it is by construction the order the intended rule produces. So
+// the two matrices must match identically, and they do so exactly when ties are
+// broken by ascending row index. Perturb upwards instead and the expected
+// answer changes, which is the point: with ties present there is no single
+// answer unless the comparator names one.
+void testTiedMagnitudesOrderByRowIndex() {
+  // Every column gets 48 candidate rows. That is deliberate: a standard library
+  // sorts a short range by insertion, which happens to be stable, so a column
+  // with few nonzeros cannot tell the two comparators apart. The quicksort that
+  // does reorder equal elements starts above 32 entries in the MSVC STL and
+  // above 16 in libstdc++, so 48 is past both.
+  const int n = 192;
+  const int perColumn = 48;
+  const int stride = 5;
+  const double kNudge = 1e-9;
+
+  // Deterministic, library-independent magnitudes drawn from a handful of
+  // distinct values, so tie groups are large.
+  auto magnitude = [](int j, int k) {
+    unsigned h = static_cast<unsigned>(j) * 2654435761u + static_cast<unsigned>(k) * 40503u;
+    h = h * 1664525u + 1013904223u;
+    return 1.0 + static_cast<double>((h >> 16) % 3u);
+  };
+
+  // `tiedMaximum` puts the largest magnitude on a three-row tie group in every
+  // column: the one tie that decides what the greedy seed reaches for first, and
+  // so what ends up on the diagonal.
+  auto build = [&](bool tiedMaximum, bool breakTies) {
+    SpMat A(n, n);
+    std::vector<Eigen::Triplet<double>> t;
+    for (int j = 0; j < n; ++j)
+      for (int k = 0; k < perColumn; ++k) {
+        const int row = (j + stride * k) % n;
+        const bool atMaximum = tiedMaximum && (k == 0 || k == 13 || k == 29);
+        double v = atMaximum ? 10.0 : magnitude(j, k);
+        if (breakTies) v *= 1.0 - kNudge * static_cast<double>(row) / static_cast<double>(n);
+        t.emplace_back(row, j, v);
+      }
+    A.setFromTriplets(t.begin(), t.end());
+    A.makeCompressed();
+    return A;
+  };
+
+  // Ties in the first matrix, none in the second: the premise of the comparison.
+  auto tiedPairs = [](const SpMat& A) {
+    long long ties = 0;
+    for (int j = 0; j < A.cols(); ++j) {
+      std::vector<double> m;
+      for (SpMat::InnerIterator it(A, j); it; ++it) m.push_back(std::abs(it.value()));
+      std::sort(m.begin(), m.end());
+      for (std::size_t k = 1; k < m.size(); ++k)
+        if (m[k] == m[k - 1]) ++ties;
+    }
+    return ties;
+  };
+
+  const char* kWhat[2] = {"tie groups", "tied maximum"};
+  for (int variant = 0; variant < 2; ++variant) {
+    const SpMat tied = build(variant == 1, false);
+    const SpMat untied = build(variant == 1, true);
+    const std::string what = kWhat[variant];
+
+    checkTrue(tiedPairs(tied) > 0, what + ": the matrix really does have tied magnitudes");
+    checkTrue(tiedPairs(untied) == 0, what + ": the nudged copy has none left");
+
+    std::vector<int> matchTied, matchUntied;
+    const bool perfectTied = slu::maximumWeightMatching(tied, matchTied);
+    const bool perfectUntied = slu::maximumWeightMatching(untied, matchUntied);
+    checkTrue(perfectTied && perfectUntied, what + ": both matchings are perfect");
+    checkTrue(matchTied == matchUntied, what + ": ties are resolved in row order");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -258,6 +357,8 @@ int main() {
   testNeverWorseThanIdentity();
   std::printf("Degenerate input:\n");
   testStructurallySingular();
+  std::printf("Transversal tie order:\n");
+  testTiedMagnitudesOrderByRowIndex();
   std::printf("Integration:\n");
   testIntegration();
 

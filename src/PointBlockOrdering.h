@@ -165,8 +165,19 @@ class PointBlockOrdering {
           if (merge >= kMinimumCollapseRatio) viable.push_back({{nv, layout}, merge});
         }
       }
-      std::sort(viable.begin(), viable.end(),
-                [](const ScoredCandidate& a, const ScoredCandidate& b) { return a.merge > b.merge; });
+      // Ties are broken on the candidate itself (narrower blocking first, then
+      // VariableMajor before NodeMajor) rather than left to std::sort, which is
+      // not stable. Equal collapse ratios are ordinary here -- the two layouts
+      // of one nv collapse identically whenever the pattern does not
+      // distinguish them -- and with only the ratio as a key the truncation
+      // below would keep whichever candidate the standard library's sort
+      // happened to leave in front, making the chosen blocking (and every
+      // baseline measured through it) differ between libstdc++ and the MSVC STL.
+      std::sort(viable.begin(), viable.end(), [](const ScoredCandidate& a, const ScoredCandidate& b) {
+        if (a.merge != b.merge) return a.merge > b.merge;
+        if (a.candidate.nv != b.candidate.nv) return a.candidate.nv < b.candidate.nv;
+        return static_cast<int>(a.candidate.layout) < static_cast<int>(b.candidate.layout);
+      });
       if (viable.size() > kMaxScoredCandidates) viable.resize(kMaxScoredCandidates);
       for (const ScoredCandidate& s : viable) candidates.push_back(s.candidate);
     } else {

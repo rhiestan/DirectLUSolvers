@@ -57,6 +57,19 @@ bool maximumWeightMatching(const MatrixType& A,
   // Per-column candidate rows, sorted by descending |value| (nonzeros only). This
   // both drives the greedy seeding and orders the augmenting-path search so that
   // large entries are preferred on the diagonal.
+  //
+  // The comparator breaks ties on the row index, which is not cosmetic: it is
+  // what makes the matching -- and therefore everything downstream of it -- the
+  // same on every standard library. std::sort is not stable, so a comparator on
+  // magnitude alone leaves rows of EQUAL |value| in an order that is the
+  // library's choice rather than the algorithm's, and libstdc++ and the MSVC STL
+  // choose differently. Ties are the common case, not a corner: on HB/mahindas
+  // 564 of 1258 columns have them, 443 tied at the column maximum, i.e. at the
+  // entry the greedy seed takes. A different tie order picks a different (equally
+  // heavy, equally valid) matching, which permutes the rows differently, which
+  // changes the pattern the fill-reducing ordering sees -- so fill, supernode
+  // count and pivoting all move. Across the pinned corpus that reaches 87% fill
+  // spread (TSOPF_RS_b9_c6). Fill baselines are only meaningful with this pinned.
   std::vector<std::vector<StorageIndex>> candidates(static_cast<std::size_t>(n));
   for (StorageIndex j = 0; j < n; ++j) {
     std::vector<std::pair<RealScalar, StorageIndex>> rows;
@@ -66,7 +79,9 @@ bool maximumWeightMatching(const MatrixType& A,
     }
     std::sort(rows.begin(), rows.end(),
               [](const std::pair<RealScalar, StorageIndex>& a,
-                 const std::pair<RealScalar, StorageIndex>& b) { return a.first > b.first; });
+                 const std::pair<RealScalar, StorageIndex>& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+              });
     auto& dst = candidates[static_cast<std::size_t>(j)];
     dst.reserve(rows.size());
     for (const auto& pr : rows) dst.push_back(pr.second);
