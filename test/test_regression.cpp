@@ -87,6 +87,10 @@ constexpr double kResidSlack = 10.0;
 // the band is deliberately wide: this catches an algorithmic blow-up, not noise.
 constexpr double kTimeSlack = 3.0;
 
+// Rows the run could not measure because their matrix is not on this machine.
+// Reported at the end so an unexpectedly thin run is visible rather than silent.
+int g_missingTestdata = 0;
+
 // ---------------------------------------------------------------------------
 //  Measurement
 // ---------------------------------------------------------------------------
@@ -193,6 +197,20 @@ std::vector<Case> buildCases() {
   for (const lu_testing::BenchmarkMatrix& m : lu_testing::benchmarkMatrices()) {
     if (m.tier == Tier::Huge) continue;
     const std::string path = lu_testing::testdataPath(m.relative);
+    // Skipped when absent, exactly as the SuiteSparse rows below are. testdata/
+    // lives outside this repository, so without this every row here is a
+    // load failure on a checkout that does not have it -- which is what kept
+    // this suite out of CI entirely, and every defect in the tie-order chain
+    // lived in that gap. A run with no testdata/ still pins the synthetic rows
+    // and whatever of the corpus has been fetched; --update's merge keeps the
+    // rows it could not measure.
+    {
+      std::ifstream probe(path);
+      if (!probe) {
+        ++g_missingTestdata;
+        continue;
+      }
+    }
     // Loaded RAW -- the symmetric-pattern copy SupernodalLU needs is made per
     // case below, so LeftRightLU can be pinned on the unsymmetric original it
     // actually supports.
@@ -520,6 +538,11 @@ int main(int argc, char** argv) {
     std::printf("Review the diff before committing -- a fill change is a real change.\n");
     return lu_testing::failureCount() == 0 ? 0 : 1;
   }
+
+  if (g_missingTestdata > 0)
+    std::printf("\n%d testdata matrix/matrices are not on this machine and were skipped;\n"
+                "their baseline rows were not checked (set DLU_TESTDATA_DIR to include them).\n",
+                g_missingTestdata);
 
   return lu_testing::summarize("Regression");
 }

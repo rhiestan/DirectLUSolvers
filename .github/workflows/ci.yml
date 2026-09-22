@@ -10,8 +10,14 @@
 # on every push. It completes in a few seconds.
 #
 # The SuiteSparse corpus is different -- it is *downloadable*, so a scheduled job
-# fetches it and runs the real-matrix correctness sweep. That gives coverage on
-# genuine matrices without needing the developer's private testdata/.
+# fetches it and runs the real-matrix suites: correctness, serial-vs-parallel
+# consistency, and the FILL REGRESSION. That last one matters more than its
+# label suggests. test_regression is tagged `testdata` for the matrices that
+# live outside this repository, but its rows for the downloadable corpus need
+# nothing private, and it skips the rest. Leaving it out of CI entirely is what
+# let a standard-library-dependent tie order in the matching sit undetected:
+# every defect in that chain showed up only as fill, only on real matrices, and
+# only on a developer's machine.
 #
 # VERIFICATION STATUS. The Windows leg was reproduced locally before this file
 # was committed -- MSVC 19.44 via both Ninja and the Visual Studio generator,
@@ -19,9 +25,17 @@
 # test sequence below. All 8 quick tests pass, and the full 15-test suite also
 # passes under MSVC where testdata is available. Notably the fill baselines hold
 # byte-for-byte across clang 22 and MSVC 19.44, so they are compiler-portable at
-# least across those two. The LINUX legs remain unverified: this project has
-# never been built with gcc, though nothing in src/ or test/ uses a
-# Windows-specific header or API.
+# least across those two.
+#
+# The Linux leg is now verified too: gcc 13.3, full 30-test suite with testdata
+# and the corpus both present, clean under -Wall -Wextra. Getting there took two
+# real fixes, both of which this file's gaps had hidden. The fill baselines were
+# NOT in fact compiler-portable -- they only looked it because libstdc++ had
+# never run them; the matching sorted equal-magnitude candidate rows with an
+# unstable std::sort, so libstdc++ and the MSVC STL picked different matchings
+# and different fill. And two test gates were pinning residual quantities that
+# no toolchain reproduces. Both are fixed; the baselines now hold across gcc,
+# clang and MSVC.
 #
 # EIGEN IS PINNED TO AN EXACT COMMIT, deliberately. The fill baselines in
 # test/baselines/ record nnzL+nnzU per matrix, and fill depends on the
@@ -111,5 +125,19 @@ jobs:
 
       # The contract: a solver may solve, may decline, or may return a bad answer
       # it flagged itself -- but never a silently wrong one.
+      #
+      # The whole `suitesparse` label, not just test_suitesparse: that also
+      # covers test_parallel_consistency_corpus, which runs both solvers'
+      # intra-supernode parallelism against their serial selves on real
+      # matrices. It needs no data this job has not already fetched.
       - name: Correctness sweep
-        run: ctest --test-dir build -R test_suitesparse --output-on-failure
+        run: ctest --test-dir build -L suitesparse --output-on-failure
+
+      # Fill regression on the corpus. This is the suite that pins nnzL+nnzU,
+      # and it was the one that caught the standard-library tie-order bug in
+      # the matching -- on a developer's machine, because nothing ran it here.
+      # It is labelled `testdata` for the matrices that live outside this
+      # repository; those rows report themselves as skipped, and the ~18
+      # corpus matrices fetched above are checked.
+      - name: Fill regression on the corpus
+        run: ctest --test-dir build -R '^test_regression$' --output-on-failure
