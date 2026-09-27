@@ -79,7 +79,8 @@ constexpr double kDefaultFillTolerance = 0.05;
 // baseline was recorded (some testdata matrices are singular or near-singular by
 // construction) is not held to a magnitude: see compareAgainstBaseline. Rows
 // that met it get kResidSlack of room, which is slack for a different summation
-// order, not for a solver that got worse.
+// order, not for a solver that got worse -- unless the factorization perturbed
+// pivots, where no band holds across instruction sets (see the same function).
 constexpr double kResidTolerance = 1e-6;
 constexpr double kResidSlack = 10.0;
 
@@ -90,6 +91,10 @@ constexpr double kTimeSlack = 3.0;
 // Rows the run could not measure because their matrix is not on this machine.
 // Reported at the end so an unexpectedly thin run is visible rather than silent.
 int g_missingTestdata = 0;
+
+// Rows whose residual was judged on the contract rather than pinned, because
+// the factorization perturbed pivots (see compareAgainstBaseline).
+int g_perturbedRows = 0;
 
 // ---------------------------------------------------------------------------
 //  Measurement
@@ -103,6 +108,10 @@ struct Record {
   long long snodes = 0;
   double resid = 0.0;
   double timeMs = 0.0;
+  // Measured on every run, never recorded in the baseline: they describe THIS
+  // run's arithmetic, which is exactly what differs between toolchains.
+  long long replaced = 0;  // pivots the factorization had to perturb
+  bool flagged = false;    // solve() itself reported the answer as inaccurate
 
   long long fill() const { return nnzL + nnzU; }
   bool factored() const { return nnzL >= 0; }
@@ -144,6 +153,8 @@ Record measure(const std::string& matrix, const std::string& solverName,
     r.nnzU = solver.nnzU();
     r.snodes = static_cast<long long>(solver.supernodeCount());
     r.resid = (A * x - b).norm() / b.norm();
+    r.replaced = static_cast<long long>(solver.replacedPivots());
+    r.flagged = (solver.info() != Eigen::Success);  // solve()'s verdict, not compute()'s
   } catch (const std::exception&) {
     r.nnzL = -1;
   }
@@ -393,6 +404,24 @@ void compareAgainstBaseline(const Record& r, const BaselineMap& baseline, double
       lu_testing::note(key + ": residual " + sci(b.resid) + " -> " +
                        sci(r.resid) + " (both fail the accuracy bar; not pinned)");
     checkTrue(std::isfinite(r.resid), key + ": residual is finite");
+  } else if (r.replaced > 0) {
+    // The factorization had to perturb pivots, so the accuracy of this answer
+    // is whatever iterative refinement recovers -- and where that lands is
+    // decided by the rounding order, i.e. by the vector width, FMA and the
+    // compiler, not by the solver. Mallya/lhr10c under LeftRightLU+COLAMD
+    // (~450 replaced pivots, growth 2.5e22) solves to 1.1e-09 under SSE2,
+    // 4.8e-02 under AVX and 7.4e-10 under AVX2, bit-reproducibly on each, and
+    // MSVC and clang agree digit for digit per ISA. A band around one of those
+    // draws pins the ISA it was recorded on. What does hold on every one is the
+    // contract: the answer is accurate, or solve() says it is not. A silently
+    // wrong answer still fails here.
+    const bool accurate = std::isfinite(r.resid) && r.resid <= kResidTolerance;
+    check(accurate || r.flagged, key + ": residual accurate or reported by solve()", r.resid);
+    ++g_perturbedRows;
+    if (r.resid > b.resid * kResidSlack)
+      lu_testing::note(key + ": residual " + sci(b.resid) + " -> " + sci(r.resid) + " with " +
+                       std::to_string(r.replaced) + " perturbed pivots" +
+                       (r.flagged ? ", reported by solve()" : "") + " (not pinned)");
   } else {
     const double residLimit = std::max(kResidTolerance, b.resid * kResidSlack);
     check(std::isfinite(r.resid) && r.resid <= residLimit, key + ": residual", r.resid);
@@ -543,6 +572,10 @@ int main(int argc, char** argv) {
     std::printf("\n%d testdata matrix/matrices are not on this machine and were skipped;\n"
                 "their baseline rows were not checked (set DLU_TESTDATA_DIR to include them).\n",
                 g_missingTestdata);
+  if (g_perturbedRows > 0)
+    std::printf("\n%d row(s) factored with perturbed pivots; their residual was held to\n"
+                "\"accurate, or reported by solve()\" rather than to the recorded value.\n",
+                g_perturbedRows);
 
   return lu_testing::summarize("Regression");
 }
