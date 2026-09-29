@@ -13,8 +13,10 @@
 #ifndef DIRECTLUSOLVERS_TEST_TESTING_CHECK_H
 #define DIRECTLUSOLVERS_TEST_TESTING_CHECK_H
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <limits>
 #include <string>
 
 namespace lu_testing {
@@ -61,6 +63,25 @@ inline void fail(const std::string& message) {
 
 // Informational line, styled like a check but never counted.
 inline void note(const std::string& message) { std::printf("        %s\n", message.c_str()); }
+
+// Two results from what should be the same arithmetic on two code paths (BTF on
+// vs off on an irreducible matrix, lower triangle vs full input, ...) are not
+// bit-identical in general: with FMA enabled (-mfma, MKL) the compiler contracts
+// a*b+c differently in each path and the answers drift by a few ulp. Compare
+// them in units of unit roundoff relative to the larger magnitude instead.
+// kSamePathUlps is generous against the few ulp that contraction produces and
+// still ~1e13 below what a real divergence -- a double-counted triangle, a
+// different pivot, a block solved out of order -- would show.
+constexpr double kSamePathUlps = 64.0;
+
+// max |a - b| / max(|a|, |b|), in units of double epsilon. Works on any Eigen
+// dense expression (real or complex) without this header including Eigen.
+template <typename A, typename B>
+double ulpGap(const A& a, const B& b) {
+  const double scale = std::max<double>(a.cwiseAbs().maxCoeff(), b.cwiseAbs().maxCoeff());
+  if (scale == 0.0) return 0.0;
+  return double((a - b).cwiseAbs().maxCoeff()) / scale / std::numeric_limits<double>::epsilon();
+}
 
 inline double ms(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double, std::milli>(b - a).count();

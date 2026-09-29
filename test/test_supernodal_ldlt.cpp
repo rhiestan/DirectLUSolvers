@@ -146,7 +146,10 @@ void testTriangleIndependence() {
         (xf - xTrue).norm() / xTrue.norm());
   checkTrue(lower.nnzL() == upper.nnzL() && lower.nnzL() == full.nnzL(),
             "all three read the same graph (equal nnzL)");
-  check((xl - xf).norm() <= 0.0, "lower-triangle and full input agree exactly", (xl - xf).norm());
+  // Same factorization, so agreement to within FMA contraction noise; reading the
+  // upper half as well would be off by O(1), not a few ulp.
+  const double ulps = lu_testing::ulpGap(xl, xf);
+  check(ulps <= lu_testing::kSamePathUlps, "lower-triangle and full input agree (ulps)", ulps);
 }
 
 void testPositiveDefiniteFastPathDeclines() {
@@ -856,7 +859,7 @@ void testSymmetricMatching() {
   // On a positive definite matrix the diagonal is already the best pivot there
   // is, every cycle of the matching is a fixed point, and no pair is formed. The
   // check is that this costs nothing but the matching itself -- same fill, same
-  // answer, bit for bit.
+  // answer up to FMA contraction noise (see kSamePathUlps).
   {
     const SparseMatrix<double> A = laplacian2d(30, 30);
     const SparseMatrix<double> Lo = triangleOf(A, true);
@@ -870,7 +873,8 @@ void testSymmetricMatching() {
     checkTrue(matched.matchedPairs() == 0, "and on an SPD matrix it forms none either");
     checkTrue(plain.nnzL() == matched.nnzL(), "so the fill is unchanged");
     const VectorXd xp = plain.solve(b), xm = matched.solve(b);
-    checkTrue((xp - xm).cwiseAbs().maxCoeff() == 0.0, "and the answer is bit-identical");
+    const double ulps = lu_testing::ulpGap(xp, xm);
+    check(ulps <= lu_testing::kSamePathUlps, "and the answer is the same (ulps)", ulps);
   }
 
   // The case it exists for. Without matching the ordering puts no 2x2 candidate
