@@ -11,6 +11,8 @@
 #ifndef SUPERNODAL_LU_SUPPORT_H
 #define SUPERNODAL_LU_SUPPORT_H
 
+#include <Eigen/SparseCore>
+
 #include <vector>
 
 namespace Eigen {
@@ -73,6 +75,22 @@ struct UpdateSource {
 //                diagonal entry exactly 1 and no entry larger than 1. Costs
 //                O(n) shortest-path searches, so it is opt-in.
 enum class MatchingMethod { None, Transversal, MC64 };
+
+// Runs a fill-reducing ordering functor on `matrix`, compressing a copy first
+// when the input is uncompressed (reserve + insert). Eigen's COLAMDOrdering
+// reads the index arrays directly and requires compressed storage; it only
+// asserts that in debug builds, so in release an uncompressed input silently
+// corrupts the heap. Compressed inputs -- the common case -- pay no copy.
+template <typename OrderingType, typename MatrixType, typename PermutationType>
+void orderCompressed(OrderingType& ordering, const MatrixType& matrix, PermutationType& perm) {
+  if (matrix.isCompressed()) {
+    ordering(matrix, perm);
+    return;
+  }
+  typename MatrixType::PlainObject compressed(matrix);
+  compressed.makeCompressed();
+  ordering(compressed, perm);
+}
 
 }  // namespace supernodal_lu
 }  // namespace Eigen

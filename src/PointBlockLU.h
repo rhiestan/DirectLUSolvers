@@ -563,7 +563,7 @@ void PointBlockLU<MatrixType, OrderingType>::analyzePattern(const MatrixType& ma
   }
 
   PermutationType perm;
-  m_orderingFunctor(matrix, perm);
+  supernodal_lu::orderCompressed(m_orderingFunctor, matrix, perm);
   if (perm.size() == 0) {  // NaturalOrdering reports the identity as empty
     for (StorageIndex k = 0; k < n; ++k) m_colOf[k] = k;
   } else if (point_block::OrderingConvention<OrderingType>::returnsInverse) {

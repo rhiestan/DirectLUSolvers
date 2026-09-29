@@ -1759,7 +1759,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matri
           blockOfPosition[static_cast<std::size_t>(btfPosition[static_cast<std::size_t>(j)])];
   } else {
     PermutationType orderingPerm;
-    m_orderingFunctor(B, orderingPerm);
+    supernodal_lu::orderCompressed(m_orderingFunctor, B, orderingPerm);
     readOrdering(orderingPerm, n, m_toInternal);
   }
 

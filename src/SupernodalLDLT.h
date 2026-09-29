@@ -1130,7 +1130,7 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::analyzePattern(co
     // Eigen's AMD/METIS functors symmetrize whatever they are given, so passing a
     // single triangle orders the same graph the factorization will eliminate.
     PermutationType orderingPerm;
-    m_orderingFunctor(matrix, orderingPerm);
+    supernodal_lu::orderCompressed(m_orderingFunctor, matrix, orderingPerm);
     if (orderingPerm.size() == 0) {  // NaturalOrdering reports the identity as empty
       for (StorageIndex i = 0; i < n; ++i) m_toInternal[i] = i;
     } else {

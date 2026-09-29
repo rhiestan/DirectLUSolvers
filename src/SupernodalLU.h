@@ -1090,7 +1090,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::analyzePattern(const Matr
 
   // 1) fill-reducing ordering (orders the pattern of B + B^T).
   PermutationType orderingPerm;
-  m_orderingFunctor(B, orderingPerm);
+  supernodal_lu::orderCompressed(m_orderingFunctor, B, orderingPerm);
 
   m_toInternal.resize(n);
   if (orderingPerm.size() == 0) {  // NaturalOrdering returns empty
