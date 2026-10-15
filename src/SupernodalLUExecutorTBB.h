@@ -28,6 +28,7 @@
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/global_control.h>
 #include <oneapi/tbb/parallel_for.h>
+#include <oneapi/tbb/task_arena.h>
 
 #include <memory>
 
@@ -76,10 +77,23 @@ class TBBExecutor {
     // TBB's work-stealing scheduler balance the load, the same reason
     // StdThreadExecutor/OpenMPExecutor use per-index dynamic scheduling
     // rather than static, evenly-sized chunks.
+    //
+    // Each chunk runs under this_task_arena::isolate. A task body may itself
+    // start nested TBB parallelism -- most notably dense BLAS calls (trsm,
+    // gemm) when Eigen forwards them to oneMKL built with the TBB threading
+    // layer (EIGEN_USE_MKL_ALL). Without isolation, the thread waiting for
+    // that nested work may steal ANOTHER index of this parallelFor and run it
+    // on top of the suspended one. That is fatal for bodies that block on
+    // each other, such as LeftRightLU's DAG lanes, which poll until every
+    // supernode is done: the stolen lane waits forever for the supernode
+    // suspended beneath it on the same stack (deadlock). Isolation restricts
+    // such a waiting thread to the nested work it spawned itself.
     oneapi::tbb::parallel_for(
         oneapi::tbb::blocked_range<Index>(begin, end, 1),
         [&](const oneapi::tbb::blocked_range<Index>& range) {
-          for (Index i = range.begin(); i != range.end(); ++i) f(i);
+          oneapi::tbb::this_task_arena::isolate([&] {
+            for (Index i = range.begin(); i != range.end(); ++i) f(i);
+          });
         },
         oneapi::tbb::simple_partitioner());
   }

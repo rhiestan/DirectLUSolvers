@@ -312,10 +312,10 @@ void fm2WayNodeRefine2Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
     for (nswaps--; nswaps > mincutorder; nswaps--) {
       const IndexT higain = swaps[static_cast<std::size_t>(nswaps)];
 
-      const IndexT to = where[static_cast<std::size_t>(higain)];
-      const IndexT other = (to + 1) % 2;
+      const IndexT toI = where[static_cast<std::size_t>(higain)];
+      const IndexT other = (toI + 1) % 2;
       pwgts[2] += vwgt[static_cast<std::size_t>(higain)];
-      pwgts[static_cast<std::size_t>(to)] -= vwgt[static_cast<std::size_t>(higain)];
+      pwgts[static_cast<std::size_t>(toI)] -= vwgt[static_cast<std::size_t>(higain)];
       where[static_cast<std::size_t>(higain)] = 2;
       bndInsert(nbnd, bndind, bndptr, higain);
 
@@ -324,7 +324,7 @@ void fm2WayNodeRefine2Sided(Ctrl<IndexT, RealT>& ctrl, Graph<IndexT, RealT>* gra
       for (IndexT j = xadj[static_cast<std::size_t>(higain)]; j < xadj[static_cast<std::size_t>(higain) + 1]; j++) {
         const IndexT k = adjncy[static_cast<std::size_t>(j)];
         if (where[static_cast<std::size_t>(k)] == 2)
-          rinfo[static_cast<std::size_t>(k)].edegrees[to] -= vwgt[static_cast<std::size_t>(higain)];
+          rinfo[static_cast<std::size_t>(k)].edegrees[toI] -= vwgt[static_cast<std::size_t>(higain)];
         else
           edegrees[where[static_cast<std::size_t>(k)]] += vwgt[static_cast<std::size_t>(k)];
       }

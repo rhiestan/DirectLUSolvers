@@ -174,11 +174,13 @@ class TBBExecutor {
     // grainsize 1 + simple_partitioner: always split down to one index per
     // task, so TBB's work-stealing scheduler can balance the same
     // non-uniform per-supernode costs OpenMPExecutor handles with
-    // schedule(dynamic).
+    // schedule(dynamic). Each chunk is isolated: see below.
     oneapi::tbb::parallel_for(
         oneapi::tbb::blocked_range<Index>(begin, end, 1),
         [&](const oneapi::tbb::blocked_range<Index>& range) {
-          for (Index i = range.begin(); i != range.end(); ++i) f(i);
+          oneapi::tbb::this_task_arena::isolate([&] {
+            for (Index i = range.begin(); i != range.end(); ++i) f(i);
+          });
         },
         oneapi::tbb::simple_partitioner());
   }
@@ -192,6 +194,17 @@ Like `OpenMPExecutor`, this does not own a private pool: oneTBB maintains one pr
 worker arena shared by every `TBBExecutor` and any other TBB-based code linked into the
 application (e.g. oneMKL built with the TBB threading layer), so it composes without
 oversubscribing the machine.
+
+**Task isolation.** Sharing the arena with nested TBB work needs care. When a task body itself
+starts TBB parallelism (typically a dense BLAS call that Eigen forwards to oneMKL with the TBB
+threading layer, `EIGEN_USE_MKL_ALL`), the thread waiting for the nested work may steal another
+index of the *same* `parallelFor` and run it on top of the suspended one. LeftRightLU's DAG
+lanes block until every supernode is finished, so such a stolen lane waits forever for the
+supernode suspended beneath it, and the factorization deadlocks with all threads idle. This was
+observed in practice with oneMKL statically linked with its TBB layer, where
+`MKL_NUM_THREADS=1` did not help. `TBBExecutor` therefore runs every chunk under
+`oneapi::tbb::this_task_arena::isolate`, which restricts a waiting thread to the nested work it
+spawned itself.
 
 **Build** (needs the oneTBB headers and `tbb12`/`tbb` linked):
 
