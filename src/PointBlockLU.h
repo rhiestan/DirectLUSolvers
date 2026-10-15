@@ -145,6 +145,7 @@
 #include <vector>
 
 #include "LeftRightLUConditionEstimate.h"
+#include "SupernodalLUSupport.h"
 
 namespace Eigen {
 namespace point_block {
