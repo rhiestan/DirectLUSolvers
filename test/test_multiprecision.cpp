@@ -10,8 +10,9 @@
 // Needs Boost.Multiprecision (header-only); built only with
 // -DDLU_WITH_BOOST_MULTIPRECISION=ON.
 
-#include <boost/multiprecision/cpp_bin_float.hpp>
-#include <boost/multiprecision/eigen.hpp>
+// In place of the Boost headers: also routes the refinement residuals through a
+// cpp_bin_float of twice the mantissa (ExtendedPrecision).
+#include <BoostMultiprecisionSupport>
 
 #include <LeftRightLU>
 #include <MultifrontalQR>
@@ -25,14 +26,17 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "testing/Check.h"
 
 using lu_testing::check;
 using lu_testing::checkTrue;
+using lu_testing::note;
 using Eigen::Index;
 using quad = boost::multiprecision::cpp_bin_float_quad;
 
@@ -114,6 +118,62 @@ Vec<T> pinvSolve(const Dense<T>& A, const Vec<T>& b, const T& relTol) {
 }
 
 std::string tagOf(const char* type, const std::string& what) { return std::string(type) + ": " + what; }
+
+// ---------------------------------------------------------------------------
+// Extended-precision residual
+// ---------------------------------------------------------------------------
+
+static_assert(std::is_void<Eigen::left_right_lu::ExtendedPrecision<double>::type>::value,
+              "double keeps the error-free-transformation emulation");
+static_assert(std::numeric_limits<Eigen::left_right_lu::ExtendedPrecision<quad>::type>::digits >=
+                  2 * std::numeric_limits<quad>::digits,
+              "quad accumulates in a native type with at least twice its mantissa");
+
+// r = b - A x where b = fl(A x): r is pure cancellation, ~eps |A||x|, and only
+// an accumulation with about twice the working mantissa gets its leading digits
+// right. Its promise is |r~ - r| <= eps |r| + c eps^2 (|A||x|)_i -- relative to
+// r itself that second term is a few eps, not less than one. The reference is
+// the same sum in 600 bits. Entries are divided by 3 and 7 so they carry every
+// bit of T: data generated in double would make every product exact in quad,
+// b exact, and r identically zero.
+template <typename T>
+void extendedResidualAccuracy() {
+  const std::string t = tagOf(typeName<T>(), "extended residual of b = fl(Ax)");
+  using Ref = boost::multiprecision::number<boost::multiprecision::cpp_bin_float<600>>;
+  const int n = 200;
+  SpMat<T> A = randomSparse<T>(n, n, 0.05, 91);
+  for (Index k = 0; k < A.nonZeros(); ++k) A.valuePtr()[k] /= T(3);
+  Vec<T> x = randomVector<T>(n, 92);
+  x /= T(7);
+  const Vec<T> b = A * x;
+  Vec<T> r;
+  Eigen::left_right_lu::residualExtended(A, b, x, r);
+  Vec<T> rt;
+  Eigen::left_right_lu::residualExtendedTransposed<false>(SpMat<T>(A.transpose()), b, x, rt);
+
+  std::vector<Ref> exact(std::size_t(n), Ref(0)), absAx(std::size_t(n), Ref(0));
+  for (Index k = 0; k < A.outerSize(); ++k)
+    for (typename SpMat<T>::InnerIterator it(A, k); it; ++it) {
+      const Ref p = Ref(it.value()) * Ref(x[k]);
+      exact[std::size_t(it.row())] += p;
+      absAx[std::size_t(it.row())] += abs(p);
+    }
+  const Ref e = Ref(Eigen::NumTraits<T>::epsilon());
+  double worst = 0, worstT = 0, worstRel = 0;
+  int nonzero = 0;
+  for (int i = 0; i < n; ++i) {
+    const Ref ri = Ref(b[i]) - exact[std::size_t(i)];
+    nonzero += (ri != 0);
+    const Ref bound = e * abs(ri) + Ref(10) * e * e * absAx[std::size_t(i)];
+    worst = std::max(worst, double(Ref(abs(Ref(r[i]) - ri) / bound)));
+    worstT = std::max(worstT, double(Ref(abs(Ref(rt[i]) - ri) / bound)));
+    if (ri != 0) worstRel = std::max(worstRel, double(Ref(abs(Ref(r[i]) - ri) / abs(ri) / e)));
+  }
+  checkTrue(nonzero > n / 2, t + ": the residual is not trivially zero (precondition)");
+  check(worst <= 1.0, t + ": within eps|r| + 10 eps^2 (|A||x|)_i", worst);
+  check(worstT <= 1.0, t + ": transposed form, same bound", worstT);
+  note(t + ": worst error relative to r itself = " + std::to_string(worstRel) + " eps");
+}
 
 // ---------------------------------------------------------------------------
 // MultifrontalQR
@@ -646,6 +706,9 @@ void runOthers() {
 }  // namespace
 
 int main() {
+  std::printf("--- extended residual ---\n");
+  extendedResidualAccuracy<double>();
+  extendedResidualAccuracy<quad>();
   runQR<double>();
   runQR<quad>();
   runLU<double>();

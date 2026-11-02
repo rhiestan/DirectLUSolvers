@@ -1,0 +1,3 @@
+// Eigen-style umbrella include for the Boost.Multiprecision support module.
+// Usage:  #include <BoostMultiprecisionSupport>   (with DirectLUSolvers/src on the include path)
+#include "BoostMultiprecisionSupport.h"

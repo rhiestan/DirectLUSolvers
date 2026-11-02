@@ -41,6 +41,14 @@
 // the platform already has. It is pure software, identical everywhere, and it
 // works for float and complex scalars too.
 //
+// A SOFTWARE SCALAR HAS A BETTER OPTION. For Boost.Multiprecision and the like
+// every operation is a library call, and the emulation costs ~25 of them per
+// multiply-add (two Veltkamp splits, the split product, two twoSums). A native
+// type with twice the mantissa makes the product exact in ONE multiply and the
+// sum one add, at 2-4x the cost of a single working-precision operation.
+// ExtendedPrecision<Real> below names that type; it defaults to the emulation,
+// and BoostMultiprecisionSupport.h specializes it for every cpp_bin_float.
+//
 // THE FLAG HAZARD -- read this before compiling with anything unusual
 //
 // Error-free transformations are algebraically trivial: in exact arithmetic
@@ -179,12 +187,57 @@ struct CompensatedSum {
   }
 };
 
+/** The same interface, accumulating in a native type Wide with at least twice
+  * Real's mantissa: a product of two Reals is then exact, the running sum
+  * carries Wide's precision, and the result is rounded to Real once. */
+template <typename Real, typename Wide>
+struct WideSum {
+  Wide acc = Wide(0);
+
+  void add(const Real& v) { acc += Wide(v); }
+  void addProduct(const Real& a, const Real& b) { acc += Wide(a) * Wide(b); }
+  void clear() { acc = Wide(0); }
+  Real subtractedFrom(const Real& b) const { return Real(Wide(b) - acc); }
+};
+
+}  // namespace detail
+
+/** \brief The type an extended-precision residual accumulates in, for the real
+  * working type \a Real.
+  *
+  * `void`, the default, means "emulate": double-Real arithmetic from error-free
+  * transformations (detail::CompensatedSum), roughly twice Real's mantissa from
+  * Real's own operations. That is the right choice for float and double, whose
+  * operations are single instructions.
+  *
+  * Specialize it to a native type with at least twice Real's mantissa (and an
+  * exponent range at least as wide) when Real is a software type: a product is
+  * then exact in one multiply instead of ~17 operations. For example
+  *
+  *   template <> struct ExtendedPrecision<MyQuad> { typedef MyOct type; };
+  *
+  * BoostMultiprecisionSupport.h does this for every cpp_bin_float. The
+  * specialization must be visible wherever the solvers are instantiated with
+  * Real -- in every translation unit, or the program has two meanings for one
+  * template. */
+template <typename Real>
+struct ExtendedPrecision {
+  typedef void type;
+};
+
+namespace detail {
+
+template <typename Real>
+using ExtendedAccumulator =
+    typename std::conditional<std::is_void<typename ExtendedPrecision<Real>::type>::value, CompensatedSum<Real>,
+                              WideSum<Real, typename ExtendedPrecision<Real>::type>>::type;
+
 /** One entry of a matrix-vector product, accumulated into real/imaginary parts.
-  * Complex scalars go through the same real error-free transformations, four
-  * products at a time -- there is no separate complex EFT and none is needed. */
-template <typename Scalar, typename Real>
-inline void accumulateProduct(CompensatedSum<Real>& re, CompensatedSum<Real>& im, const Scalar& a,
-                              const Scalar& x) {
+  * Complex scalars go through the same real accumulators, four products at a
+  * time -- there is no separate complex EFT and none is needed. */
+template <typename Scalar, typename Acc>
+inline void accumulateProduct(Acc& re, Acc& im, const Scalar& a, const Scalar& x) {
+  typedef typename NumTraits<Scalar>::Real Real;
   if
     constexpr(NumTraits<Scalar>::IsComplex) {
       const Real ar = numext::real(a), ai = numext::imag(a);
@@ -200,9 +253,8 @@ inline void accumulateProduct(CompensatedSum<Real>& re, CompensatedSum<Real>& im
   }
 }
 
-template <typename Scalar, typename Real>
-inline Scalar finishResidual(const CompensatedSum<Real>& re, const CompensatedSum<Real>& im,
-                             const Scalar& b) {
+template <typename Scalar, typename Acc>
+inline Scalar finishResidual(const Acc& re, const Acc& im, const Scalar& b) {
   if
     constexpr(NumTraits<Scalar>::IsComplex) {
       return Scalar(re.subtractedFrom(numext::real(b)), im.subtractedFrom(numext::imag(b)));
@@ -215,7 +267,8 @@ inline Scalar finishResidual(const CompensatedSum<Real>& re, const CompensatedSu
 
 }  // namespace detail
 
-/** \brief r = b - A x, with every dot product accumulated in double-double.
+/** \brief r = b - A x, with every dot product accumulated in double-double (or
+  * in ExtendedPrecision<Real>::type, where that is specialized).
   *
   * The result is rounded to working precision once, at the end, so \a r is an
   * ordinary vector -- the extra precision lives only inside the accumulation,
@@ -238,7 +291,7 @@ void residualExtended(const MatrixT& A, const RhsT& b, const SolT& x, DestT& r) 
   // Named, not `re(std::size_t(n))`: that spelling is a function declaration,
   // not a vector -- the most vexing parse, and it compiles.
   const std::size_t rows = std::size_t(n);
-  std::vector<detail::CompensatedSum<Real>> re(rows), im(rows);
+  std::vector<detail::ExtendedAccumulator<Real>> re(rows), im(rows);
   for (Index c = 0; c < nrhs; ++c) {
     for (Index i = 0; i < n; ++i) {
       re[std::size_t(i)].clear();
@@ -250,12 +303,11 @@ void residualExtended(const MatrixT& A, const RhsT& b, const SolT& x, DestT& r) 
       if (numext::is_exactly_zero(xk)) continue;
       for (typename MatrixT::InnerIterator it(A, k); it; ++it) {
         const std::size_t i = std::size_t(it.row());
-        detail::accumulateProduct<Scalar, Real>(re[i], im[i], it.value(), xk);
+        detail::accumulateProduct<Scalar>(re[i], im[i], it.value(), xk);
       }
     }
     for (Index i = 0; i < n; ++i)
-      r(i, c) = detail::finishResidual<Scalar, Real>(re[std::size_t(i)], im[std::size_t(i)],
-                                                     b(i, c));
+      r(i, c) = detail::finishResidual<Scalar>(re[std::size_t(i)], im[std::size_t(i)], b(i, c));
   }
 }
 
@@ -275,12 +327,12 @@ void residualExtendedTransposed(const MatrixT& A, const RhsT& b, const SolT& x, 
 
   for (Index c = 0; c < nrhs; ++c) {
     for (Index k = 0; k < A.outerSize(); ++k) {
-      detail::CompensatedSum<Real> re, im;
+      detail::ExtendedAccumulator<Real> re, im;
       for (typename MatrixT::InnerIterator it(A, k); it; ++it) {
         const Scalar a = Conjugate ? numext::conj(it.value()) : it.value();
-        detail::accumulateProduct<Scalar, Real>(re, im, a, x(it.row(), c));
+        detail::accumulateProduct<Scalar>(re, im, a, x(it.row(), c));
       }
-      r(k, c) = detail::finishResidual<Scalar, Real>(re, im, b(k, c));
+      r(k, c) = detail::finishResidual<Scalar>(re, im, b(k, c));
     }
   }
 }

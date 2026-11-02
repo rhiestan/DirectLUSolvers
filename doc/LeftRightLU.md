@@ -209,7 +209,11 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
    toolchain: 8 bytes, 53 mantissa bits), so code written against it would silently do nothing
    on Windows while working on Linux. What runs instead is **double-double** arithmetic built
    from error-free transformations (`twoSum`, `twoProduct`), which is pure software and
-   behaves identically everywhere, including for `float` and complex scalars.
+   behaves identically everywhere, including for `float` and complex scalars. A software
+   scalar does better with a native type of twice its mantissa, where a product is exact in
+   one multiply instead of ~17 operations: specialize `left_right_lu::ExtendedPrecision<Real>`
+   to name it (`BoostMultiprecisionSupport.h` does so for every `cpp_bin_float`; measured on
+   quad, the residual then costs 1.6x a plain one instead of 8.2x).
 
    Three things worth knowing before turning it on:
 

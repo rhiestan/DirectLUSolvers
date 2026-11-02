@@ -108,9 +108,11 @@ below is an **opt-in** header that pulls in one extra dependency, listed per-hea
 dependency-free so you only pay for what you use.
 
 All six solvers also work with a software floating-point scalar such as
-Boost.Multiprecision's `cpp_bin_float_quad` (include `<boost/multiprecision/eigen.hpp>` first).
-Tolerances and defaults derive from the scalar's own epsilon, and the double-T refinement
-residuals stay exact. Expect roughly 60x the double run time for quad.
+Boost.Multiprecision's `cpp_bin_float_quad`: include `<BoostMultiprecisionSupport>` in place of
+the Boost headers, in every translation unit that uses one. Tolerances and defaults derive from
+the scalar's own epsilon. The support header makes the refinement residuals accumulate in a
+`cpp_bin_float` of twice the mantissa, about 5x faster than the double-T emulation used
+otherwise (which also stays exact). Expect roughly 60x the double run time for quad.
 `test/test_multiprecision.cpp` checks every solver against dense references in the same scalar.
 RobustLU's acceptance tolerances (`setBackwardErrorTolerance` and friends, default 1e-6) are
 absolute, calibrated on double; tighten them for a wider type if a rung should meet that type's
@@ -152,7 +154,8 @@ solver.factorize(A2);
 | `src/LeftRightLU` | Umbrella header for `LeftRightLU`, `#include <LeftRightLU>`. |
 | `src/LeftRightLUBlockTriangular.h` | Block triangular form: strongly connected components of the matched matrix, the second half of the Dulmage–Mendelsohn decomposition (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Eigen only. |
 | `src/LeftRightLUConditionEstimate.h` | Hager-Higham 1-norm condition estimation and the Oettli-Prager componentwise backward error — what lets a caller tell a 13-digit answer from a 2-digit one (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Shared by `LeftRightLU`, `PointBlockLU`, `SupernodalLDLT` and `RobustLU` despite the name. Eigen only. |
-| `src/LeftRightLUExtendedResidual.h` | Double-double (compensated) residuals for iterative refinement — what turns refinement's small *backward* error into a small *forward* one. Portable software arithmetic, not `long double`. Eigen only. |
+| `src/LeftRightLUExtendedResidual.h` | Double-double (compensated) residuals for iterative refinement — what turns refinement's small *backward* error into a small *forward* one. Portable software arithmetic, not `long double`; a software scalar can name a native wider type instead (`ExtendedPrecision`). Eigen only. |
+| `src/BoostMultiprecisionSupport.h` | Opt-in, requires Boost.Multiprecision: includes the Boost headers the solvers need for a `cpp_bin_float` scalar and specializes `ExtendedPrecision` for it. Umbrella header `#include <BoostMultiprecisionSupport>`. |
 | `src/PointBlockLU.h` | The [unsymmetric-pattern solver](doc/PointBlockLU.md) with refactorization replay. |
 | `src/PointBlockLU` | Umbrella header for `PointBlockLU`, `#include <PointBlockLU>`. |
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
