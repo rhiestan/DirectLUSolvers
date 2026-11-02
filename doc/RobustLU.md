@@ -222,6 +222,15 @@ failure is a bad trade, so the stopping rules carry as much weight as the escala
   stops. Note the message does not overclaim: a condition number is a worst-case *bound*, so the
   answer may still be accurate — there is simply no way to tell from the residual, which is
   exactly why it is flagged.
+- **That κ must be of `A`, not of the factors, when a pivot was replaced.** LeftRightLU's
+  `conditionEstimate()` describes the operator its factors invert, and under static pivoting that
+  is `A + E`. A replaced pivot was too small, so `E` regularises, and the estimate lands near
+  1 / (static pivot) whatever κ(A) is: 2.7e10 against a true 2.8e16 on a Neumann Laplacian shifted by
+  2⁻⁴⁵, whose 19%-wrong answer was accepted as Solved. For such a rung κ is re-estimated with the
+  *refined* `solve()` as the inverse — refinement works against `A` — which matched the exact κ₁ to
+  three digits from 5e10 to 4e18, for four extra solves paid only when a pivot was replaced. On the
+  corpus it moved one verdict, `GHS_indef/sit100` (numerically singular, answer 76% off), from
+  Solved to IllConditioned.
 
 This is why step 4 came after [condition estimation](LeftRightLU.md#whats-different-from-supernodallu):
 "the solver did badly" and "the matrix is unsolvable" are indistinguishable from a residual, and

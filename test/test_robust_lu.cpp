@@ -284,6 +284,41 @@ void testStopsWhenConditioningIsHopeless() {
               rlu::outcomeName(s.outcome()));
 }
 
+// The same diagnosis when the first rung REPLACED a pivot. Its factors invert
+// A + E, and a replaced pivot is one that was too small, so E regularises:
+// LeftRightLU's estimate of that operator sits near 1 / (static pivot), here
+// 2.7e10, whatever kappa(A) is. Read as kappa(A) it passes kappa * eps < 1, and
+// a 19%-wrong answer was accepted as Solved. Neumann Laplacian plus 2^-45 e1 e1^T:
+// exact entries, kappa_1 = 2.8e16 in closed form up to the shift's rounding.
+void testIllConditioningBehindAReplacedPivot() {
+  std::printf("  ill-conditioning behind a replaced pivot is still diagnosed\n");
+  const int n = 200;
+  std::vector<Eigen::Triplet<double>> tr;
+  for (int i = 0; i < n; ++i) {
+    tr.emplace_back(i, i, double((i > 0) + (i < n - 1)) + (i == 0 ? std::ldexp(1.0, -45) : 0.0));
+    if (i > 0) tr.emplace_back(i, i - 1, -1.0);
+    if (i < n - 1) tr.emplace_back(i, i + 1, -1.0);
+  }
+  SpMat A(n, n);
+  A.setFromTriplets(tr.begin(), tr.end());
+  A.makeCompressed();
+  VectorXd xTrue(n);
+  for (int i = 0; i < n; ++i) xTrue[i] = double((i * 7) % 11 + 1);
+  const VectorXd b = A * xTrue;
+
+  Robust s;
+  s.setSymmetryTolerance(-1.0);  // the unsymmetric ladder, where this is decided
+  s.compute(A);
+  const VectorXd x = s.solve(b);
+
+  checkTrue(s.attempts()[0].replacedPivots > 0, "the first rung replaced a pivot (precondition)");
+  checkTrue((x - xTrue).norm() / xTrue.norm() > 1e-3, "the answer is in fact wrong");
+  check(s.conditionEstimate() > 1e16 && s.conditionEstimate() < 1e17,
+        "kappa describes A (2.8e16), not the perturbed factors (2.7e10)", s.conditionEstimate());
+  checkTrue(s.outcome() == rlu::Outcome::IllConditioned && s.info() != Eigen::Success,
+            "diagnosed as ill-conditioned, not reported as a success");
+}
+
 void testEscalationCanBeCapped() {
   std::printf("  setMaxStrategy caps the climb\n");
   // Unsymmetric, so the cap applies to the rung it names: on a symmetric matrix
@@ -567,6 +602,7 @@ int main() {
   testSymmetricFastPath();
   testStructuralSingularityEscalatesToRankRevealing();
   testStopsWhenConditioningIsHopeless();
+  testIllConditioningBehindAReplacedPivot();
   testEscalationCanBeCapped();
   testReportIsConsistent();
   testRankRevealingOnAConsistentSingularSystem();

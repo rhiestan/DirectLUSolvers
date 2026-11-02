@@ -91,6 +91,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -383,6 +384,30 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
    *  predicted fill and then declined, so that comparison costs nothing. */
   robust_lu::Attempt runDirect(const MatrixType& matrix, robust_lu::Strategy s,
                                bool reuseAnalysis = false);
+  /** kappa_1(A) for an m_direct whose factorization replaced pivots.
+    *
+    * LeftRightLU::conditionEstimate() describes the operator its factors invert,
+    * and under static pivoting that is A + E, not A. A replaced pivot is one
+    * that was TOO SMALL, so E regularises: the estimate comes out near
+    * 1 / (static pivot) whatever kappa(A) is -- 2.7e10 against a true 2.8e16 on
+    * a Neumann Laplacian with a 2^-45 shift. The kappa * eps test below then
+    * passes, the probe's backward error is fine, and an answer wrong in the
+    * first digit was accepted as Solved.
+    *
+    * So the inverse is applied by solve() instead of by the bare factors: the
+    * refinement there works against A, each application is backward stable for
+    * A, and an estimate of ||A^-1|| through it cannot land far below
+    * min(kappa(A), 1/eps) -- which is all the kappa * eps test needs. Measured on
+    * that family, it matches the exact kappa_1 to three digits from 5e10 to
+    * 4e18, for four extra solves, paid only when a pivot was replaced. */
+  double refinedConditionEstimate(const MatrixType& matrix);
+  /** Attempt records kappa as a double. +inf there -- an overflowing estimate,
+    * or a wider Scalar's kappa beyond double's range -- would read as "no
+    * estimate" in the kappa * eps test and be accepted; DBL_MAX reads as what it
+    * is. NaN (no estimate at all) passes through. */
+  static double finiteOrMax(double kappa) {
+    return kappa > (std::numeric_limits<double>::max)() ? (std::numeric_limits<double>::max)() : kappa;
+  }
   /** Re-solve the EXISTING factorization with a double-double residual. No
     *  refactorization, no re-analysis -- this is the one genuinely cheap rung. */
   robust_lu::Attempt resolveExtended(const MatrixType& matrix);
@@ -559,7 +584,7 @@ robust_lu::Attempt RobustLU<MatrixType>::runDirect(const MatrixType& matrix, rob
   const DenseVector x = m_direct->solve(probe);
   a.milliseconds = elapsed();
   a.backwardError = double(m_direct->lastBackwardError());
-  a.conditionEstimate = double(m_direct->conditionEstimate());
+  a.conditionEstimate = finiteOrMax(double(m_direct->conditionEstimate()));
   a.growthFactor = double(m_direct->growthFactor());
   a.replacedPivots = (long long)m_direct->replacedPivots();
   a.factorNonzeros = (long long)m_direct->nnzL() + m_direct->nnzU();
@@ -569,7 +594,18 @@ robust_lu::Attempt RobustLU<MatrixType>::runDirect(const MatrixType& matrix, rob
                                               : (matrix * x - probe).norm());
   a.accepted = acceptable(a, x.allFinite());
   if (!a.accepted) a.note = rejection(a);
+  // Last, because its solves overwrite m_direct's per-solve diagnostics read above.
+  if (a.replacedPivots > 0) a.conditionEstimate = refinedConditionEstimate(matrix);
   return a;
+}
+
+template <typename MatrixType>
+double RobustLU<MatrixType>::refinedConditionEstimate(const MatrixType& matrix) {
+  const Index n = matrix.cols();
+  auto applyInv = [&](const DenseVector& in, DenseVector& out) { out = m_direct->solve(in); };
+  auto applyInvAdj = [&](const DenseVector& in, DenseVector& out) { out = m_direct->adjoint().solve(in); };
+  const RealScalar invNorm = left_right_lu::oneNormEstimate<Scalar>(n, applyInv, applyInvAdj);
+  return finiteOrMax(double(left_right_lu::oneNorm(matrix) * invNorm));
 }
 
 template <typename MatrixType>
@@ -592,7 +628,7 @@ robust_lu::Attempt RobustLU<MatrixType>::resolveExtended(const MatrixType& matri
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   a.factored = true;
   a.backwardError = double(m_direct->lastBackwardError());
-  a.conditionEstimate = double(m_direct->conditionEstimate());
+  a.conditionEstimate = finiteOrMax(double(m_direct->conditionEstimate()));
   a.growthFactor = double(m_direct->growthFactor());
   a.replacedPivots = (long long)m_direct->replacedPivots();
   const RealScalar bn = probe.norm();
@@ -603,6 +639,7 @@ robust_lu::Attempt RobustLU<MatrixType>::resolveExtended(const MatrixType& matri
     a.note =
         "recovers digits lost to conditioning; kept (never worse than the plain residual, and "
         "the factorization is unchanged)";
+  if (a.replacedPivots > 0) a.conditionEstimate = refinedConditionEstimate(matrix);
   return a;
 }
 
