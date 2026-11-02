@@ -86,8 +86,13 @@ jobs:
             -DDLU_EIGEN_DIR="$PWD/eigen-src" \
             ${{ matrix.cc != '' && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
 
+      # Bounded on purpose. A bare --parallel under the Makefile generator is
+      # `make -j` with NO limit: every test TU (~30, each a full Eigen
+      # instantiation at 1-2 GB under g++) compiles at once, the 16 GB runner
+      # runs out of memory, and the job dies as "runner has received a
+      # shutdown signal" with no compiler error in the log.
       - name: Build
-        run: cmake --build build --config Release --parallel
+        run: cmake --build build --config Release --parallel 4
 
       # Only the `quick` label: the rest needs testdata/, which is not in this
       # repository. A failure here is a real failure, not a missing-data error.
@@ -121,7 +126,7 @@ jobs:
       - name: Configure and build
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDLU_EIGEN_DIR="$PWD/eigen-src"
-          cmake --build build --parallel
+          cmake --build build --parallel 4
 
       # The contract: a solver may solve, may decline, or may return a bad answer
       # it flagged itself -- but never a silently wrong one.
