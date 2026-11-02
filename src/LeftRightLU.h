@@ -945,7 +945,8 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     const RealScalar mag = numext::abs(mantissa);
     if (!(mag > RealScalar(0)) || !(numext::isfinite)(mag)) return;
     int e = 0;
-    std::frexp(mag, &e);
+    using std::frexp;
+    frexp(mag, &e);
     mantissa = scaleByPowerOfTwo(mantissa, -e);
     exponent += e;
   }
@@ -957,9 +958,13 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
                                                 numext::mini(long(2 * std::numeric_limits<RealScalar>::max_exponent), exponent)));
     return scaleByPowerOfTwoImpl(mantissa, e, std::integral_constant<bool, NumTraits<Scalar>::IsComplex>());
   }
-  static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::false_type) { return std::ldexp(m, e); }
+  static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::false_type) {
+    using std::ldexp;
+    return ldexp(m, e);
+  }
   static Scalar scaleByPowerOfTwoImpl(const Scalar& m, int e, std::true_type) {
-    return Scalar(std::ldexp(numext::real(m), e), std::ldexp(numext::imag(m), e));
+    using std::ldexp;
+    return Scalar(ldexp(numext::real(m), e), ldexp(numext::imag(m), e));
   }
 
   void init() {
@@ -2150,9 +2155,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
     }
 
     Scalar pivot = diag(k, k);
-    if (staticPivot > RealScalar(0) && std::abs(pivot) < staticPivot) {
-      pivot = (std::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
-                                                 : pivot * (staticPivot / std::abs(pivot));
+    if (staticPivot > RealScalar(0) && numext::abs(pivot) < staticPivot) {
+      pivot = (numext::abs(pivot) == RealScalar(0)) ? Scalar(staticPivot)
+                                                    : pivot * (staticPivot / numext::abs(pivot));
       diag(k, k) = pivot;
       ++replacedCount;
     }

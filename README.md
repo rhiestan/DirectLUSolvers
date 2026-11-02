@@ -107,6 +107,15 @@ external dependencies, no linking beyond your usual Eigen setup. Everything else
 below is an **opt-in** header that pulls in one extra dependency, listed per-header. This mirrors Eigen's own `*Support` module convention: the base solvers stay
 dependency-free so you only pay for what you use.
 
+All six solvers also work with a software floating-point scalar such as
+Boost.Multiprecision's `cpp_bin_float_quad` (include `<boost/multiprecision/eigen.hpp>` first).
+Tolerances and defaults derive from the scalar's own epsilon, and the double-T refinement
+residuals stay exact. Expect roughly 60x the double run time for quad.
+`test/test_multiprecision.cpp` checks every solver against dense references in the same scalar.
+RobustLU's acceptance tolerances (`setBackwardErrorTolerance` and friends, default 1e-6) are
+absolute, calibrated on double; tighten them for a wider type if a rung should meet that type's
+accuracy rather than double's.
+
 ## Quick start
 
 ```cpp
@@ -214,7 +223,9 @@ ctest --test-dir build --output-on-failure     # ctest -L quick for the fast sub
 ```
 
 Optional dependencies are independent switches, all default `OFF`:
-`-DDLU_WITH_METIS=ON`, `-DDLU_WITH_PARDISO=ON`, `-DDLU_WITH_OPENMP=ON`, `-DDLU_WITH_TBB=ON`.
+`-DDLU_WITH_METIS=ON`, `-DDLU_WITH_PARDISO=ON`, `-DDLU_WITH_OPENMP=ON`, `-DDLU_WITH_TBB=ON`,
+`-DDLU_WITH_BOOST_MULTIPRECISION=ON` (finds `boost_multiprecision` through the usual CMake search,
+then in `../vcpkg/installed/x64-windows`).
 The build defaults to **Release**, deliberately set before `project()` — on an MSVC-targeting
 toolchain the usual guard placed after it never fires and you silently get `-O0`, which is a
 50-100x timing error here. See [Testing](doc/Testing.md) for the full story, the baseline

@@ -73,6 +73,7 @@
 
 #include <cmath>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 namespace Eigen {
@@ -102,10 +103,11 @@ namespace detail {
 
 template <typename Real>
 struct HasFastFma {
-  // float and double both ride on the same hardware unit; a type the platform
-  // emulates (long double on some ABIs) would not, but no such type reaches
-  // here in practice.
-  static const bool value = EIGEN_LEFT_RIGHT_LU_FAST_FMA != 0;
+  // float and double both ride on the same hardware unit. A software type
+  // (Boost.Multiprecision and the like) has no hardware fma, and its fma need
+  // not round once -- twoProduct would then be inexact -- so it takes the
+  // splitting path, which is exact for any binary round-to-nearest type.
+  static const bool value = EIGEN_LEFT_RIGHT_LU_FAST_FMA != 0 && std::is_floating_point<Real>::value;
 };
 
 /** Veltkamp splitting: a = hi + lo exactly, with each half carrying at most
@@ -113,8 +115,8 @@ struct HasFastFma {
 template <typename Real>
 inline void veltkampSplit(Real a, Real& hi, Real& lo) {
   // 2^ceil(p/2) + 1, computed once per type rather than hard-coded per width.
-  static const Real splitter =
-      std::ldexp(Real(1), (std::numeric_limits<Real>::digits + 1) / 2) + Real(1);
+  using std::ldexp;
+  static const Real splitter = ldexp(Real(1), (std::numeric_limits<Real>::digits + 1) / 2) + Real(1);
   const Real c = splitter * a;
   hi = c - (c - a);
   lo = a - hi;

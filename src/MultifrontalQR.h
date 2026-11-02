@@ -247,8 +247,10 @@ RealScalar inversePowerOfTwo(RealScalar value) {
     }
   }
   int e = 0;
-  std::frexp(value, &e);  // value = f * 2^e, f in [0.5, 1)
-  return std::ldexp(RealScalar(1), -e);
+  using std::frexp;
+  using std::ldexp;
+  frexp(value, &e);  // value = f * 2^e, f in [0.5, 1)
+  return ldexp(RealScalar(1), -e);
 }
 
 // Orthonormalizes the columns of a tall, thin X in place: classical Gram-Schmidt

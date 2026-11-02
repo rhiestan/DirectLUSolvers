@@ -336,6 +336,17 @@ add_dlu_test(test_pointblock_lu SOURCE test/test_pointblock_lu.cpp LABELS "quick
 # Rank-revealing multifrontal QR. Dependency-free: every reference is a dense
 # Eigen SVD or pivoted QR of a generated matrix.
 add_dlu_test(test_multifrontal_qr SOURCE test/test_multifrontal_qr.cpp LABELS "quick;correctness")
+
+# The solvers with Boost.Multiprecision's cpp_bin_float_quad as the scalar,
+# side by side with double. Boost is header-only; the in-tree vcpkg is tried
+# after anything CMAKE_PREFIX_PATH / a toolchain file already provides.
+option(DLU_WITH_BOOST_MULTIPRECISION "Test the solvers with Boost.Multiprecision scalars" OFF)
+if(DLU_WITH_BOOST_MULTIPRECISION)
+  find_package(boost_multiprecision CONFIG REQUIRED
+               HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../vcpkg/installed/x64-windows")
+  add_dlu_test(test_multiprecision SOURCE test/test_multiprecision.cpp
+               LINK Boost::multiprecision LABELS "correctness;multiprecision")
+endif()
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 
 # The reader's own unit tests are instant; the registry sweep that follows them
