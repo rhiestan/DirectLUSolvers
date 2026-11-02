@@ -93,6 +93,15 @@
 //                         one (dead columns zero), which is cheaper and sparse in
 //                         the dead columns.
 //
+// The minimum norm is ||x||_2 by default, which depends on the units of the
+// columns: rescale one column and the "shortest" solution moves.
+// Solution::ColumnScaledMinimumNorm minimizes ||diag(||A(:,j)||_2) x|| instead,
+// which is invariant under column scaling (A D gives D^-1 x exactly), and
+// setMinimumNormWeights(w) minimizes ||diag(w) x|| for any positive w. Both
+// change only the inner product the null space is orthonormalized and projected
+// in -- the factorization, the rank decision and the cost are those of the
+// plain minimum-norm solve.
+//
 // Refinement residuals are computed in double-double (see
 // LeftRightLUExtendedResidual.h). That is exact on the SCALED matrix only
 // because the scaling is by powers of two -- a general scaling would make the
@@ -163,8 +172,20 @@ namespace multifrontal_qr {
  */
 enum class Ordering { Auto, COLAMD, AMD, Natural };
 
-/** Which solution solve() returns when the matrix is rank deficient. */
-enum class Solution { MinimumNorm, Basic };
+/** Which solution solve() returns when the matrix is rank deficient.
+ *
+ *   MinimumNorm              the least-squares solution of smallest ||x||_2, or
+ *                            of smallest ||diag(w) x||_2 under
+ *                            setMinimumNormWeights(w).
+ *   Basic                    the basic solution: dead columns zero.
+ *   ColumnScaledMinimumNorm  the least-squares solution of smallest
+ *                            ||diag(||A(:,j)||_2) x||_2: the minimum norm of
+ *                            the matrix with unit columns, mapped back, so
+ *                            invariant under column scaling. A zero column
+ *                            has weight 1. setMinimumNormWeights() overrides
+ *                            these weights.
+ */
+enum class Solution { MinimumNorm, Basic, ColumnScaledMinimumNorm };
 
 /** Equilibration before factoring. All factors are powers of two.
  *
@@ -442,13 +463,15 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   SparseMatrix<Scalar, ColMajor, StorageIndex> matrixR() const;
 
   /** Orthonormal basis of the (numerical) null space of A, n x (n - rank), in
-   *  ORIGINAL column coordinates and the ORIGINAL (unscaled) inner product.
-   *  Computed on first use and cached; empty if the null space is larger than
-   *  setMaxNullSpaceScalars() allows. */
+   *  ORIGINAL column coordinates and the ORIGINAL (unscaled) inner product,
+   *  whatever weights minimum-norm solves use. Computed on first use and
+   *  cached; empty if the null space is larger than setMaxNullSpaceScalars()
+   *  allows. */
   const DenseMatrix& nullSpace() const {
-    ensureNullSpace();
-    if (m_nullSpace.cols() != m_nullDim && !m_nullSpaceTooLarge)
-      m_nullSpace = m_nullQR.householderQ() * DenseMatrix::Identity(m_cols, m_nullDim);
+    NullBasis& nb = m_null[0];
+    ensureNullSpace(nb, m_colScale);
+    if (m_nullSpace.cols() != nb.dim && !nb.tooLarge)
+      m_nullSpace = nb.qr.householderQ() * DenseMatrix::Identity(m_cols, nb.dim);
     return m_nullSpace;
   }
 
@@ -465,7 +488,8 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
    *  + ||b||)), where the ratio is noise -- the solve is consistent then. */
   RealScalar leastSquaresOptimality() const { return m_lastOptimality; }
   /** Why the last solve() returned something other than what setSolution()
-   *  asked for (currently: a null space too large to form), or empty. */
+   *  asked for (a null space too large to form, or minimum-norm weights that
+   *  are not n positive finite numbers), or empty. */
   const std::string& lastSolveMessage() const { return m_solveNote; }
   /** Refinement steps the last solve() took (on its worst column). */
   Index iterativeRefinements() const { return m_lastRefinements; }
@@ -497,6 +521,15 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   multifrontal_qr::Ordering ordering() const { return m_ordering; }
   void setSolution(multifrontal_qr::Solution s) { m_solution = s; }
   multifrontal_qr::Solution solution() const { return m_solution; }
+  /** Weights of the minimum-norm solution: solve() minimizes ||diag(w) x||_2
+   *  over the least-squares solutions, under Solution::MinimumNorm or
+   *  ColumnScaledMinimumNorm (overriding the latter's column norms). w must
+   *  hold cols() positive finite numbers when solve() runs; otherwise solve()
+   *  minimizes ||x||_2 and says so in lastSolveMessage(). An empty w (the
+   *  default) clears them. Takes effect at the next solve(), no refactorization
+   *  needed. */
+  void setMinimumNormWeights(const RealVector& w) { m_normWeights = w; }
+  const RealVector& minimumNormWeights() const { return m_normWeights; }
   void setScaling(multifrontal_qr::Scaling s) { m_scaling = s; }
   multifrontal_qr::Scaling scaling() const { return m_scaling; }
   /** The scaling the last factorize() kept (Auto resolves to one). */
@@ -709,7 +742,21 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   // level-3 operations.
   void upperSolveBlock(const DenseMatrix& c, DenseMatrix& z) const;
   void upperMultiplyBlock(const DenseMatrix& z, DenseMatrix& u, bool includeDead) const;
-  void ensureNullSpace() const;
+  // An orthonormal null-space basis in the coordinates u = metric .* z, z the
+  // scaled coordinates in original column order (x = colScale .* z). metric =
+  // colScale is the original inner product; metric = colScale .* w the one of
+  // ||diag(w) x||.
+  struct NullBasis {
+    bool ready = false;
+    bool tooLarge = false;
+    RealVector metric;
+    HouseholderQR<DenseMatrix> qr;  // the basis is the first dim columns of Q
+    Index dim = 0;
+  };
+  void ensureNullSpace(NullBasis& nb, const RealVector& metric) const;
+  // The metric of weighted minimum-norm solves; false (metric untouched) for
+  // the plain 2-norm. Sets `problem` when the weights asked for are unusable.
+  bool minimumNormMetric(RealVector& metric, std::string& problem) const;
   RealScalar inverseNormEstimate() const;  // Hager-Higham ||R11^-1||_1, cached
   void toOriginal(const Vector& z, Vector& x) const {
     x.resize(m_cols);
@@ -732,6 +779,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   ScalarFactor m_sf;
   Index m_slotCount = 0;
   multifrontal_qr::Solution m_solution = multifrontal_qr::Solution::MinimumNorm;
+  RealVector m_normWeights;
   multifrontal_qr::Scaling m_scaling = multifrontal_qr::Scaling::Auto;
   multifrontal_qr::Scaling m_scalingUsed = multifrontal_qr::Scaling::None;
   RealScalar m_relTol = RealScalar(-1);
@@ -783,11 +831,11 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   Index m_repairs = 0;
   Index m_nnzR = 0, m_nnzH = 0, m_largestFront = 0;
 
-  mutable bool m_nullSpaceReady = false;
-  mutable bool m_nullSpaceTooLarge = false;
-  mutable DenseMatrix m_nullSpace;        // explicit basis, formed only on request
-  mutable HouseholderQR<DenseMatrix> m_nullQR;  // the basis in factored form
-  mutable Index m_nullDim = 0;
+  // [0] in the original inner product (nullSpace(), unweighted solves),
+  // [1] in the weighted one, so alternating between them rebuilds neither.
+  mutable NullBasis m_null[2];
+  mutable DenseMatrix m_nullSpace;        // explicit basis of m_null[0], formed only on request
+  mutable RealVector m_colNormMetric;     // colScale .* ||A(:,j)||_2, cached
   mutable RealScalar m_conditionEstimate = RealScalar(-1);
   mutable RealScalar m_inverseNormEstimate = RealScalar(-1);
   mutable RealScalar m_lastResidual = RealScalar(0);
@@ -813,6 +861,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
     o.setScalarDeferralLimit(m_scalarDeferLimit);
     o.setOrdering(m_ordering);
     o.setSolution(m_solution);
+    o.setMinimumNormWeights(m_normWeights);
     o.setRankTolerance(m_relTol);
     o.setRankVerification(m_verifyRank);
     o.setThoroughVerification(m_thoroughVerification);
@@ -833,6 +882,7 @@ class MultifrontalQR : public SparseSolverBase<MultifrontalQR<MatrixType_, Execu
   template <typename Other>
   void copySolveOptionsTo(Other& o) const {
     o.setSolution(m_solution);
+    o.setMinimumNormWeights(m_normWeights);
     o.setMaxRefinements(m_maxRefinements);
     o.setExtendedPrecisionResidual(m_extendedResidual);
     o.setMaxNullSpaceScalars(m_maxNullSpaceScalars);
@@ -1394,11 +1444,10 @@ void MultifrontalQR<MatrixType, Executor>::releaseNumeric() {
   m_rank = 0;
   m_sigma.resize(0);
   m_rankVerified = false;
-  m_nullSpaceReady = false;
-  m_nullSpaceTooLarge = false;
+  m_null[0] = NullBasis();
+  m_null[1] = NullBasis();
   m_nullSpace.resize(0, 0);
-  m_nullQR = HouseholderQR<DenseMatrix>();
-  m_nullDim = 0;
+  m_colNormMetric.resize(0);
   m_conditionEstimate = RealScalar(-1);
   m_inverseNormEstimate = RealScalar(-1);
   m_unweighted.reset();
@@ -2567,23 +2616,66 @@ void MultifrontalQR<MatrixType, Executor>::verifyRank(bool& needsRepair, std::ve
 // ============================================================================
 
 template <typename MatrixType, typename Executor>
-void MultifrontalQR<MatrixType, Executor>::ensureNullSpace() const {
+bool MultifrontalQR<MatrixType, Executor>::minimumNormMetric(RealVector& metric, std::string& problem) const {
+  using multifrontal_qr::Solution;
+  if (m_normWeights.size() > 0) {
+    // The product of a positive finite weight and a power of two is positive
+    // and finite unless it leaves the exponent range.
+    bool usable = m_normWeights.size() == m_cols;
+    if (usable) {
+      metric = m_colScale.cwiseProduct(m_normWeights);
+      for (Index c = 0; c < m_cols && usable; ++c)
+        usable = metric[c] > RealScalar(0) && metric[c] <= NumTraits<RealScalar>::highest();
+    }
+    if (usable) return true;
+    problem = "MultifrontalQR: setMinimumNormWeights() needs cols() positive finite weights; minimized ||x||_2 instead";
+    return false;
+  }
+  if (m_solution != Solution::ColumnScaledMinimumNorm) return false;
+  if (m_colNormMetric.size() != m_cols) {
+    // colScale_j ||A(:,j)|| = ||As(:,j) ./ rowScale||: exact quotients (the
+    // scaling is by powers of two), largest first so the sum of squares cannot
+    // overflow. A zero column keeps weight 1.
+    m_colNormMetric.resize(m_cols);
+    for (Index c = 0; c < m_cols; ++c) {
+      RealScalar big(0);
+      for (typename MatrixType::InnerIterator it(m_scaled, c); it; ++it)
+        big = (std::max)(big, numext::abs(it.value()) / m_rowScale[it.row()]);
+      if (big == RealScalar(0)) {
+        m_colNormMetric[c] = m_colScale[c];
+        continue;
+      }
+      const RealScalar pre = multifrontal_qr::detail::inversePowerOfTwo(big);
+      RealScalar sq(0);
+      for (typename MatrixType::InnerIterator it(m_scaled, c); it; ++it)
+        sq += numext::abs2(it.value() * (pre / m_rowScale[it.row()]));
+      m_colNormMetric[c] = numext::sqrt(sq) / pre;
+    }
+  }
+  metric = m_colNormMetric;
+  return true;
+}
+
+template <typename MatrixType, typename Executor>
+void MultifrontalQR<MatrixType, Executor>::ensureNullSpace(NullBasis& nb, const RealVector& metric) const {
   const Index k = m_cols - m_rank;
   const bool tooLarge = double(m_cols) * double(k) > m_maxNullSpaceScalars;
   // A basis refused under a smaller setMaxNullSpaceScalars() is tried again
-  // once the cap allows it.
-  if (m_nullSpaceReady && !(m_nullSpaceTooLarge && !tooLarge)) return;
-  m_nullSpaceReady = true;
-  m_nullSpaceTooLarge = false;
-  m_nullSpace.resize(m_cols, 0);
-  m_nullDim = 0;
+  // once the cap allows it; one built for other weights is rebuilt.
+  const bool sameMetric = nb.metric.size() == metric.size() && (nb.metric.array() == metric.array()).all();
+  if (nb.ready && sameMetric && !(nb.tooLarge && !tooLarge)) return;
+  nb.ready = true;
+  nb.tooLarge = false;
+  nb.metric = metric;
+  nb.dim = 0;
+  if (&nb == &m_null[0]) m_nullSpace.resize(m_cols, 0);
   if (k <= 0) return;
   if (tooLarge) {
-    m_nullSpaceTooLarge = true;
+    nb.tooLarge = true;
     return;
   }
   // Null space of [R11 R12]: [-R11^-1 R12 e_d; e_d] for every dead column d,
-  // mapped back through the column scaling (x = Dc y), then orthonormalized.
+  // mapped to the basis coordinates (u = metric .* z), then orthonormalized.
   // All k right-hand sides at once, front by front: the same flops as k
   // separate solves, but as dense level-3 operations instead of k passes over
   // the front list.
@@ -2636,7 +2728,7 @@ void MultifrontalQR<MatrixType, Executor>::ensureNullSpace() const {
   }
   DenseMatrix N(m_cols, k);
   for (Index c2 = 0; c2 < m_cols; ++c2)
-    N.row(c2) = Z.row(m_sym.origToInternal[std::size_t(c2)]) * Scalar(m_colScale[c2]);
+    N.row(c2) = Z.row(m_sym.origToInternal[std::size_t(c2)]) * Scalar(metric[c2]);
   Z.resize(0, 0);
   for (Index j = 0; j < k; ++j) N.col(j) /= N.col(j).norm();
   eigen_assert(col == k);
@@ -2654,16 +2746,15 @@ void MultifrontalQR<MatrixType, Executor>::ensureNullSpace() const {
   N = HouseholderQR<DenseMatrix>(N).householderQ() * DenseMatrix::Identity(m_cols, k);
   {
     Z.resize(m_cols, k);  // internal order, scaled coordinates
-    for (Index c2 = 0; c2 < m_cols; ++c2) Z.row(m_sym.origToInternal[std::size_t(c2)]) = N.row(c2) / Scalar(m_colScale[c2]);
+    for (Index c2 = 0; c2 < m_cols; ++c2) Z.row(m_sym.origToInternal[std::size_t(c2)]) = N.row(c2) / Scalar(metric[c2]);
     DenseMatrix U, DZ = DenseMatrix::Zero(m_cols, k);
     upperMultiplyBlock(Z, U, true);
     upperSolveBlock(U, DZ);
-    for (Index c2 = 0; c2 < m_cols; ++c2) N.row(c2) -= DZ.row(m_sym.origToInternal[std::size_t(c2)]) * Scalar(m_colScale[c2]);
+    for (Index c2 = 0; c2 < m_cols; ++c2) N.row(c2) -= DZ.row(m_sym.origToInternal[std::size_t(c2)]) * Scalar(metric[c2]);
     Z.resize(0, 0);
   }
-  HouseholderQR<DenseMatrix> qr(N);
-  m_nullQR = std::move(qr);
-  m_nullDim = k;
+  nb.qr.compute(N);
+  nb.dim = k;
 }
 
 template <typename MatrixType, typename Executor>
@@ -2750,9 +2841,17 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
   m_lastRefinements = 0;
   m_lastResidual = RealScalar(0);
   m_lastOptimality = RealScalar(0);
-  const bool minNorm = m_solution == multifrontal_qr::Solution::MinimumNorm && r < n;
-  if (minNorm) ensureNullSpace();
-  const bool project = minNorm && !m_nullSpaceTooLarge && m_nullDim > 0;
+  const bool minNorm = m_solution != multifrontal_qr::Solution::Basic && r < n;
+  // The projection works in u = metric .* z (z: scaled coordinates in original
+  // order), where the norm minimized is the 2-norm: metric = colScale for
+  // ||x||, colScale .* w for ||diag(w) x||.
+  RealVector metric;
+  std::string weightProblem;
+  const bool weighted = minNorm && minimumNormMetric(metric, weightProblem);
+  if (!weighted) metric = m_colScale;
+  NullBasis& nb = m_null[weighted ? 1 : 0];
+  if (minNorm) ensureNullSpace(nb, metric);
+  const bool project = minNorm && !nb.tooLarge && nb.dim > 0;
   const bool augmented = !(m == n && r == n);
   const RealScalar eps = NumTraits<RealScalar>::epsilon();
 
@@ -2838,14 +2937,16 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
     m_lastRefinements = (std::max)(m_lastRefinements, steps);
 
     toOriginal(z, x);
-    x.array() *= m_colScale.array().template cast<Scalar>();
     if (project) {
-      // x - N N^H x = Q diag(0, I) Q^H x with N the first nullDim columns of Q,
+      // From here to the end of this block x holds u = metric .* z, which is x
+      // itself when the norm is unweighted.
+      x.array() *= metric.array().template cast<Scalar>();
+      // u - N N^H u = Q diag(0, I) Q^H u with N the first dim columns of Q,
       // applied in factored form. Q is exactly unitary, so one pass suffices.
-      const auto Qseq = m_nullQR.householderQ();
+      const auto Qseq = nb.qr.householderQ();
       auto projectOffNull = [&](Vector& v) {
         v.applyOnTheLeft(Qseq.adjoint());
-        v.head(m_nullDim).setZero();
+        v.head(nb.dim).setZero();
         v.applyOnTheLeft(Qseq);
       };
       projectOffNull(x);
@@ -2864,12 +2965,12 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
         Index steps2 = 0;
         Vector xs, zi, dxo;
         for (; steps2 < m_maxRefinements; ++steps2) {
-          xs = x.cwiseQuotient(m_colScale.template cast<Scalar>());
+          xs = x.cwiseQuotient(metric.template cast<Scalar>());
           toInternal(xs, zi);
           residual(zi, rr);
           bjorckStep(dz);
           toOriginal(dz, dxo);
-          dxo.array() *= m_colScale.array().template cast<Scalar>();
+          dxo.array() *= metric.array().template cast<Scalar>();
           projectOffNull(dxo);
           const RealScalar dn = dxo.template lpNorm<Infinity>();
           if (!(numext::isfinite)(dn) || dn >= prevNorm) break;
@@ -2881,13 +2982,17 @@ void MultifrontalQR<MatrixType, Executor>::_solve_impl(const MatrixBase<Rhs>& b,
         }
         m_lastRefinements = (std::max)(m_lastRefinements, steps2);
       }
+      // x = colScale .* (u ./ metric): one rounding, colScale being a power of two.
+      if (weighted) x = x.cwiseQuotient(metric.template cast<Scalar>()).cwiseProduct(m_colScale.template cast<Scalar>());
+    } else {
+      x.array() *= m_colScale.array().template cast<Scalar>();
     }
     dest.col(col) = x;
   }
 
   // Diagnostics in the ORIGINAL matrix: A = Dr^-1 As Dc^-1.
-  m_solveNote.clear();
-  if (minNorm && !project && m_nullSpaceTooLarge)
+  m_solveNote = weightProblem;
+  if (minNorm && !project && nb.tooLarge)
     m_solveNote = "MultifrontalQR: null space too large for setMaxNullSpaceScalars(); returned the basic solution";
   RealScalar worstRes(0), worstOpt(0);
   RealScalar anorm(0);

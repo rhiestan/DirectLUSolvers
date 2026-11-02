@@ -171,6 +171,8 @@ block stops at 1373, and the repair loop can then only report failure; the SVD r
 | full rank, m = n | the solution, refined |
 | full rank, m > n | the least-squares solution, refined on the augmented system (Björck) |
 | rank r < n, `Solution::MinimumNorm` (default) | the **minimum-norm** least-squares solution — `pinv(A) b` up to the rank decision |
+| rank r < n, `Solution::ColumnScaledMinimumNorm` | the least-squares solution of smallest `‖diag(‖A(:,j)‖₂) x‖`: invariant under column scaling |
+| rank r < n, `setMinimumNormWeights(w)` | the least-squares solution of smallest `‖diag(w) x‖` (under either minimum-norm setting) |
 | rank r < n, `Solution::Basic` | the basic solution: dead columns and null directions zero |
 
 The minimum-norm answer is the basic one projected orthogonally off the null space, in the
@@ -191,6 +193,30 @@ part is removed again (a basic solve of the tiny `A n`, which is well conditione
 basis is orthonormalized once more. Its size is capped by `setMaxNullSpaceScalars` (default
 5e7); beyond it the basic solution is returned and `lastSolveMessage()` says so, and raising
 the cap later makes the next solve build it.
+
+### Weighted minimum norm
+
+`‖x‖₂` depends on the units of the columns: give one column a factor of 1e6 and the "shortest"
+solution moves away from it. `Solution::ColumnScaledMinimumNorm` minimizes
+`‖diag(‖A(:,j)‖₂) x‖` instead — the minimum-norm solution of the matrix with unit columns, mapped
+back — so `A D` gives `D⁻¹ x` for any diagonal `D`, to rounding (the column norms are exact, not
+the equilibration's powers of two). `setMinimumNormWeights(w)` minimizes `‖diag(w) x‖` for any
+`cols()` positive finite weights, and overrides the column norms; weights that are not usable are
+reported in `lastSolveMessage()` and the plain 2-norm is used.
+
+Only the inner product changes: the basis is built from the same `[-R11⁻¹R12; I]`, mapped to
+`u = diag(w) x` coordinates, and orthonormalized and projected there, with the projected refinement
+working in the same coordinates. Factorization, rank decision and cost are those of the plain
+minimum-norm solve, and the weighted basis is cached next to the plain one, so `nullSpace()`
+(always in the original inner product) and alternating solves rebuild neither. On a 14400×14700
+grid operator whose columns span 1e12, with 300 dependent columns, the first column-scaled solve
+costs 940 ms against 925 ms for the plain one, and both repeat in about 50 ms. On such columns
+the column-scaled answer is also the more accurate one: relative residual 4e-15, against 2e-6 for
+the plain minimum norm.
+
+Accuracy follows the weighted problem's own conditioning, `κ(diag(w) N)` for a null basis `N`.
+With weights spanning 1e12 on a tall test matrix the error is 5e-11 against an exact
+null-space reference. A dense `pinv(A diag(w)⁻¹)` reference is off by 4e-5 there.
 
 Options read by `solve()` — `setSolution`, `setMaxRefinements`, `setExtendedPrecisionResidual`,
 `setMaxNullSpaceScalars` — take effect on the next solve, including on the column-scaled
@@ -326,7 +352,8 @@ close to the true one (`spmsrtls`, 6.6×).
 | `setMaxRepairs(n)` | 8 | refactorizations verification may spend |
 | `setDenseVerificationLimit(r)` | 24 | R11 order up to which verification uses a dense SVD |
 | `setThoroughVerification(bool)` | off | always run the singular-value iteration, even when the condition-estimate bound already clears the threshold 1000× |
-| `setSolution(Solution)` | `MinimumNorm` | or `Basic` |
+| `setSolution(Solution)` | `MinimumNorm` | `Basic`, or `ColumnScaledMinimumNorm` (see [Weighted minimum norm](#weighted-minimum-norm)) |
+| `setMinimumNormWeights(w)` | none | minimize `‖diag(w) x‖`; empty clears |
 | `setMaxNullSpaceScalars(x)` | 5e7 | largest null-space basis a minimum-norm solve forms |
 | `setMaxRefinements(n)` | 3 | refinement steps per solve (stops early when the correction stalls) |
 | `setExtendedPrecisionResidual(bool)` | on | double-double refinement residuals |

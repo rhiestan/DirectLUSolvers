@@ -1023,6 +1023,195 @@ void testMinimumNormAccuracy() {
   check(worstErr < 1e-13 * worstKappaA, "min-norm accuracy, wide 30x50 (10 seeds): error ~ eps kappa(A)", worstErr);
 }
 
+// argmin ||diag(w) x|| over the least-squares solutions: diag(w)^-1 pinv(A diag(w)^-1) b.
+template <typename Scalar>
+Vec<Scalar> weightedPinvSolve(const Dense<Scalar>& A, const Vec<Scalar>& b, const Eigen::VectorXd& w, double relTol) {
+  const Eigen::VectorXd winv = w.cwiseInverse();
+  const Vec<Scalar> y = pinvSolve<Scalar>(A * winv.cast<Scalar>().asDiagonal(), b, relTol);
+  return winv.cast<Scalar>().asDiagonal() * y;
+}
+
+// Columns rescaled by factors spanning 1e-6..1e6 (not powers of two, so the
+// equilibration cannot absorb them exactly), with exact dependencies so the
+// rank is unambiguous.
+template <typename Scalar>
+Dense<Scalar> deficientWithDependencies(int m, int n, unsigned seed) {
+  Dense<Scalar> Ad(randomSparse<Scalar>(m, n, 0.15, seed));
+  for (int j = 3; j < n; j += 7) Ad.col(j) = Scalar(3.0) * Ad.col(j - 1) - Ad.col(j - 3);
+  return Ad;
+}
+
+Eigen::VectorXd spreadScaling(int n, unsigned seed, double decades = 6.0) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> u(-decades, decades);
+  Eigen::VectorXd d(n);
+  for (int j = 0; j < n; ++j) d[j] = 1.37 * std::pow(10.0, u(rng));
+  return d;
+}
+
+template <typename Scalar>
+void testWeightedMinimumNorm(const char* tag, int m, int n, unsigned seed) {
+  using Eigen::multifrontal_qr::Solution;
+  using Solver = Eigen::MultifrontalQR<Eigen::SparseMatrix<Scalar>>;
+  const std::string t = tag;
+  const Dense<Scalar> Ad = deficientWithDependencies<Scalar>(m, n, seed);
+  const Index rank = numericalRank<Scalar>(Ad, 1e-12);
+  const Eigen::VectorXd d = spreadScaling(n, seed + 1);
+  const Dense<Scalar> ADd = Ad * d.cast<Scalar>().asDiagonal();
+  Eigen::SparseMatrix<Scalar> A = Ad.sparseView(), AD = ADd.sparseView();
+  A.makeCompressed();
+  AD.makeCompressed();
+  // Inconsistent when m > rank: the least-squares solution set is what counts.
+  Vec<Scalar> b(m);
+  std::mt19937 rng(seed + 2);
+  for (int i = 0; i < m; ++i) b[i] = randomScalar<Scalar>(rng);
+
+  Solver qa, qd;
+  qa.setEngine(g_engine);
+  qd.setEngine(g_engine);
+  qa.setSolution(Solution::ColumnScaledMinimumNorm);
+  qd.setSolution(Solution::ColumnScaledMinimumNorm);
+  qa.compute(A);
+  qd.compute(AD);
+  check(qa.rank() == rank && qd.rank() == rank, t + ": rank", double(qa.rank()));
+
+  // Against the dense reference, weights = column norms.
+  Eigen::VectorXd cn(n);
+  for (int j = 0; j < n; ++j) cn[j] = Ad.col(j).norm();
+  const Vec<Scalar> xa = qa.solve(b);
+  const Vec<Scalar> ref = weightedPinvSolve<Scalar>(Ad, b, cn, 1e-12);
+  check(relErr(xa, ref) < 1e-10, t + ": column-scaled == dense weighted pinv", relErr(xa, ref));
+  checkTrue(qa.lastSolveMessage().empty(), t + ": column-scaled, no message");
+
+  // Scale invariance: (A D) gives D^-1 x. Plain minimum norm does not.
+  const Vec<Scalar> xd = qd.solve(b);
+  const Vec<Scalar> xaMapped = d.cwiseInverse().cast<Scalar>().asDiagonal() * xa;
+  check(relErr(xd, xaMapped) < 1e-10, t + ": column-scaled is scale invariant", relErr(xd, xaMapped));
+  qd.setSolution(Solution::MinimumNorm);
+  const Vec<Scalar> xdPlain = qd.solve(b);
+  check(relErr(xdPlain, xaMapped) > 1e-3, t + ": (plain min-norm is not -- the check above is not vacuous)",
+        relErr(xdPlain, xaMapped));
+  // The weighted basis is cached apart from the plain one: no trace of it.
+  Solver fresh;
+  fresh.setEngine(g_engine);
+  fresh.compute(AD);
+  const Vec<Scalar> xFresh = fresh.solve(b);
+  check((xdPlain - xFresh).norm() == 0.0, t + ": plain min-norm after a weighted solve is bit-identical to a fresh one",
+        (xdPlain - xFresh).norm());
+
+  // Explicit weights, under MinimumNorm and overriding ColumnScaledMinimumNorm.
+  // Spread over 1e4 only: the weighted problem's condition grows with the
+  // spread, and so does the error of the dense SVD reference (an exact
+  // null-space reference with 1e12 is in testExtremeWeights).
+  const Eigen::VectorXd w = spreadScaling(n, seed + 3, 2.0);
+  const Vec<Scalar> refW = weightedPinvSolve<Scalar>(Ad, b, w, 1e-12);
+  const auto wErr = [&](const Vec<Scalar>& x) {
+    return (w.cast<Scalar>().asDiagonal() * (x - refW)).norm() / (w.cast<Scalar>().asDiagonal() * refW).norm();
+  };
+  qa.setSolution(Solution::MinimumNorm);
+  qa.setMinimumNormWeights(w);
+  const Vec<Scalar> xw = qa.solve(b);
+  check(wErr(xw) < 1e-11, t + ": explicit weights == dense weighted pinv (W-norm)", wErr(xw));
+  qa.setSolution(Solution::ColumnScaledMinimumNorm);
+  const Vec<Scalar> xw2 = qa.solve(b);
+  check(wErr(xw2) < 1e-11, t + ": explicit weights override column scaling", wErr(xw2));
+  // Least squares, whichever solution was picked: A^H r relative to its
+  // rounding level, which stays meaningful when r itself is at rounding level.
+  const double anorm = Ad.norm();
+  const double opt = (Ad.adjoint() * (Ad * xw - b)).norm() / (anorm * (anorm * xw.norm() + b.norm()));
+  check(opt < 1e-13, t + ": weighted solution is least squares", opt);
+
+  // The null space keeps the original inner product.
+  const Dense<Scalar> N = qa.nullSpace();
+  const double orth = (N.adjoint() * N - Dense<Scalar>::Identity(N.cols(), N.cols())).norm();
+  check(N.cols() == n - rank && orth < 1e-12, t + ": nullSpace() orthonormal in the original inner product", orth);
+  check((Ad * N).norm() < 1e-10 * Ad.norm(), t + ": nullSpace() is a null space", (Ad * N).norm());
+
+  // Unusable weights: plain minimum norm, with a message.
+  qa.setSolution(Solution::MinimumNorm);
+  qa.setMinimumNormWeights(Eigen::VectorXd::Ones(n - 1));
+  const Vec<Scalar> xbad = qa.solve(b);
+  const Vec<Scalar> refA = pinvSolve<Scalar>(Ad, b, 1e-12);
+  checkTrue(!qa.lastSolveMessage().empty(), t + ": wrong-size weights reported");
+  check(relErr(xbad, refA) < 1e-9, t + ": wrong-size weights fall back to plain min-norm", relErr(xbad, refA));
+  Eigen::VectorXd neg = w;
+  neg[n / 2] = -1.0;
+  qa.setMinimumNormWeights(neg);
+  const Vec<Scalar> xneg = qa.solve(b);
+  checkTrue(!qa.lastSolveMessage().empty() && relErr(xneg, refA) < 1e-9, t + ": negative weight reported, plain min-norm");
+  qa.setMinimumNormWeights(Eigen::VectorXd());
+  const Vec<Scalar> xclr = qa.solve(b);
+  checkTrue(qa.lastSolveMessage().empty() && relErr(xclr, refA) < 1e-9, t + ": cleared weights, plain min-norm");
+}
+
+// Weights spanning 1e12 on a tall matrix whose null space is known exactly
+// (the constructed dependencies; the rest has full column rank), so the
+// reference -- min ||W (x_p + N c)|| by a small dense QR -- never factors the
+// badly scaled A W^-1 that a pseudoinverse reference would, and is far more
+// accurate than one. The error must follow the weighted problem's own
+// condition kappa(W N), not grow with the weight spread beyond that.
+void testExtremeWeights() {
+  const int m = 90, n = 50;
+  const Eigen::MatrixXd Ad = deficientWithDependencies<double>(m, n, 311);
+  std::vector<int> deps;
+  for (int j = 3; j < n; j += 7) deps.push_back(j);
+  Eigen::MatrixXd N = Eigen::MatrixXd::Zero(n, Index(deps.size()));
+  for (std::size_t k = 0; k < deps.size(); ++k) {
+    N(deps[k], Index(k)) = 1.0;
+    N(deps[k] - 1, Index(k)) = -3.0;
+    N(deps[k] - 3, Index(k)) = 1.0;
+  }
+  Eigen::SparseMatrix<double> A = Ad.sparseView();
+  A.makeCompressed();
+  const Eigen::VectorXd b = Eigen::VectorXd::LinSpaced(m, -1.0, 2.0);
+  const Eigen::VectorXd xp = Ad.colPivHouseholderQr().solve(b);
+  for (double decades : {3.0, 6.0}) {
+    const Eigen::VectorXd w = spreadScaling(n, 314, decades);
+    const Eigen::MatrixXd WN = w.asDiagonal() * N;
+    const Eigen::VectorXd ref = xp + N * WN.colPivHouseholderQr().solve(-(w.asDiagonal() * xp));
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(WN);
+    const double kappa = svd.singularValues()[0] / svd.singularValues()[svd.singularValues().size() - 1];
+    Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+    qr.setEngine(g_engine);
+    qr.setMinimumNormWeights(w);
+    qr.compute(A);
+    const Eigen::VectorXd x = qr.solve(b);
+    const double err = (w.asDiagonal() * (x - ref)).norm() / (w.asDiagonal() * ref).norm();
+    const std::string tag = "extreme weights, spread 1e" + std::to_string(int(2 * decades));
+    check(qr.rank() == n - Index(deps.size()), tag + ": rank", double(qr.rank()));
+    check(err < 1e-15 * kappa, tag + ": W-norm error ~ eps kappa(W N)", err);
+  }
+}
+
+// Weighted minimum norm through Scaling::Auto's column-scaled fallback (square,
+// singular, inconsistent right-hand side), and Basic ignores the weights.
+void testWeightedMinimumNormFallback() {
+  using Eigen::multifrontal_qr::Solution;
+  const int n = 60;
+  const Eigen::MatrixXd Ad = deficientWithDependencies<double>(n, n, 91);
+  const Eigen::VectorXd d = spreadScaling(n, 92);
+  Eigen::SparseMatrix<double> A = Eigen::MatrixXd(Ad * d.asDiagonal()).sparseView();
+  A.makeCompressed();
+  const Eigen::VectorXd b = Eigen::VectorXd::LinSpaced(n, -1.0, 2.0);
+  Eigen::MultifrontalQR<Eigen::SparseMatrix<double>> qr;
+  qr.setEngine(g_engine);
+  qr.setSolution(Solution::ColumnScaledMinimumNorm);
+  qr.compute(A);
+  const Eigen::VectorXd x = qr.solve(b);
+  checkTrue(qr.scalingUsed() == Eigen::multifrontal_qr::Scaling::RowsAndColumns && !qr.isWeightedLeastSquares(),
+            "weighted fallback: row-scaled factorization, unweighted answer");
+  Eigen::VectorXd cn(n);
+  for (int j = 0; j < n; ++j) cn[j] = Ad.col(j).norm() * d[j];
+  const Eigen::VectorXd ref = weightedPinvSolve<double>(Ad * d.asDiagonal(), b, cn, 1e-12);
+  check(relErr<double>(x, ref) < 1e-9, "weighted fallback: column-scaled == dense weighted pinv", relErr<double>(x, ref));
+  qr.setSolution(Solution::Basic);
+  qr.setMinimumNormWeights(Eigen::VectorXd::Constant(n, 3.0));
+  const Eigen::VectorXd xb = qr.solve(b);
+  double deadNorm = 0.0;
+  for (auto c : qr.deadColumns()) deadNorm += std::abs(xb[c]);
+  checkTrue(deadNorm == 0.0 && qr.lastSolveMessage().empty(), "weighted fallback: Basic ignores the weights");
+}
+
 }  // namespace
 
 void testAutoEngine() {
@@ -1126,6 +1315,12 @@ int main() {
     testLargeFrontParallel();
     testOptionsChangedAfterCompute();
     testMinimumNormAccuracy();
+    std::printf("--- weighted minimum norm ---\n");
+    testWeightedMinimumNorm<double>("weighted wide 40x70", 40, 70, 301);
+    testWeightedMinimumNorm<double>("weighted tall 90x50", 90, 50, 311);
+    testWeightedMinimumNorm<std::complex<double>>("complex weighted wide 30x55", 30, 55, 321);
+    testWeightedMinimumNormFallback();
+    testExtremeWeights();
   }
   std::printf("=== engine selection ===\n");
   testAutoEngine();
