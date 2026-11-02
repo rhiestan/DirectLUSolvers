@@ -141,7 +141,10 @@
 
 #include <algorithm>
 #include <limits>
+#include <climits>
+#include <cmath>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "LeftRightLUConditionEstimate.h"
@@ -286,10 +289,11 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   }
   RealScalar pivotThreshold() const { return m_pivotThreshold; }
 
-  /** Row/column equilibration (Ruiz). On by default and worth keeping on for
-   *  this matrix class: testdata/setfos_2 spans 4e48 in magnitude, where an
-   *  unscaled pivot comparison is meaningless. Folded transparently into
-   *  solve(). */
+  /** Row/column equilibration (Ruiz, by powers of two). On by default and worth
+   *  keeping on for this matrix class: testdata/setfos_2 spans 4e48 in
+   *  magnitude, where an unscaled pivot comparison is meaningless. Every scale
+   *  factor is a power of two, so scaling rounds nothing. Folded transparently
+   *  into solve(). */
   void setEquilibration(bool on) { m_equilibrate = on; }
   bool equilibration() const { return m_equilibrate; }
 
@@ -528,7 +532,42 @@ class PointBlockLU : public SparseSolverBase<PointBlockLU<MatrixType_, OrderingT
   std::vector<Scalar> m_lVal, m_uVal;
   std::vector<Scalar> m_pivotRecorded;  // |pivot| at the time the plan was recorded
 
+  // Equilibration: row i is scaled by m_rowScale[i] == 2^m_rowExp[i], column j
+  // by m_colScale[j] == 2^m_colExp[j]. The exponents drive the sweeps and the
+  // software-scalar path; the RealScalar copies are what a hardware float
+  // multiplies by.
   std::vector<RealScalar> m_rowScale, m_colScale;
+  std::vector<int> m_rowExp, m_colExp;
+  std::vector<int> m_entryExp, m_rowMaxExp, m_colMaxExp;  // scratch for computeScaling()
+
+  // A software scalar (Boost.Multiprecision and the like) shifts its exponent:
+  // much cheaper than a multiprecision multiply, and exact. A hardware float
+  // multiplies by the stored power of two, which is just as exact and faster
+  // than a call to ldexp.
+  static constexpr bool kShiftScaling = !std::is_floating_point<RealScalar>::value;
+  static Scalar shiftByPowerOfTwo(const Scalar& v, int e) {
+    using std::ldexp;
+    if constexpr (NumTraits<Scalar>::IsComplex)
+      return Scalar(ldexp(numext::real(v), e), ldexp(numext::imag(v), e));
+    else
+      return ldexp(v, e);
+  }
+  // v * Dr(i) * Dc(j), v * Dr(i), v * Dc(j) -- all exact.
+  Scalar scaled(const Scalar& v, StorageIndex i, StorageIndex j) const {
+    const std::size_t ui = static_cast<std::size_t>(i), uj = static_cast<std::size_t>(j);
+    if constexpr (kShiftScaling) return shiftByPowerOfTwo(v, m_rowExp[ui] + m_colExp[uj]);
+    else return v * m_rowScale[ui] * m_colScale[uj];
+  }
+  Scalar rowScaled(const Scalar& v, StorageIndex i) const {
+    const std::size_t ui = static_cast<std::size_t>(i);
+    if constexpr (kShiftScaling) return shiftByPowerOfTwo(v, m_rowExp[ui]);
+    else return v * m_rowScale[ui];
+  }
+  Scalar colScaled(const Scalar& v, StorageIndex j) const {
+    const std::size_t uj = static_cast<std::size_t>(j);
+    if constexpr (kShiftScaling) return shiftByPowerOfTwo(v, m_colExp[uj]);
+    else return v * m_colScale[uj];
+  }
 
   // scratch, kept across calls so a replay allocates nothing
   std::vector<Scalar> m_work;
@@ -650,48 +689,92 @@ bool PointBlockLU<MatrixType, OrderingType>::storeInput(const MatrixType& matrix
 template <typename MatrixType, typename OrderingType>
 void PointBlockLU<MatrixType, OrderingType>::computeScaling(const MatrixType& matrix) {
   const StorageIndex n = m_size;
-  m_rowScale.assign(static_cast<std::size_t>(n), RealScalar(1));
-  m_colScale.assign(static_cast<std::size_t>(n), RealScalar(1));
-  if (!m_equilibrate) return;
-
-  // Ruiz equilibration on |A|: iterate row and column scalings towards a matrix
-  // whose rows and columns all have infinity norm 1, so that the pivot
-  // comparison in factorize() is meaningful (testdata/setfos_2 spans 4e48).
-  //
-  // ITERATE TO CONVERGENCE, DO NOT RUN A FIXED COUNT. This runs on every
-  // factorize(), replays included, and the sweep is O(nnz) while the
-  // factorization it is preparing can be far cheaper: on testdata/setfos (a
-  // tridiagonal matrix needing 2050 flops) a fixed eight sweeps WAS 80% of the
-  // whole replay, 97.7 us against 19.1 us with scaling off. A well-scaled matrix
-  // converges in one or two sweeps and should pay for one or two.
-  const RealScalar tolerance = RealScalar(0.1);  // max deviation of any row/col norm from 1
-  const int maxSweeps = 20;
-  std::vector<RealScalar> rowMax(static_cast<std::size_t>(n)), colMax(static_cast<std::size_t>(n));
-  for (int sweep = 0; sweep < maxSweeps; ++sweep) {
-    std::fill(rowMax.begin(), rowMax.end(), RealScalar(0));
-    std::fill(colMax.begin(), colMax.end(), RealScalar(0));
-    for (StorageIndex j = 0; j < n; ++j) {
+  const std::size_t un = static_cast<std::size_t>(n);
+  m_rowExp.assign(un, 0);
+  m_colExp.assign(un, 0);
+  if (m_equilibrate) {
+    // Ruiz equilibration on |A|: iterate row and column scalings towards a
+    // matrix whose rows and columns all have infinity norm near 1, so that the
+    // pivot comparison in factorize() is meaningful (testdata/setfos_2 spans
+    // 4e48).
+    //
+    // BY POWERS OF TWO, IN INTEGER ARITHMETIC. Only the binade of an entry
+    // matters to the sweep, and the binade of a product of powers of two is a
+    // sum of exponents. So each entry's exponent e (|a| in [2^(e-1), 2^e)) is
+    // read once, a row or column maximum is a max over integers, and Ruiz's
+    // division by sqrt(max) becomes a shift by floor(e/2) applied to both the
+    // row and the column -- which takes an entry in [2^(e-1), 2^e) to
+    // [0.5, 2) or one binade short of it. The sweep stops when no exponent
+    // moves, i.e. every row and column maximum lies in [0.5, 2). Nothing is
+    // rounded: not the scale factors, not the scaled matrix, and a software
+    // scalar pays no square roots or multiplies here at all.
+    //
+    // ITERATE TO CONVERGENCE, DO NOT RUN A FIXED COUNT. This runs on every
+    // factorize(), replays included, and the sweep is O(nnz) while the
+    // factorization it is preparing can be far cheaper: on testdata/setfos (a
+    // tridiagonal matrix needing 2050 flops) a fixed eight sweeps of the
+    // floating-point form WAS 80% of the whole replay, 97.7 us against 19.1 us
+    // with scaling off. A well-scaled matrix converges in one or two sweeps and
+    // should pay for one or two.
+    const int kNone = INT_MIN;  // zero or non-finite entry; an empty row/column
+    m_entryExp.clear();
+    m_entryExp.reserve(static_cast<std::size_t>(matrix.nonZeros()));
+    for (StorageIndex j = 0; j < n; ++j)
       for (typename MatrixType::InnerIterator it(matrix, j); it; ++it) {
-        const StorageIndex i = internal::convert_index<StorageIndex>(it.index());
-        const RealScalar v = numext::abs(it.value()) * m_rowScale[i] * m_colScale[j];
-        rowMax[i] = numext::maxi(rowMax[i], v);
-        colMax[j] = numext::maxi(colMax[j], v);
+        const RealScalar a = numext::abs(it.value());
+        int e = kNone;
+        if (a > RealScalar(0) && (numext::isfinite)(a)) {
+          using std::frexp;
+          frexp(a, &e);
+        }
+        m_entryExp.push_back(e);
       }
+    // Halving toward -infinity, so a maximum in [0.25, 0.5) (e = -1) still moves.
+    auto halfDown = [](int e) { return e >= 0 ? e / 2 : -((1 - e) / 2); };
+    const int maxSweeps = 20;
+    for (int sweep = 0; sweep < maxSweeps; ++sweep) {
+      m_rowMaxExp.assign(un, kNone);
+      m_colMaxExp.assign(un, kNone);
+      std::size_t t = 0;
+      for (StorageIndex j = 0; j < n; ++j)
+        for (typename MatrixType::InnerIterator it(matrix, j); it; ++it, ++t) {
+          const int e = m_entryExp[t];
+          if (e == kNone) continue;
+          const std::size_t i = static_cast<std::size_t>(it.index());
+          const int v = e + m_rowExp[i] + m_colExp[static_cast<std::size_t>(j)];
+          m_rowMaxExp[i] = (std::max)(m_rowMaxExp[i], v);
+          m_colMaxExp[static_cast<std::size_t>(j)] = (std::max)(m_colMaxExp[static_cast<std::size_t>(j)], v);
+        }
+      bool moved = false;
+      for (std::size_t i = 0; i < un; ++i)
+        if (m_rowMaxExp[i] != kNone) {
+          const int d = halfDown(m_rowMaxExp[i]);
+          if (d != 0) {
+            m_rowExp[i] -= d;
+            moved = true;
+          }
+        }
+      for (std::size_t j = 0; j < un; ++j)
+        if (m_colMaxExp[j] != kNone) {
+          const int d = halfDown(m_colMaxExp[j]);
+          if (d != 0) {
+            m_colExp[j] -= d;
+            moved = true;
+          }
+        }
+      if (!moved) break;
     }
-    RealScalar deviation = RealScalar(0);
-    for (StorageIndex i = 0; i < n; ++i)
-      if (rowMax[i] > RealScalar(0))
-        deviation = numext::maxi(deviation, numext::abs(RealScalar(1) - rowMax[i]));
-    for (StorageIndex j = 0; j < n; ++j)
-      if (colMax[j] > RealScalar(0))
-        deviation = numext::maxi(deviation, numext::abs(RealScalar(1) - colMax[j]));
-    if (deviation <= tolerance) break;
-
-    for (StorageIndex i = 0; i < n; ++i)
-      if (rowMax[i] > RealScalar(0)) m_rowScale[i] /= numext::sqrt(rowMax[i]);
-    for (StorageIndex j = 0; j < n; ++j)
-      if (colMax[j] > RealScalar(0)) m_colScale[j] /= numext::sqrt(colMax[j]);
   }
+  if (!m_equilibrate) {
+    m_rowScale.assign(un, RealScalar(1));
+    m_colScale.assign(un, RealScalar(1));
+    return;
+  }
+  using std::ldexp;
+  m_rowScale.resize(un);
+  m_colScale.resize(un);
+  for (std::size_t i = 0; i < un; ++i) m_rowScale[i] = ldexp(RealScalar(1), m_rowExp[i]);
+  for (std::size_t j = 0; j < un; ++j) m_colScale[j] = ldexp(RealScalar(1), m_colExp[j]);
 }
 
 // ---------------------------------------------------------------------------
@@ -832,8 +915,7 @@ bool PointBlockLU<MatrixType, OrderingType>::fullFactorize(const MatrixType& mat
       m_work[static_cast<std::size_t>(m_stackXi[static_cast<std::size_t>(p)])] = Scalar(0);
     for (typename MatrixType::InnerIterator it(matrix, col); it; ++it) {
       const StorageIndex i = internal::convert_index<StorageIndex>(it.index());
-      m_work[static_cast<std::size_t>(i)] =
-          it.value() * m_rowScale[static_cast<std::size_t>(i)] * m_colScale[static_cast<std::size_t>(col)];
+      m_work[static_cast<std::size_t>(i)] = scaled(it.value(), i, col);
     }
     for (StorageIndex px = top; px < n; ++px) {
       const StorageIndex j = m_stackXi[static_cast<std::size_t>(px)];  // original row
@@ -970,8 +1052,7 @@ void PointBlockLU<MatrixType, OrderingType>::replayColumn(const MatrixType& matr
   const StorageIndex col = m_colOf[static_cast<std::size_t>(k)];
   for (typename MatrixType::InnerIterator it(matrix, col); it; ++it) {
     const StorageIndex i = internal::convert_index<StorageIndex>(it.index());
-    work[m_pinv[static_cast<std::size_t>(i)]] =
-        it.value() * m_rowScale[static_cast<std::size_t>(i)] * m_colScale[static_cast<std::size_t>(col)];
+    work[m_pinv[static_cast<std::size_t>(i)]] = scaled(it.value(), i, col);
   }
 
   for (StorageIndex p = uBegin; p + 1 < uEnd; ++p) {
@@ -1026,8 +1107,7 @@ template <typename GetB, typename SetX>
 void PointBlockLU<MatrixType, OrderingType>::solveColumn(GetB getB, SetX setX, Scalar* w) const {
   const StorageIndex n = m_size;
   for (StorageIndex i = 0; i < n; ++i)  // w = Pr Dr b; every entry written, no clear needed
-    w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])] =
-        getB(i) * m_rowScale[static_cast<std::size_t>(i)];
+    w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])] = rowScaled(getB(i), i);
 
   for (StorageIndex k = 0; k < n; ++k) {  // unit lower triangular, diagonal first
     const Scalar xk = w[static_cast<std::size_t>(k)];
@@ -1050,7 +1130,7 @@ void PointBlockLU<MatrixType, OrderingType>::solveColumn(GetB getB, SetX setX, S
   }
   for (StorageIndex k = 0; k < n; ++k) {  // x = Dc Pc w
     const StorageIndex j = m_colOf[static_cast<std::size_t>(k)];
-    setX(j, w[static_cast<std::size_t>(k)] * m_colScale[static_cast<std::size_t>(j)]);
+    setX(j, colScaled(w[static_cast<std::size_t>(k)], j));
   }
 }
 
@@ -1065,7 +1145,7 @@ void PointBlockLU<MatrixType, OrderingType>::solveColumnAdjoint(GetB getB, SetX 
   const StorageIndex n = m_size;
   for (StorageIndex k = 0; k < n; ++k) {  // w = Pc^T Dc v
     const StorageIndex j = m_colOf[static_cast<std::size_t>(k)];
-    w[static_cast<std::size_t>(k)] = getB(j) * m_colScale[static_cast<std::size_t>(j)];
+    w[static_cast<std::size_t>(k)] = colScaled(getB(j), j);
   }
   for (StorageIndex k = 0; k < n; ++k) {  // U^H is lower triangular: forward
     const StorageIndex begin = m_uPtr[static_cast<std::size_t>(k)];
@@ -1086,8 +1166,7 @@ void PointBlockLU<MatrixType, OrderingType>::solveColumnAdjoint(GetB getB, SetX 
     if (k == 0) break;  // StorageIndex may be unsigned
   }
   for (StorageIndex i = 0; i < n; ++i)  // r = Dr Pr^T w
-    setX(i, w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])] *
-                m_rowScale[static_cast<std::size_t>(i)]);
+    setX(i, rowScaled(w[static_cast<std::size_t>(m_pinv[static_cast<std::size_t>(i)])], i));
 }
 
 template <typename MatrixType, typename OrderingType>
@@ -1289,9 +1368,12 @@ typename MatrixType::Scalar PointBlockLU<MatrixType, OrderingType>::logAbsDeterm
   RealScalar acc = RealScalar(0);
   for (StorageIndex k = 0; k < m_size; ++k)
     acc += numext::log(numext::abs(m_uVal[static_cast<std::size_t>(m_uPtr[static_cast<std::size_t>(k) + 1] - 1)]));
-  // divide out the (positive) equilibration: log|det A| = log|det A~| - sum log Dr - sum log Dc
+  // divide out the equilibration: log|det A| = log|det A~| - sum log Dr - sum log Dc,
+  // and every scale is a power of two, so the sum is an integer times log 2.
+  long long scaleExp = 0;
   for (StorageIndex i = 0; i < m_size; ++i)
-    acc -= numext::log(m_rowScale[static_cast<std::size_t>(i)]) + numext::log(m_colScale[static_cast<std::size_t>(i)]);
+    scaleExp += (long long)m_rowExp[static_cast<std::size_t>(i)] + m_colExp[static_cast<std::size_t>(i)];
+  if (scaleExp != 0) acc -= RealScalar(scaleExp) * numext::log(RealScalar(2));
   return Scalar(acc);
 }
 

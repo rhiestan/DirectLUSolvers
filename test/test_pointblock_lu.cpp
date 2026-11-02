@@ -357,12 +357,26 @@ void testConditionEstimate() {
 
 void testErrorBoundsCatchWhatTheResidualCannot() {
   std::printf("\n-- an answer that is backward stable and still worthless --\n");
-  // THE case this whole section exists for. At n=80 the bidiagonal's kappa is
-  // ~1e19: the computed x is the exact solution of a system a rounding error
-  // away from A, so its residual is ~1e-14 and every residual check on earth
-  // passes it -- and it is wrong by a factor of 70.
+  // THE case this whole section exists for: the computed x is the exact
+  // solution of a system a rounding error away from A, so its residual is tiny
+  // and every residual check on earth passes it -- and it is wrong.
+  //
+  // The bidiagonal alone has kappa ~1e19 but is no test: it is already
+  // triangular, elimination does nothing, and back substitution can undo the
+  // product that formed b exactly -- the "worthless" answer comes out exact.
+  // Multiplying by a well-conditioned tridiagonal (diagonally dominant,
+  // kappa < 10) with non-dyadic entries keeps kappa ~1e19 but makes partial
+  // pivoting eliminate, and round, for real.
   const int n = 80;
-  const SpMat A = bidiagonal(n, -1.7);
+  std::vector<Eigen::Triplet<double>> tr;
+  for (int i = 0; i < n; ++i) {
+    tr.emplace_back(i, i, 1.0);
+    if (i > 0) tr.emplace_back(i, i - 1, -0.3);
+    if (i < n - 1) tr.emplace_back(i, i + 1, 0.45);
+  }
+  SpMat C(n, n);
+  C.setFromTriplets(tr.begin(), tr.end());
+  const SpMat A = SpMat(bidiagonal(n, -1.7) * C);
   const VectorXd xTrue = irrationalSolution(n);
   const VectorXd b = A * xTrue;
 
@@ -403,6 +417,38 @@ void testErrorBoundsCatchWhatTheResidualCannot() {
                     double(good.lastCorrectDigits()));
   lu_testing::check((wx - wTrue).norm() / wTrue.norm() < 1e-12, "which it deserves",
                     (wx - wTrue).norm() / wTrue.norm());
+}
+
+// Equilibration by powers of two rounds nothing, so on a diagonal matrix the
+// solve is ONE division per entry: x_i must equal b_i / d_i bit for bit, however
+// widely the entries are spread. A scale factor that is not a power of two
+// rounds the scaled pivot and the scaled rhs, and breaks the equality in the
+// last bit on most entries.
+void testEquilibrationRoundsNothing() {
+  std::printf("\n-- equilibration rounds nothing --\n");
+  const int n = 60;
+  std::mt19937 rng(11u);
+  std::uniform_real_distribution<double> mant(1.0, 2.0);
+  std::uniform_int_distribution<int> expo(-500, 500);
+  std::vector<Eigen::Triplet<double>> tr;
+  VectorXd d(n), b(n);
+  for (int i = 0; i < n; ++i) {
+    d[i] = std::ldexp(mant(rng), expo(rng)) * (i % 3 == 0 ? -1.0 : 1.0);
+    b[i] = std::ldexp(mant(rng), expo(rng) / 4);
+    tr.emplace_back(i, i, d[i]);
+  }
+  SpMat A(n, n);
+  A.setFromTriplets(tr.begin(), tr.end());
+  Eigen::PointBlockLU<SpMat> s;
+  s.compute(A);
+  const VectorXd x = s.solve(b);
+  int exact = 0;
+  for (int i = 0; i < n; ++i) exact += (x[i] == b[i] / d[i]);
+  lu_testing::check(exact == n, "x_i == b_i / d_i exactly, entries spread over 2^+-500", double(exact));
+  double logDet = 0.0;
+  for (int i = 0; i < n; ++i) logDet += std::log(std::abs(d[i]));
+  lu_testing::check(std::abs(s.logAbsDeterminant() - logDet) <= 1e-12 * std::abs(logDet),
+                    "log|det| folds the scaling back out", std::abs(s.logAbsDeterminant() - logDet));
 }
 
 void testDefaultPathPaysOnlyForTheResidual() {
@@ -895,6 +941,7 @@ int main() {
   testDeterminant();
   testConditionEstimate();
   testErrorBoundsCatchWhatTheResidualCannot();
+  testEquilibrationRoundsNothing();
   testDefaultPathPaysOnlyForTheResidual();
   testGrowthFactorTracksPivotThreshold();
   testReplayRefreshesTheResidualCheck();

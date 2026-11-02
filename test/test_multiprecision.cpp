@@ -484,6 +484,33 @@ void pointBlockSquare() {
   check(de < kDetTol * eps<T>(), t + ": determinant (error / eps)", de / eps<T>());
 }
 
+// Equilibration by powers of two rounds nothing -- for quad by shifting the
+// exponent, for double by multiplying by an exact power of two. On a diagonal
+// matrix the solve is then one division per entry, so x_i == b_i / d_i exactly.
+template <typename T>
+void pointBlockExactScaling() {
+  const std::string t = tagOf(typeName<T>(), "PointBlockLU diagonal 2^+-500");
+  const int n = 60;
+  std::mt19937 rng(11u);
+  std::uniform_real_distribution<double> mant(1.0, 2.0);
+  std::uniform_int_distribution<int> expo(-500, 500);
+  std::vector<Eigen::Triplet<T>> tr;
+  Vec<T> d(n), b(n);
+  for (int i = 0; i < n; ++i) {
+    using std::ldexp;
+    d[i] = ldexp(T(mant(rng)) / T(3), expo(rng));  // a quad-only tail below double's last bit
+    b[i] = ldexp(T(mant(rng)) / T(7), expo(rng) / 4);
+    tr.emplace_back(i, i, d[i]);
+  }
+  SpMat<T> A(n, n);
+  A.setFromTriplets(tr.begin(), tr.end());
+  Eigen::PointBlockLU<SpMat<T>> lu(A);
+  const Vec<T> x = lu.solve(b);
+  int exact = 0;
+  for (int i = 0; i < n; ++i) exact += (x[i] == T(b[i] / d[i]));
+  check(exact == n, t + ": x_i == b_i / d_i exactly", double(exact));
+}
+
 // Symmetric indefinite: Bunch-Kaufman 2x2 pivots, inertia against a dense
 // eigensolver in the same scalar.
 template <typename T>
@@ -610,6 +637,7 @@ void runOthers() {
   std::printf("--- SupernodalLU / PointBlockLU / SupernodalLDLT / RobustLU <%s> ---\n", typeName<T>());
   supernodalSquare<T>();
   pointBlockSquare<T>();
+  pointBlockExactScaling<T>();
   ldltIndefinite<T>();
   robustLadder<T>();
   robustBeyondDouble<T>();

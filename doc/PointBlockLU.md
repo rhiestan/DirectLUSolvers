@@ -210,7 +210,10 @@ says the machine was steady and the movement was in the compiled layout.
   omission.
 - **No matching and no static pivoting.** Partial pivoting does that job; Ruiz equilibration
   is on by default (`setEquilibration`) and matters — `setfos_2` spans 4e48 in magnitude,
-  where an unscaled pivot comparison is meaningless.
+  where an unscaled pivot comparison is meaningless. Every scale factor is a power of two and
+  the sweeps run on integer exponents, so equilibrating rounds nothing and costs a software
+  scalar no square roots or multiplies; it stops once every row and column maximum lies in
+  [0.5, 2).
 - **`setPivotThreshold(t)`** (default 1.0 = strict partial pivoting) keeps the structural
   diagonal as pivot when `|a_kk| >= t * max|a_ik|`. Lower values mean less fill and a pivot
   sequence that survives refactorization better, at some stability cost — `growthFactor()` is
