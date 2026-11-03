@@ -216,10 +216,10 @@ struct WideSum {
   *
   *   template <> struct ExtendedPrecision<MyQuad> { typedef MyOct type; };
   *
-  * BoostMultiprecisionSupport.h does this for every cpp_bin_float. The
-  * specialization must be visible wherever the solvers are instantiated with
-  * Real -- in every translation unit, or the program has two meanings for one
-  * template. */
+  * BoostMultiprecisionSupport.h does this for every cpp_bin_float, and
+  * MpfixSupport.h for every mpfix::Float. The specialization must be visible
+  * wherever the solvers are instantiated with Real -- in every translation
+  * unit, or the program has two meanings for one template. */
 template <typename Real>
 struct ExtendedPrecision {
   typedef void type;

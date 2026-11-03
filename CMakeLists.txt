@@ -347,6 +347,21 @@ if(DLU_WITH_BOOST_MULTIPRECISION)
   add_dlu_test(test_multiprecision SOURCE test/test_multiprecision.cpp
                LINK Boost::multiprecision LABELS "correctness;multiprecision")
 endif()
+
+# The same checks with mpfix's fixed-size IEEE types (binary128/256/512).
+# Header-only, but C++20, so only this target is raised to it. DLU_MPFIX_DIR
+# defaults to a sibling checkout.
+option(DLU_WITH_MPFIX "Test the solvers with mpfix scalars" OFF)
+if(DLU_WITH_MPFIX)
+  set(DLU_MPFIX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../mpfix" CACHE PATH "mpfix checkout")
+  if(NOT EXISTS "${DLU_MPFIX_DIR}/include/mpfix/float.h")
+    message(FATAL_ERROR "DLU_WITH_MPFIX: no mpfix headers under ${DLU_MPFIX_DIR}/include")
+  endif()
+  add_dlu_test(test_mpfix SOURCE test/test_mpfix.cpp LABELS "correctness;multiprecision")
+  target_include_directories(test_mpfix PRIVATE "${DLU_MPFIX_DIR}/include")
+  target_compile_features(test_mpfix PRIVATE cxx_std_20)
+  set_target_properties(test_mpfix PROPERTIES CXX_STANDARD 20)
+endif()
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 
 # The reader's own unit tests are instant; the registry sweep that follows them

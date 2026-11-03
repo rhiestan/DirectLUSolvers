@@ -1,0 +1,3 @@
+// Eigen-style umbrella include for the mpfix support module.
+// Usage:  #include <MpfixSupport>   (with DirectLUSolvers/src on the include path)
+#include "MpfixSupport.h"

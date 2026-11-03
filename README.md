@@ -118,6 +118,13 @@ RobustLU's acceptance tolerances (`setBackwardErrorTolerance` and friends, defau
 absolute, calibrated on double; tighten them for a wider type if a rung should meet that type's
 accuracy rather than double's.
 
+The same goes for [mpfix](https://github.com/rhiestan/mpfix)'s fixed-size IEEE types
+(`binary128`, `binary256`, `binary512`, C++20): include `<MpfixSupport>` in place of
+`mpfix/eigen.h`. Its residuals accumulate in an `mpfix::Float` of twice the precision, 7.5x
+faster than the emulation for `binary128` (2.8x for `binary512`). `binary128` runs about 5x
+faster than `cpp_bin_float_quad` under clang. `test/test_mpfix.cpp` runs the same checks,
+built with `-DDLU_WITH_MPFIX=ON` (mpfix expected at `../mpfix`, or set `DLU_MPFIX_DIR`).
+
 ## Quick start
 
 ```cpp
@@ -156,6 +163,7 @@ solver.factorize(A2);
 | `src/LeftRightLUConditionEstimate.h` | Hager-Higham 1-norm condition estimation and the Oettli-Prager componentwise backward error — what lets a caller tell a 13-digit answer from a 2-digit one (see [What's different from SupernodalLU](doc/LeftRightLU.md#whats-different-from-supernodallu)). Shared by `LeftRightLU`, `PointBlockLU`, `SupernodalLDLT` and `RobustLU` despite the name. Eigen only. |
 | `src/LeftRightLUExtendedResidual.h` | Double-double (compensated) residuals for iterative refinement — what turns refinement's small *backward* error into a small *forward* one. Portable software arithmetic, not `long double`; a software scalar can name a native wider type instead (`ExtendedPrecision`). Eigen only. |
 | `src/BoostMultiprecisionSupport.h` | Opt-in, requires Boost.Multiprecision: includes the Boost headers the solvers need for a `cpp_bin_float` scalar and specializes `ExtendedPrecision` for it. Umbrella header `#include <BoostMultiprecisionSupport>`. |
+| `src/MpfixSupport.h` | Opt-in, requires mpfix and C++20: includes `mpfix/eigen.h` and specializes `ExtendedPrecision` for every `mpfix::Float`. Umbrella header `#include <MpfixSupport>`. |
 | `src/PointBlockLU.h` | The [unsymmetric-pattern solver](doc/PointBlockLU.md) with refactorization replay. |
 | `src/PointBlockLU` | Umbrella header for `PointBlockLU`, `#include <PointBlockLU>`. |
 | `src/PointBlockOrdering.h` | [`PointBlockOrdering`](doc/PointBlockOrdering.md) — fill-reducing ordering on the node graph, for matrices with several unknowns per grid point. Dependency-free. |
