@@ -1894,36 +1894,59 @@ void MultifrontalQR<MatrixType, Executor>::processFront(Index f, bool intraParal
       const Index p = Index(hTau.size() - h0);
       if (p > 0 && panelEnd < fn) {
         const Index rowsP = reach - k0;
-        V.setZero(rowsP, p);
-        for (Index i = 0; i < p; ++i) {
-          const Index hr = hReach[h0 + std::size_t(i)] - k0;
-          V(i, i) = Scalar(1);
-          if (hr > i + 1) V.col(i).segment(i + 1, hr - i - 1) = F.col(hCol[h0 + std::size_t(i)]).segment(k0 + i + 1, hr - i - 1);
-        }
-        // Apply H_p ... H_1 = (I - V T V^H)^H with T built from the conjugated
-        // coefficients (Eigen's backward block reflector), to fixed-width column
-        // chunks. The chunks are independent, and their width does not depend
-        // on the executor, so a parallel factorization is bit-identical to a
-        // serial one.
-        Map<const Vector> taus(hTau.data() + h0, p);
-        DenseMatrix T(p, p);
-        internal::make_block_householder_triangular_factor(T, V, taus.conjugate());
+        // The trailing columns are updated in fixed-width column chunks. The
+        // chunks are independent, and their width does not depend on the
+        // executor, so a parallel factorization is bit-identical to a serial one.
         const Index trailingCols = fn - panelEnd;
         const Index chunk = kTrailingChunk;
         const Index chunks = (trailingCols + chunk - 1) / chunk;
-        auto update = [&](Index c) {
-          const Index c0 = panelEnd + c * chunk;
-          const Index width = (std::min)(chunk, fn - c0);
-          auto block = F.block(k0, c0, rowsP, width);
-          DenseMatrix tmp(p, width);
-          supernodal_lu::assignProduct(tmp, V.adjoint(), block);
-          tmp = (T.template triangularView<Upper>().adjoint() * tmp).eval();
-          supernodal_lu::subtractProduct(block, V, tmp);
+        auto runChunks = [&](const auto& update) {
+          if (intraParallel && chunks > 1 && double(rowsP) * double(trailingCols) * double(p) > 2e6) {
+            m_executor.parallelFor(0, chunks, update);
+          } else {
+            for (Index c = 0; c < chunks; ++c) update(c);
+          }
         };
-        if (intraParallel && chunks > 1 && double(rowsP) * double(trailingCols) * double(p) > 2e6) {
-          m_executor.parallelFor(0, chunks, update);
-        } else {
-          for (Index c = 0; c < chunks; ++c) update(c);
+        if
+          constexpr(supernodal_lu::UseGemm<Scalar>::value) {
+            // Apply H_p ... H_1 = (I - V T V^H)^H with T built from the
+            // conjugated coefficients (Eigen's backward block reflector).
+            V.setZero(rowsP, p);
+            for (Index i = 0; i < p; ++i) {
+              const Index hr = hReach[h0 + std::size_t(i)] - k0;
+              V(i, i) = Scalar(1);
+              if (hr > i + 1)
+                V.col(i).segment(i + 1, hr - i - 1) = F.col(hCol[h0 + std::size_t(i)]).segment(k0 + i + 1, hr - i - 1);
+            }
+            Map<const Vector> taus(hTau.data() + h0, p);
+            DenseMatrix T(p, p);
+            internal::make_block_householder_triangular_factor(T, V, taus.conjugate());
+            runChunks([&](Index c) {
+              const Index c0 = panelEnd + c * chunk;
+              const Index width = (std::min)(chunk, fn - c0);
+              auto block = F.block(k0, c0, rowsP, width);
+              DenseMatrix tmp(p, width);
+              supernodal_lu::assignProduct(tmp, V.adjoint(), block);
+              tmp = (T.template triangularView<Upper>().adjoint() * tmp).eval();
+              supernodal_lu::subtractProduct(block, V, tmp);
+            });
+          }
+        else {
+          // A software scalar applies H_1, ..., H_p one at a time, each only
+          // down to its own reach. The compact-WY form multiplies the zeros of V
+          // below each reach and adds the T product; without SIMD each of those
+          // costs a full operation (binary128, 100x100 grid: 23% faster).
+          runChunks([&](Index c) {
+            const Index c0 = panelEnd + c * chunk;
+            const Index width = (std::min)(chunk, fn - c0);
+            Vector chunkWork(width);
+            for (Index i = 0; i < p; ++i) {
+              const Index len = hReach[h0 + std::size_t(i)] - (k0 + i);
+              F.block(k0 + i, c0, len, width)
+                  .applyHouseholderOnTheLeft(F.col(hCol[h0 + std::size_t(i)]).segment(k0 + i + 1, len - 1),
+                                             hTau[h0 + std::size_t(i)], chunkWork.data());
+            }
+          });
         }
       }
     }
