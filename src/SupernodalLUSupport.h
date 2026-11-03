@@ -13,10 +13,66 @@
 
 #include <Eigen/SparseCore>
 
+#include <type_traits>
 #include <vector>
 
 namespace Eigen {
 namespace supernodal_lu {
+
+// Dense products in the factorization kernels. Eigen's GEMM packs its operands
+// and blocks for SIMD registers, which pays off for float and double but is
+// pure overhead for a software scalar (Boost.Multiprecision, mpfix): measured
+// on binary128, 20-22 ns per multiply-add against 12 ns for the arithmetic
+// alone. Software scalars take the coefficient-based lazyProduct, which costs
+// about the arithmetic. Hardware types keep the GEMM.
+template <typename Scalar>
+struct UseGemm : std::is_floating_point<typename NumTraits<Scalar>::Real> {};
+
+// dst -= lhs * rhs. dst may be a temporary block expression.
+template <typename Dst, typename Lhs, typename Rhs>
+inline void subtractProduct(Dst&& dst, const Lhs& lhs, const Rhs& rhs) {
+  if
+    constexpr(UseGemm<typename std::decay<Dst>::type::Scalar>::value) dst.noalias() -= lhs * rhs;
+  else
+    dst.noalias() -= lhs.lazyProduct(rhs);
+}
+
+// The lower triangle of dst -= lhs * rhs; the coefficient-based form evaluates
+// only the coefficients it writes.
+template <typename Dst, typename Lhs, typename Rhs>
+inline void subtractProductLower(Dst&& dst, const Lhs& lhs, const Rhs& rhs) {
+  if
+    constexpr(UseGemm<typename std::decay<Dst>::type::Scalar>::value) dst.template triangularView<Lower>() -=
+        lhs * rhs;
+  else
+    dst.template triangularView<Lower>() -= lhs.lazyProduct(rhs);
+}
+
+// tri.solveInPlace<Side>(rhs) for a triangular view tri. Eigen's matrix
+// triangular solve runs its updates through the same GEMM kernel; a software
+// scalar solves one column (OnTheLeft) or row (OnTheRight) at a time instead,
+// which Eigen does without it.
+template <int Side = OnTheLeft, typename TriangularView, typename Rhs>
+inline void triangularSolveInPlace(const TriangularView& tri, Rhs&& rhs) {
+  if
+    constexpr(UseGemm<typename std::decay<Rhs>::type::Scalar>::value) tri.template solveInPlace<Side>(rhs);
+  else if
+    constexpr(Side == OnTheLeft) {
+      for (Index j = 0; j < rhs.cols(); ++j) tri.solveInPlace(rhs.col(j));
+    }
+  else {
+    for (Index i = 0; i < rhs.rows(); ++i) tri.template solveInPlace<OnTheRight>(rhs.row(i));
+  }
+}
+
+// dst = lhs * rhs.
+template <typename Dst, typename Lhs, typename Rhs>
+inline void assignProduct(Dst&& dst, const Lhs& lhs, const Rhs& rhs) {
+  if
+    constexpr(UseGemm<typename std::decay<Dst>::type::Scalar>::value) dst.noalias() = lhs * rhs;
+  else
+    dst.noalias() = lhs.lazyProduct(rhs);
+}
 
 // A supernode is a maximal range of consecutive columns (in the internal,
 // fill-reducing + postordered numbering) that share the same below-diagonal

@@ -1914,9 +1914,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex s
       const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
       const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);
       if (facingRows)
-        targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
+        supernodal_lu::subtractProduct(targetDiag.block(destRow, targetColStart, rowCount, columnCount), lower, facingUpper);
       else
-        targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
+        supernodal_lu::subtractProduct(targetLower.block(destRow, targetColStart, rowCount, columnCount), lower, facingUpper);
     }
   }
 
@@ -1930,7 +1930,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex s
       const StorageIndex columnCount = colBlock.height();
       const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
       const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);
-      targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
+      supernodal_lu::subtractProduct(targetUpper.block(targetColStart, destCol, columnCount, rowCount), facingLower, upper);
     }
   }
 }
@@ -1961,10 +1961,10 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(Sto
       const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
       for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
         const RowBlock& colBlock = m_rowBlocks[cb];
-        targetDiag.block(destRow, colBlock.firstRow - targetFirstColumn, rowBlock.height(),
-                         colBlock.height())
-            .noalias() -= srcLower.block(rowBlock.panelOffset, 0, rowBlock.height(), wSrc) *
-                          srcUpper.block(0, colBlock.panelOffset, wSrc, colBlock.height());
+        supernodal_lu::subtractProduct(
+            targetDiag.block(destRow, colBlock.firstRow - targetFirstColumn, rowBlock.height(), colBlock.height()),
+            srcLower.block(rowBlock.panelOffset, 0, rowBlock.height(), wSrc),
+            srcUpper.block(0, colBlock.panelOffset, wSrc, colBlock.height()));
       }
     }
   }
@@ -1992,9 +1992,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(Sto
         if (a >= b) continue;
         for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
           const RowBlock& colBlock = m_rowBlocks[cb];
-          targetLower.block(a, colBlock.firstRow - targetFirstColumn, b - a, colBlock.height())
-              .noalias() -= srcLower.block(rowBlock.panelOffset + (a - destRow), 0, b - a, wSrc) *
-                            srcUpper.block(0, colBlock.panelOffset, wSrc, colBlock.height());
+          supernodal_lu::subtractProduct(targetLower.block(a, colBlock.firstRow - targetFirstColumn, b - a, colBlock.height()),
+                                         srcLower.block(rowBlock.panelOffset + (a - destRow), 0, b - a, wSrc),
+                                         srcUpper.block(0, colBlock.panelOffset, wSrc, colBlock.height()));
         }
       }
     }
@@ -2021,9 +2021,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(Sto
         if (a >= b) continue;
         for (StorageIndex cb = u.facingRowBlock; cb < lastFacing; ++cb) {
           const RowBlock& colBlock = m_rowBlocks[cb];
-          targetUpper.block(colBlock.firstRow - targetFirstColumn, a, colBlock.height(), b - a)
-              .noalias() -= srcLower.block(colBlock.panelOffset, 0, colBlock.height(), wSrc) *
-                            srcUpper.block(0, rowBlock.panelOffset + (a - destCol), wSrc, b - a);
+          supernodal_lu::subtractProduct(targetUpper.block(colBlock.firstRow - targetFirstColumn, a, colBlock.height(), b - a),
+                                         srcLower.block(colBlock.panelOffset, 0, colBlock.height(), wSrc),
+                                         srcUpper.block(0, rowBlock.panelOffset + (a - destCol), wSrc, b - a));
         }
       }
     }
@@ -2229,11 +2229,11 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storage
     const Index offDiag = static_cast<Index>(m_supernodes[s].offDiagonalRowCount);
     auto lowerSolve = [&](Index start, Index len) {
       auto chunk = lower.middleRows(start, len);
-      diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(chunk);
+      supernodal_lu::triangularSolveInPlace<OnTheRight>(diag.template triangularView<Upper>(), chunk);
     };
     auto upperSolve = [&](Index start, Index len) {
       auto chunk = upper.middleCols(start, len);
-      diag.template triangularView<UnitLower>().solveInPlace(chunk);
+      supernodal_lu::triangularSolveInPlace(diag.template triangularView<UnitLower>(), chunk);
     };
     if (intraParallel) {
       parallelChunks(offDiag, intraChunkRows(offDiag), lowerSolve);

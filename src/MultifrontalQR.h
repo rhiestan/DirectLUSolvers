@@ -1915,9 +1915,10 @@ void MultifrontalQR<MatrixType, Executor>::processFront(Index f, bool intraParal
           const Index c0 = panelEnd + c * chunk;
           const Index width = (std::min)(chunk, fn - c0);
           auto block = F.block(k0, c0, rowsP, width);
-          DenseMatrix tmp = V.adjoint() * block;
+          DenseMatrix tmp(p, width);
+          supernodal_lu::assignProduct(tmp, V.adjoint(), block);
           tmp = (T.template triangularView<Upper>().adjoint() * tmp).eval();
-          block.noalias() -= V * tmp;
+          supernodal_lu::subtractProduct(block, V, tmp);
         };
         if (intraParallel && chunks > 1 && double(rowsP) * double(trailingCols) * double(p) > 2e6) {
           m_executor.parallelFor(0, chunks, update);

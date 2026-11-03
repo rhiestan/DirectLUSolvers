@@ -1534,10 +1534,9 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyUpdate(
       const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
       const auto lower = srcLower.block(rowBlock.panelOffset, 0, rc, wSrc);
       if (rb == cb)  // straddles the diagonal: triangular output
-        targetDiag.block(destRow, targetColStart, rc, cc).template triangularView<Lower>() -=
-            lower * dl;
+        supernodal_lu::subtractProductLower(targetDiag.block(destRow, targetColStart, rc, cc), lower, dl);
       else  // entirely below it: a plain GEMM
-        targetDiag.block(destRow, targetColStart, rc, cc).noalias() -= lower * dl;
+        supernodal_lu::subtractProduct(targetDiag.block(destRow, targetColStart, rc, cc), lower, dl);
     }
 
     // rows below the target's columns -> the target's off-diagonal panel.
@@ -1600,10 +1599,9 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::applyAllUpdatesCh
         const StorageIndex destRow = rowBlock.firstRow - targetFirstColumn;
         const auto lower = srcLower.block(rowBlock.panelOffset, 0, rc, wSrc);
         if (rb == cb)
-          targetDiag.block(destRow, targetColStart, rc, cc).template triangularView<Lower>() -=
-              lower * dl;
+          supernodal_lu::subtractProductLower(targetDiag.block(destRow, targetColStart, rc, cc), lower, dl);
         else
-          targetDiag.block(destRow, targetColStart, rc, cc).noalias() -= lower * dl;
+          supernodal_lu::subtractProduct(targetDiag.block(destRow, targetColStart, rc, cc), lower, dl);
       }
     }
   }
@@ -1690,7 +1688,7 @@ void SupernodalLDLT<MatrixType, UpLo, OrderingType, Executor>::factorizeSupernod
   // concurrently on a level too narrow to fill the pool any other way.
   auto panelSolve = [&](Index start, Index len) {
     auto rows = lower.middleRows(start, len);
-    diag.template triangularView<UnitLower>().adjoint().template solveInPlace<OnTheRight>(rows);
+    supernodal_lu::triangularSolveInPlace<OnTheRight>(diag.template triangularView<UnitLower>().adjoint(), rows);
     for (StorageIndex q = 0; q < w;) {
       if (pivotKind[q] != 2) {
         rows.col(q) /= diag(q, q);

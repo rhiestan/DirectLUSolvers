@@ -1212,9 +1212,9 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
       const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
       const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);  // wSrc x cc
       if (facingRows)  // facing rows -> target diagonal block
-        targetDiag.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
+        supernodal_lu::subtractProduct(targetDiag.block(destRow, targetColStart, rowCount, columnCount), lower, facingUpper);
       else  // below rows -> target lower panel
-        targetLower.block(destRow, targetColStart, rowCount, columnCount).noalias() -= lower * facingUpper;
+        supernodal_lu::subtractProduct(targetLower.block(destRow, targetColStart, rowCount, columnCount), lower, facingUpper);
     }
   }
 
@@ -1230,7 +1230,7 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyUpdate(StorageIndex 
       const StorageIndex columnCount = colBlock.height();
       const StorageIndex targetColStart = colBlock.firstRow - targetFirstColumn;
       const auto facingLower = srcLower.block(colBlock.panelOffset, 0, columnCount, wSrc);  // cc x wSrc
-      targetUpper.block(targetColStart, destCol, columnCount, rowCount).noalias() -= facingLower * upper;
+      supernodal_lu::subtractProduct(targetUpper.block(targetColStart, destCol, columnCount, rowCount), facingLower, upper);
     }
   }
 }
@@ -1263,8 +1263,9 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::applyAllUpdatesChunked(St
       const auto facingUpper = srcUpper.block(0, colBlock.panelOffset, wSrc, columnCount);
       for (StorageIndex rb = u.facingRowBlock; rb < lastFacing; ++rb) {
         const RowBlock& rowBlock = m_rowBlocks[rb];
-        targetDiag.block(rowBlock.firstRow - targetFirstColumn, targetColStart, rowBlock.height(), columnCount)
-            .noalias() -= srcLower.block(rowBlock.panelOffset, 0, rowBlock.height(), wSrc) * facingUpper;
+        supernodal_lu::subtractProduct(
+            targetDiag.block(rowBlock.firstRow - targetFirstColumn, targetColStart, rowBlock.height(), columnCount),
+            srcLower.block(rowBlock.panelOffset, 0, rowBlock.height(), wSrc), facingUpper);
       }
     }
   }
@@ -1446,9 +1447,10 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeDiagonalBlock(
     const StorageIndex trailing = w - panelEnd;
     if (trailing > 0) {
       auto upperRight = diag.block(j0, panelEnd, jb, trailing);  // A12, becomes U12
-      diag.block(j0, j0, jb, jb).template triangularView<UnitLower>().solveInPlace(upperRight);
-      diag.block(panelEnd, panelEnd, trailing, trailing).noalias() -=
-          diag.block(panelEnd, j0, trailing, jb) * upperRight;  // L21 * U12
+      supernodal_lu::triangularSolveInPlace(diag.block(j0, j0, jb, jb).template triangularView<UnitLower>(),
+                                            upperRight);
+      supernodal_lu::subtractProduct(diag.block(panelEnd, panelEnd, trailing, trailing),
+                                     diag.block(panelEnd, j0, trailing, jb), upperRight);  // L21 * U12
     }
   }
 
@@ -1501,12 +1503,12 @@ void SupernodalLU<MatrixType, OrderingType, Executor>::factorizeSupernode(Storag
     const Index offDiag = static_cast<Index>(m_supernodes[s].offDiagonalRowCount);
     auto lowerSolve = [&](Index start, Index len) {
       auto chunk = lower.middleRows(start, len);
-      diag.template triangularView<Upper>().template solveInPlace<OnTheRight>(chunk);
+      supernodal_lu::triangularSolveInPlace<OnTheRight>(diag.template triangularView<Upper>(), chunk);
     };
     // upperFactor := L_kk^{-1} * upperFactor: every COLUMN is independent.
     auto upperSolve = [&](Index start, Index len) {
       auto chunk = upper.middleCols(start, len);
-      diag.template triangularView<UnitLower>().solveInPlace(chunk);
+      supernodal_lu::triangularSolveInPlace(diag.template triangularView<UnitLower>(), chunk);
     };
     if (intraParallel) {
       parallelChunks(offDiag, intraChunkRows(offDiag), lowerSolve);
