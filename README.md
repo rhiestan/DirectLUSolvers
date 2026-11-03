@@ -203,7 +203,9 @@ solver.factorize(A2);
 | `test/test_edge_cases.cpp` | Degenerate sizes (n = 0/1/2, diagonal-only, single dense supernode), the refactorize workflow, zero right-hand side, and a cross-solver differential. |
 | `test/test_regression.cpp` | Fill/accuracy regression suite, checked against `test/baselines/testdata.baseline`. See [Fill regression baselines](doc/Testing.md#fill-regression-baselines). |
 | `test/test_suitesparse.cpp` | Correctness sweep over the curated SuiteSparse corpus, including matrices these solvers cannot handle. See [The SuiteSparse corpus](doc/Testing.md#the-suitesparse-corpus). |
-| `test/matrices/fetch_suitesparse.py` | Downloads the corpus named by `suitesparse.manifest` into a git-ignored `cache/`. No third-party dependency. |
+| `test/matrices/suitesparse/` | The SuiteSparse corpus, one `<Group>/<Name>.tar.gz` per matrix (19 MB, CC BY 4.0, see its README). CMake unpacks it into a git-ignored `cache/` at configure time. |
+| `test/matrices/fetch_suitesparse.py` | Maintains the corpus: `--pack` writes the archives from `cache/`; `--list`, `--verify`, `--propose`. No third-party dependency. |
+| `test/matrices/recompress_archives.py` | Recompresses the archives with AdvanceCOMP's `advdef -z -4` (zopfli; still plain gzip, ~14% smaller), checking the content is unchanged. |
 | `test/matrices/suitesparse.manifest` | The checked-in, human-curated corpus definition. |
 | `test/compare_testdata.cpp` | Benchmark harness comparing SupernodalLU (AMD/METIS/Auto) and LeftRightLU against `Eigen::SparseLU` and, optionally, MKL PARDISO, on the matrices in `testdata/`. |
 | `test/bench_setfos_samples.cpp` | Every solver here plus Eigen's direct and iterative ones over the `setfosmatrices_samples/` category corpus; raw rows to `analysis/benchmark_results.csv`. See [Which solver per matrix family](doc/Testing.md#which-solver-per-matrix-family). |

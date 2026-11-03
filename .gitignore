@@ -10,7 +10,10 @@ CMakeFiles/
 compile_commands.json
 .cache/
 
-# Downloaded matrix corpora (fetched on demand, never committed)
+# Unpacked matrix corpora (CMake extracts test/matrices/suitesparse/ into cache/)
 test/matrices/cache/
 *.mtx.gz
 /analysis/benchmark_results.csv
+
+# Python bytecode
+__pycache__/

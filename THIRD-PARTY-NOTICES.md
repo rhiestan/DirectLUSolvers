@@ -25,7 +25,7 @@ draws throughout is between:
 | [Intel oneMKL](https://www.intel.com/oneMKL) (PARDISO) | Intel proprietary | **Optional, test-only.** `compare_testdata.cpp` benchmarks against MKL PARDISO when `DLU_WITH_PARDISO=ON`. Not required to build or use the solvers. |
 | [oneTBB](https://github.com/uxlfoundation/oneTBB) | Apache-2.0 | **Optional.** `SupernodalLUExecutorTBB.h` forwards `parallelFor` to `oneapi::tbb::parallel_for`. Linked, never vendored. |
 | OpenMP runtime | per toolchain (LLVM: Apache-2.0 WITH LLVM-exception) | **Optional.** `SupernodalLUExecutorOpenMP.h` uses `#pragma omp` and `<omp.h>`. |
-| [SuiteSparse Matrix Collection](https://sparse.tamu.edu) | per matrix; the collection is freely redistributable for research | **Test data, not distributed here.** `test/matrices/suitesparse.manifest` names matrices; `fetch_suitesparse.py` downloads them into a git-ignored cache. No matrix data is committed. |
+| [SuiteSparse Matrix Collection](https://sparse.tamu.edu) | CC BY 4.0 (`test/matrices/CC-BY_4.0_License.txt`) | **Test data, distributed here.** The 38 matrices named by `test/matrices/suitesparse.manifest` are checked in under `test/matrices/suitesparse/`, repackaged to hold only the `.mtx` file of each; attribution, citation and the changes made are in `test/matrices/suitesparse/README.md`. Used by the tests only, never by the solvers. |
 
 ## Algorithmic lineage
 

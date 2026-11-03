@@ -9,8 +9,9 @@
 # synthetic and needs no external matrices, which is exactly the subset CI runs
 # on every push. It completes in a few seconds.
 #
-# The SuiteSparse corpus is different -- it is *downloadable*, so a scheduled job
-# fetches it and runs the real-matrix suites: correctness, serial-vs-parallel
+# The SuiteSparse corpus is different -- it is checked in (test/matrices/
+# suitesparse/, unpacked by CMake at configure time), so a scheduled job runs
+# the real-matrix suites on it: correctness, serial-vs-parallel
 # consistency, and the FILL REGRESSION. That last one matters more than its
 # label suggests. test_regression is tagged `testdata` for the matrices that
 # live outside this repository, but its rows for the downloadable corpus need
@@ -102,7 +103,7 @@ jobs:
   suitesparse:
     name: SuiteSparse corpus
     runs-on: ubuntu-latest
-    # Downloads ~59 MB and takes a couple of minutes, so not on every push.
+    # Takes a couple of minutes, so not on every push.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
@@ -111,17 +112,6 @@ jobs:
         run: |
           git clone --filter=blob:none https://gitlab.com/libeigen/eigen.git eigen-src
           cd eigen-src && git checkout ${{ env.EIGEN_COMMIT }}
-
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.x' }
-
-      # The manifest is checked in; the matrices are not. Verify the manifest
-      # still matches the live collection before trusting a download.
-      - name: Verify manifest against the live index
-        run: python test/matrices/fetch_suitesparse.py --verify
-
-      - name: Fetch corpus
-        run: python test/matrices/fetch_suitesparse.py --tier quick
 
       - name: Configure and build
         run: |
@@ -134,7 +124,7 @@ jobs:
       # The whole `suitesparse` label, not just test_suitesparse: that also
       # covers test_parallel_consistency_corpus, which runs both solvers'
       # intra-supernode parallelism against their serial selves on real
-      # matrices. It needs no data this job has not already fetched.
+      # matrices.
       - name: Correctness sweep
         run: ctest --test-dir build -L suitesparse --output-on-failure
 
@@ -142,7 +132,7 @@ jobs:
       # and it was the one that caught the standard-library tie-order bug in
       # the matching -- on a developer's machine, because nothing ran it here.
       # It is labelled `testdata` for the matrices that live outside this
-      # repository; those rows report themselves as skipped, and the ~18
-      # corpus matrices fetched above are checked.
+      # repository; those rows report themselves as skipped, and the corpus
+      # rows are checked.
       - name: Fill regression on the corpus
         run: ctest --test-dir build -R '^test_regression$' --output-on-failure

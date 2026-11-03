@@ -234,8 +234,8 @@ std::vector<Case> buildCases() {
   // which is what a symmetrization or ordering mistake actually moves, was
   // pinned nowhere.
   //
-  // Gated on psym and on availability: the files are downloaded on demand
-  // (test/matrices/fetch_suitesparse.py), so a checkout without them just
+  // Gated on psym and on availability: CMake unpacks the checked-in corpus,
+  // and with DLU_UNPACK_SUITESPARSE=OFF a build without it just
   // measures fewer rows, and --update's merge keeps the rest of the baseline
   // instead of deleting it.
   for (const lu_testing::SuiteSparseMatrix& m : lu_testing::suitesparseMatrices()) {

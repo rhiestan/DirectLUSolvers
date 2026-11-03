@@ -439,9 +439,41 @@ if(DLU_WITH_METIS)
                              "${CMAKE_CURRENT_SOURCE_DIR}/../METIS/libmetis")
 endif()
 
-# SuiteSparse corpus sweep. The matrices are fetched on demand into a git-ignored
-# cache (test/matrices/fetch_suitesparse.py); with nothing downloaded the suite
-# reports how to get them and passes, so this is safe to register unconditionally.
+# The SuiteSparse corpus is checked in as test/matrices/suitesparse/<Group>/
+# <Name>.tar.gz (CC BY 4.0, see the README there) and unpacked here into the
+# git-ignored test/matrices/cache/, where the suites read it. Only archives
+# newer than their unpacked matrix are extracted, so reconfiguring is cheap, and
+# a changed or added archive triggers the next reconfigure by itself.
+option(DLU_UNPACK_SUITESPARSE "Unpack the checked-in SuiteSparse corpus at configure time" ON)
+if(DLU_UNPACK_SUITESPARSE)
+  set(_dlu_corpus "${CMAKE_CURRENT_SOURCE_DIR}/test/matrices")
+  file(GLOB _dlu_archives CONFIGURE_DEPENDS "${_dlu_corpus}/suitesparse/*/*.tar.gz")
+  set(_dlu_unpacked 0)
+  foreach(_archive IN LISTS _dlu_archives)
+    get_filename_component(_group_dir "${_archive}" DIRECTORY)
+    get_filename_component(_group "${_group_dir}" NAME)
+    get_filename_component(_name "${_archive}" NAME)
+    string(REGEX REPLACE "\\.tar\\.gz$" "" _name "${_name}")
+    set(_dest "${_dlu_corpus}/cache/${_group}")
+    set(_mtx "${_dest}/${_name}/${_name}.mtx")
+    if(NOT EXISTS "${_mtx}" OR "${_archive}" IS_NEWER_THAN "${_mtx}")
+      file(MAKE_DIRECTORY "${_dest}")
+      execute_process(COMMAND "${CMAKE_COMMAND}" -E tar xzf "${_archive}"
+                      WORKING_DIRECTORY "${_dest}" RESULT_VARIABLE _rc)
+      if(NOT _rc EQUAL 0 OR NOT EXISTS "${_mtx}")
+        message(FATAL_ERROR "Could not unpack ${_archive} to ${_mtx}")
+      endif()
+      file(TOUCH "${_mtx}")  # the tar entries carry a 1970 timestamp
+      math(EXPR _dlu_unpacked "${_dlu_unpacked} + 1")
+    endif()
+  endforeach()
+  list(LENGTH _dlu_archives _dlu_count)
+  message(STATUS "SuiteSparse corpus: ${_dlu_count} matrices, ${_dlu_unpacked} unpacked now")
+endif()
+
+# SuiteSparse corpus sweep. With the corpus absent (DLU_UNPACK_SUITESPARSE=OFF)
+# the suite reports what is missing and passes, so it is registered
+# unconditionally.
 add_dlu_test(test_mc64         SOURCE test/test_mc64.cpp         LABELS "quick;correctness")
 add_dlu_test(test_scalar_types SOURCE test/test_scalar_types.cpp LABELS "quick;correctness")
 

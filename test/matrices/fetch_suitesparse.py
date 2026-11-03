@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
-"""Fetch the curated SuiteSparse corpus for the DirectLUSolvers test suites.
+"""Maintain the curated SuiteSparse corpus for the DirectLUSolvers test suites.
 
-The corpus is defined by `suitesparse.manifest` (checked in, human-curated) and
-downloaded into `cache/` (git-ignored). Nothing here is automatic: adding a
-matrix to the suite means adding a line to the manifest, deliberately.
+The corpus is defined by `suitesparse.manifest` (checked in, human-curated). The
+matrices themselves are checked in too, under `suitesparse/<Group>/<Name>.tar.gz`
+(each holding only `<Name>/<Name>.mtx`), because the collection's server no
+longer allows scripted downloads. CMake unpacks them into the git-ignored
+`cache/` at configure time, where the suites read them; nothing here is needed
+for that.
 
-    python fetch_suitesparse.py                # download everything missing
-    python fetch_suitesparse.py --tier quick   # only the small/fast tier
-    python fetch_suitesparse.py --list         # show the manifest, mark cached
+    python fetch_suitesparse.py --list         # show the manifest, mark cached/packed
+    python fetch_suitesparse.py --pack         # cache/ -> suitesparse/*.tar.gz
+    python fetch_suitesparse.py --download     # fetch missing matrices into cache/
     python fetch_suitesparse.py --verify       # check manifest vs the live index
     python fetch_suitesparse.py --propose 20   # suggest new candidates to add
 
-DEPENDENCIES: none. Downloading uses only the standard library, because the
-SuiteSparse URL scheme is stable and a test corpus should not need a pip install
-to reproduce. `ssgetpy` is used only by --propose, and only if it is installed;
-without it --propose falls back to the collection's own ssstats.csv index, which
-is what the curation was actually done from.
+Adopting a matrix: add its manifest line, put `<Name>.mtx` under
+`cache/<Group>/<Name>/` (from the collection's web page, or --download where the
+server still allows it), run --pack, then recompress_archives.py on the new
+archive, and commit it. --download,
+--verify and --propose need network access to sparse.tamu.edu.
+
+The matrices are from the SuiteSparse Matrix Collection, licensed CC BY 4.0
+(see CC-BY_4.0_License.txt and suitesparse/README.md).
+
+DEPENDENCIES: none beyond the standard library. `ssgetpy` is used only by
+--propose, and only if it is installed; without it --propose falls back to the
+collection's own ssstats.csv index, which is what the curation was done from.
 """
 
 import argparse
 import csv
+import gzip
 import io
 import os
 import sys
@@ -29,6 +40,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(HERE, "suitesparse.manifest")
 CACHE = os.path.join(HERE, "cache")
+PACKED = os.path.join(HERE, "suitesparse")
 
 INDEX_URL = "https://sparse.tamu.edu/files/ssstats.csv"
 MM_URL = "https://sparse.tamu.edu/MM/{group}/{name}.tar.gz"
@@ -59,6 +71,14 @@ class Entry:
     @property
     def cached(self):
         return os.path.isfile(self.mtx_path)
+
+    @property
+    def archive_path(self):
+        return os.path.join(PACKED, self.group, self.name + ".tar.gz")
+
+    @property
+    def packed(self):
+        return os.path.isfile(self.archive_path)
 
 
 def read_manifest(path=MANIFEST):
@@ -103,6 +123,47 @@ def download(entry, force=False):
     if not entry.cached:
         raise RuntimeError(f"expected {entry.mtx_path} after extracting {url}")
     return f"{len(blob) / 1e6:.1f} MB"
+
+
+# --------------------------------------------------------------------------
+# Pack (cache/ -> the checked-in archives)
+# --------------------------------------------------------------------------
+
+def pack(entry):
+    """Write suitesparse/<Group>/<Name>.tar.gz holding only <Name>/<Name>.mtx.
+
+    Deterministic -- fixed timestamps, owner and mode, no gzip file name. An
+    existing archive with the same content is left alone, so re-packing never
+    undoes recompress_archives.py, and git sees nothing for unchanged matrices.
+    """
+    with open(entry.mtx_path, "rb") as fh:
+        data = fh.read()
+    info = tarfile.TarInfo(f"{entry.name}/{entry.name}.mtx")
+    info.size, info.mtime, info.mode = len(data), 0, 0o644
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    tar = io.BytesIO()
+    with tarfile.open(fileobj=tar, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        tf.addfile(info, io.BytesIO(data))
+    if entry.packed:
+        with gzip.open(entry.archive_path, "rb") as old:
+            if old.read() == tar.getvalue():
+                return f"{os.path.getsize(entry.archive_path) / 1e6:.1f} MB, unchanged"
+    os.makedirs(os.path.dirname(entry.archive_path), exist_ok=True)
+    with open(entry.archive_path, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as gz:
+            gz.write(tar.getvalue())
+    return f"{os.path.getsize(entry.archive_path) / 1e6:.1f} MB"
+
+
+def cmd_pack(entries):
+    missing = [e.label for e in entries if not e.cached]
+    if missing:
+        print(f"not in cache/, cannot pack: {', '.join(missing)}")
+    for e in entries:
+        if e.cached:
+            print(f"  {e.label} ... {pack(e)}")
+    return 1 if missing else 0
 
 
 # --------------------------------------------------------------------------
@@ -200,7 +261,9 @@ def main():
     ap.add_argument("--list", action="store_true", help="show the manifest and exit")
     ap.add_argument("--verify", action="store_true", help="check manifest against the live index")
     ap.add_argument("--propose", type=int, metavar="N", help="suggest N candidates to add")
-    ap.add_argument("--force", action="store_true", help="re-download even if cached")
+    ap.add_argument("--pack", action="store_true", help="write the checked-in archives from cache/")
+    ap.add_argument("--download", action="store_true", help="fetch missing matrices from sparse.tamu.edu")
+    ap.add_argument("--force", action="store_true", help="with --download: re-download even if cached")
     args = ap.parse_args()
 
     entries = read_manifest()
@@ -210,15 +273,20 @@ def main():
         entries = [e for e in entries if TIERS.index(e.tier) <= limit]
 
     if args.list:
-        print(f"{'group/name':<34} {'tier':<9} {'n':>8} {'nnz':>10} {'psym':>6} {'cached':>7}")
+        print(f"{'group/name':<34} {'tier':<9} {'n':>8} {'nnz':>10} {'psym':>6} {'cached':>7} {'packed':>7}")
         for e in entries:
             print(f"{e.label:<34} {e.tier:<9} {e.n:>8} {e.nnz:>10} {e.psym:>6.2f} "
-                  f"{'yes' if e.cached else 'no':>7}")
+                  f"{'yes' if e.cached else 'no':>7} {'yes' if e.packed else 'no':>7}")
         return 0
+    if args.pack:
+        return cmd_pack(entries)
     if args.verify:
         return cmd_verify(entries)
     if args.propose:
         return cmd_propose(entries, args.propose)
+    if not args.download:
+        ap.print_help()
+        return 0
 
     missing = [e for e in entries if args.force or not e.cached]
     if not missing:
@@ -238,8 +306,7 @@ def main():
     if failed:
         print(f"\n{len(failed)} download(s) failed: {', '.join(failed)}")
         return 1
-    print("\nDone. The C++ suites pick these up automatically; run:")
-    print("  ctest --test-dir build -R test_suitesparse --output-on-failure")
+    print("\nDone. Run --pack to write the archives to commit.")
     return 0
 
 

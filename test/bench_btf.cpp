@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
   std::printf("Block triangular form: on vs off, %zu matrices, best of %d after a warm-up\n",
               corpus.size(), opt.reps);
   if (corpus.empty()) {
-    std::printf("Nothing to measure. Run with --quick, or fetch the corpora:\n"
-                "  python test/matrices/fetch_suitesparse.py\n");
+    std::printf("Nothing to measure. Run with --quick, or unpack the corpus:\n"
+                "  reconfigure with DLU_UNPACK_SUITESPARSE=ON\n");
     return 0;
   }
 

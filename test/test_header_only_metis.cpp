@@ -248,7 +248,7 @@ void checkSuiteSparseCorpus() {
   int present = 0;
   for (const auto& m : matrices) present += m.available ? 1 : 0;
   note("SuiteSparse corpus: " + std::to_string(present) + " of " + std::to_string(matrices.size()) +
-       " matrices downloaded (run fetch_suitesparse.py for the rest)");
+       " matrices unpacked (reconfigure with DLU_UNPACK_SUITESPARSE=ON for the rest)");
   for (const auto& m : matrices) {
     if (!m.available) continue;
     try {

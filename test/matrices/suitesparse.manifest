@@ -1,11 +1,11 @@
 # Curated SuiteSparse Matrix Collection corpus for DirectLUSolvers.
 #
-# Download with:  python fetch_suitesparse.py
-# Consumed by:    test/test_suitesparse.cpp  (via testing/TestData.h)
+# Consumed by:  test/test_suitesparse.cpp and others (via testing/TestData.h)
 #
-# The files themselves live in cache/ and are NOT committed. This manifest is,
-# so the corpus is reproducible: SuiteSparse matrices are immutable, so a given
-# line always denotes the same matrix.
+# The matrices are checked in as suitesparse/<Group>/<Name>.tar.gz (CC BY 4.0,
+# see suitesparse/README.md) and unpacked by CMake into the git-ignored cache/.
+# SuiteSparse matrices are immutable, so a given line always denotes the same
+# matrix.
 #
 # WHY THESE MATRICES
 #
@@ -30,7 +30,9 @@
 #   standard  larger; run on demand
 #   large     big enough to need real time/memory
 #
-# Add candidates with:  python fetch_suitesparse.py --propose 20
+# Find candidates with:  python fetch_suitesparse.py --propose 20
+# Adopt one: add its line, put its .mtx in cache/, run --pack, then
+# recompress_archives.py, and commit the archive.
 # Check the metadata is still accurate:  python fetch_suitesparse.py --verify
 #
 # group name tier n nnz psym spd kind

@@ -505,7 +505,7 @@ void testCorpus() {
   for (const auto& m : all)
     if (m.available && m.tier == lu_testing::Tier::Small) ++present;
   if (present == 0) {
-    note("corpus not downloaded -- skipping (run python test/matrices/fetch_suitesparse.py)");
+    note("corpus not unpacked -- skipping (reconfigure with DLU_UNPACK_SUITESPARSE=ON)");
     return;
   }
 

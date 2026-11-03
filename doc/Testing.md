@@ -18,8 +18,8 @@ ctest --test-dir build --output-on-failure
 data, a few seconds — while the remainder reads the benchmark matrices and takes
 substantially longer. That split is what makes CI possible: **Eigen and
 `testdata/` live outside this repository**, so `.github/workflows/ci.yml` runs
-the `quick` label on every push (gcc, clang, MSVC) and a scheduled job fetches
-the SuiteSparse corpus for a real-matrix sweep.
+the `quick` label on every push (gcc, clang, MSVC) and a scheduled job runs a
+real-matrix sweep over the checked-in SuiteSparse corpus.
 
 CI **pins Eigen to an exact commit**, deliberately. The fill baselines below
 depend on the fill-reducing ordering, which comes from Eigen's AMD
@@ -116,22 +116,35 @@ handle well — because the interesting question is not "does it solve" but "doe
 it behave correctly when it cannot".
 
 ```sh
-python test/matrices/fetch_suitesparse.py     # download (~59 MB, once)
 ctest --test-dir build -R test_suitesparse --output-on-failure
 ```
 
-The fetch script needs **no third-party package** — the SuiteSparse URL scheme
-is stable, so plain `urllib` suffices and reproducing the corpus never depends
-on a `pip install`. (`ssgetpy` is consulted only by `--propose`, and only if
-installed.) `suitesparse.manifest` is checked in and human-curated; the matrices
-themselves land in a git-ignored `cache/`. Because SuiteSparse matrices are
-immutable, a manifest line always denotes the same matrix.
+The corpus is **checked in**: one `test/matrices/suitesparse/<Group>/<Name>.tar.gz`
+per matrix, 19 MB in all, under the collection's CC BY 4.0 license (attribution
+in [`test/matrices/suitesparse/README.md`](../test/matrices/suitesparse/README.md)).
+The collection's server no longer allows scripted downloads, so a corpus fetched
+at test time cannot be relied on. CMake unpacks the archives into the git-ignored
+`test/matrices/cache/` at configure time (`DLU_UNPACK_SUITESPARSE`, on by
+default), extracting only what is new. `suitesparse.manifest` is the
+human-curated definition; SuiteSparse matrices are immutable, so a manifest line
+always denotes the same matrix.
+
+`fetch_suitesparse.py` maintains the corpus and needs **no third-party
+package**. (`ssgetpy` is consulted only by `--propose`, and only if installed.)
 
 ```sh
 python test/matrices/fetch_suitesparse.py --list        # what's in the corpus
+python test/matrices/fetch_suitesparse.py --pack        # cache/ -> the archives
 python test/matrices/fetch_suitesparse.py --verify      # manifest vs live index
 python test/matrices/fetch_suitesparse.py --propose 20  # candidates to adopt
 ```
+
+To adopt a matrix, add its manifest line, place its `.mtx` under
+`cache/<Group>/<Name>/`, run `--pack`, then
+`python test/matrices/recompress_archives.py` (AdvanceCOMP's `advdef -z -4`: still
+gzip, ~14% smaller; `--pack` leaves an archive with unchanged content alone, so it
+never undoes this), and commit the new archive. `--verify`,
+`--propose` and `--download` need sparse.tamu.edu to answer scripted requests.
 
 **The contract being tested.** A solver may solve accurately, may refuse to
 factor, or may return a bad answer *it has itself flagged* — but must never

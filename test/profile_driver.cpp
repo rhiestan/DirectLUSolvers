@@ -208,7 +208,7 @@ int main(int argc, char** argv) {
     selected.push_back(m);
   }
   if (selected.empty()) {
-    std::printf("No matrices selected (downloaded corpus empty?).\n");
+    std::printf("No matrices selected (corpus not unpacked?).\n");
     return 1;
   }
 

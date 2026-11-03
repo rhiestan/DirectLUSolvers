@@ -1,8 +1,7 @@
 // Correctness sweep over the curated SuiteSparse corpus.
 //
-// Setup (once):
-//   python test/matrices/fetch_suitesparse.py
-// Then:
+// The corpus is checked in (test/matrices/suitesparse/) and CMake unpacks it at
+// configure time. Run:
 //   ctest --test-dir build -R test_suitesparse --output-on-failure
 //
 // WHY THIS EXISTS
@@ -33,8 +32,8 @@
 // contract the README claims, and before this suite existed nothing tested it
 // on matrices that actually break the solvers.
 //
-// The corpus is OPTIONAL: with nothing downloaded the suite reports how to get
-// it and passes, so a fresh checkout is not broken by a missing download.
+// With the corpus not unpacked (DLU_UNPACK_SUITESPARSE=OFF) the suite reports
+// how to get it and passes.
 
 #include <Eigen/SparseCore>
 
@@ -155,13 +154,13 @@ int main(int argc, char** argv) {
 
   long long present = 0;
   for (const auto& m : selected) present += m.available ? 1 : 0;
-  std::printf("  %lld of %zu matrices in this tier are downloaded", present, selected.size());
+  std::printf("  %lld of %zu matrices in this tier are unpacked", present, selected.size());
   if (present < static_cast<long long>(selected.size()))
-    std::printf(" -- run: python test/matrices/fetch_suitesparse.py");
+    std::printf(" -- reconfigure with DLU_UNPACK_SUITESPARSE=ON");
   std::printf("\n  fill guard: %lld scalars per solver\n\n", kFillLimit);
 
   if (present == 0) {
-    std::printf("Corpus not downloaded; skipping (this is not a failure).\n");
+    std::printf("Corpus not unpacked; skipping (this is not a failure).\n");
     return lu_testing::summarize("SuiteSparse");
   }
 

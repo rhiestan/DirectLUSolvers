@@ -24,7 +24,7 @@
 #endif
 
 #ifndef DLU_MATRIX_DIR
-// Where fetch_suitesparse.py keeps the manifest and its cache/ directory.
+// Where the manifest lives, and the cache/ directory CMake unpacks the corpus into.
 #define DLU_MATRIX_DIR "DirectLUSolvers/test/matrices"
 #endif
 
@@ -103,17 +103,16 @@ inline std::vector<std::string> benchmarkPaths(Tier maxTier) {
 }
 
 // ---------------------------------------------------------------------------
-//  SuiteSparse corpus (optional, downloaded on demand)
+//  SuiteSparse corpus
 // ---------------------------------------------------------------------------
 //
 // test/matrices/suitesparse.manifest is a checked-in, human-curated list; the
-// .mtx files it names are fetched by fetch_suitesparse.py into a git-ignored
-// cache/. The manifest is read at RUN time, not baked in at configure time, so
+// .mtx files it names are checked in as test/matrices/suitesparse/*.tar.gz and
+// unpacked by CMake into a git-ignored cache/. The manifest is read at RUN time, not baked in at configure time, so
 // adopting a matrix is a one-line edit with no rebuild.
 //
-// Entries whose file has not been downloaded are still returned, with
-// `available == false`, so a suite can report "3 of 26 present, run the fetch
-// script" rather than silently testing less than the reader assumes.
+// Entries whose file has not been unpacked are still returned, with
+// `available == false`, so a suite can report "3 of 26 present" rather than silently testing less than the reader assumes.
 
 struct SuiteSparseMatrix {
   std::string group;
@@ -125,7 +124,7 @@ struct SuiteSparseMatrix {
   bool positiveDefinite = false;
   std::string kind;
   std::string path;        // absolute path to the .mtx
-  bool available = false;  // has it actually been downloaded?
+  bool available = false;  // is its .mtx actually in cache/?
 
   std::string label() const { return group + "/" + name; }
 };
