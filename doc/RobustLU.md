@@ -51,6 +51,9 @@ So the class does not climb. It measures, diagnoses, and jumps:
 | `matchingIsPerfect() == false` | structurally singular | **rank-revealing QR** — no LU exists to try |
 | ω, residual fine; κ·eps ∈ [1e-3, 1) | losing digits, recoverable | extended-residual **re-solve** (no refactor) |
 | ω, residual fine; κ·eps ≥ 1 | the matrix, not the solver | **stop**, flagged |
+
+The two κ rows apply to whichever LU rung brought ω down — the first, MC64 or partial
+pivoting — not only to the first.
 | ω ≫ eps | the diagonal was unusable | **MC64** matching |
 | ω ≫ eps after MC64 | in-block pivoting insufficient | **true partial pivoting** via `PointBlockLU` |
 | every LU rung failed | numerical rank, not structure | **rank-revealing QR** — least squares + a rank |
@@ -152,7 +155,7 @@ scalars of LU fill and factors by QR in 0.13 s — while the QR's own symbolic c
 | matrix (symmetrized) | predicted nnz(R) | QR time | outcome |
 |---|---:|---:|---|
 | `SmaGri` | 273 k | 0.04 s | rescued |
-| `shyy41` | 259 k | 0.1 s | (partial pivoting got there first) |
+| `shyy41` | 259 k | 0.1 s | (partial pivoting got there first, and flags it IllConditioned) |
 | `rw5151` | 456 k | 0.3 s | rescued |
 | `lhr10c` | 41.9 M | **102 s** | declined (partial pivoting got there first) |
 | `foldoc` | 57.5 M | **76 s** | declined |
@@ -231,6 +234,14 @@ failure is a bad trade, so the stopping rules carry as much weight as the escala
   three digits from 5e10 to 4e18, for four extra solves paid only when a pivot was replaced. On the
   corpus it moved one verdict, `GHS_indef/sit100` (numerically singular, answer 76% off), from
   Solved to IllConditioned.
+- **An escalated rung is held to the same κ test as the first.** MC64 and partial pivoting repair
+  the backward error, not the conditioning, so a rung reached by escalation can be backward
+  stable on a matrix with no answer in double just as the first rung can. `Muite/Chebyshev3`
+  (κ·eps = 1.5e5 after MC64) and `Shyy/shyy41` (κ·eps = 4.3e10 after partial pivoting) are both
+  numerically singular — `MultifrontalQR` verifies rank deficiency 2 and 8 — and both are
+  IllConditioned, not Solved. `PointBlockLU` never perturbs a pivot, so its own Hager-Higham
+  estimate is of `A` and needs no refined re-estimate. After MC64, a κ·eps in [1e-3, 1) triggers
+  the same extended-residual re-solve as after the first rung, logged as `MC64Extended`.
 
 This is why step 4 came after [condition estimation](LeftRightLU.md#whats-different-from-supernodallu):
 "the solver did badly" and "the matrix is unsolvable" are indistinguishable from a residual, and

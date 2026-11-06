@@ -409,8 +409,18 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     return kappa > (std::numeric_limits<double>::max)() ? (std::numeric_limits<double>::max)() : kappa;
   }
   /** Re-solve the EXISTING factorization with a double-double residual. No
-    *  refactorization, no re-analysis -- this is the one genuinely cheap rung. */
-  robust_lu::Attempt resolveExtended(const MatrixType& matrix);
+    *  refactorization, no re-analysis -- this is the one genuinely cheap rung.
+    *  `label` is ExtendedResidual after the default rung, MC64Extended after
+    *  MC64. */
+  robust_lu::Attempt resolveExtended(const MatrixType& matrix,
+                                     robust_lu::Strategy label = robust_lu::Strategy::ExtendedResidual);
+  /** Concludes a ladder whose rung `a` was accepted as backward stable: Solved,
+    *  re-solved with an extended residual when kappa costs digits and `extendable`
+    *  (the rung's factors are m_direct's), or IllConditioned when kappa * eps
+    *  >= 1. Every accepting LU rung goes through it, so no rung can report Solved
+    *  on a backward error alone. */
+  void concludeStable(const MatrixType& matrix, const robust_lu::Attempt& a, bool extendable,
+                      robust_lu::Strategy extendedLabel);
   robust_lu::Attempt runPivoting(const MatrixType& matrix);
   /** The symmetric fast path. Runs first and only on a symmetric matrix.
    *
@@ -609,10 +619,11 @@ double RobustLU<MatrixType>::refinedConditionEstimate(const MatrixType& matrix) 
 }
 
 template <typename MatrixType>
-robust_lu::Attempt RobustLU<MatrixType>::resolveExtended(const MatrixType& matrix) {
+robust_lu::Attempt RobustLU<MatrixType>::resolveExtended(const MatrixType& matrix,
+                                                         robust_lu::Strategy label) {
   using namespace robust_lu;
   Attempt a;
-  a.strategy = Strategy::ExtendedResidual;
+  a.strategy = label;
   const auto t0 = std::chrono::steady_clock::now();
 
   // The factorization is reused untouched: only the refinement settings change,
@@ -672,9 +683,58 @@ robust_lu::Attempt RobustLU<MatrixType>::runPivoting(const MatrixType& matrix) {
   const RealScalar bn = probe.norm();
   a.probeResidual = double(bn > RealScalar(0) ? (matrix * x - probe).norm() / bn
                                               : (matrix * x - probe).norm());
+  a.replacedPivots = 0;  // threshold pivoting never perturbs a pivot
+  a.factorNonzeros = (long long)m_pivoting->nnzL() + m_pivoting->nnzU();
   a.accepted = acceptable(a, x.allFinite());
   if (!a.accepted) a.note = rejection(a);
+  // The factors are of A itself, so their Hager-Higham estimate is honest: no
+  // refined estimate is needed, as it is for perturbed LeftRightLU factors.
+  if (a.accepted) a.conditionEstimate = finiteOrMax(double(m_pivoting->conditionEstimate()));
   return a;
+}
+
+template <typename MatrixType>
+void RobustLU<MatrixType>::concludeStable(const MatrixType& matrix, const robust_lu::Attempt& a,
+                                          bool extendable, robust_lu::Strategy extendedLabel) {
+  using namespace robust_lu;
+  m_strategy = a.strategy;
+  m_outcome = Outcome::Solved;
+  m_info = Success;
+  m_backwardError = RealScalar(a.backwardError);
+  m_conditionEstimate = RealScalar(a.conditionEstimate);
+
+  // Backward-stable. The only remaining question is whether conditioning has
+  // eaten the answer anyway, and whether anything can be done about it.
+  const double kappaEps = a.conditionEstimate * double(NumTraits<RealScalar>::epsilon());
+  if (kappaEps < 1.0 || !(numext::isfinite)(kappaEps)) {
+    if (extendable && kappaEps >= 0.001 && int(m_maxStrategy) >= int(extendedLabel)) {
+      // Backward-stable but losing digits to conditioning, and still inside
+      // the range where extra residual precision can recover them. This rung
+      // re-solves the SAME factors -- one extra solve, no refactorization.
+      // Its result is kept whether or not it is formally "accepted", because
+      // an extended residual is never worse than a working-precision one.
+      Attempt ext = resolveExtended(matrix, extendedLabel);
+      m_attempts.push_back(ext);
+      if (ext.accepted) {
+        m_strategy = ext.strategy;
+        m_backwardError = RealScalar(ext.backwardError);
+        m_conditionEstimate = RealScalar(ext.conditionEstimate);
+      }
+    }
+    return;
+  }
+  // kappa * eps >= 1: no digit of the answer is supported and no rung can
+  // change that. Escalating here would burn full factorizations to rediscover
+  // a property of the matrix -- and a rung reached by escalation is no
+  // exception: it repaired the backward error, not the conditioning.
+  m_outcome = Outcome::IllConditioned;
+  m_info = NumericalIssue;
+  m_lastError =
+      "RobustLU: the factorization is backward stable and its residual is small, but the "
+      "estimated condition number leaves no correct digits guaranteed. The answer may still be "
+      "accurate -- a condition number is a worst-case bound, not a measurement -- and there is "
+      "no way to tell from the residual, which is exactly why this is flagged. This is the "
+      "matrix, not the solver: no fallback strategy can recover it in this precision.";
 }
 
 template <typename MatrixType>
@@ -948,13 +1008,6 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
   m_isInitialized = true;
 
   const int ceiling = int(m_maxStrategy);
-  auto accept = [&](const Attempt& a) {
-    m_strategy = a.strategy;
-    m_outcome = Outcome::Solved;
-    m_info = Success;
-    m_backwardError = RealScalar(a.backwardError);
-    m_conditionEstimate = RealScalar(a.conditionEstimate);
-  };
 
   // ---- the symmetric fast path ------------------------------------------
   // Not an escalation: a cheaper answer to the same question, taken when the
@@ -1007,36 +1060,7 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
   }
 
   if (first.accepted) {
-    // Backward-stable. The only remaining question is whether conditioning has
-    // eaten the answer anyway, and whether anything can be done about it.
-    const RealScalar kappaEps =
-        RealScalar(first.conditionEstimate) * NumTraits<RealScalar>::epsilon();
-    if (kappaEps < RealScalar(1) || !(numext::isfinite)(kappaEps)) {
-      accept(first);
-      if (kappaEps >= RealScalar(0.001) && ceiling >= int(Strategy::ExtendedResidual)) {
-        // Backward-stable but losing digits to conditioning, and still inside
-        // the range where extra residual precision can recover them. This rung
-        // re-solves the SAME factors -- one extra solve, no refactorization.
-        // Its result is kept whether or not it is formally "accepted", because
-        // an extended residual is never worse than a working-precision one.
-        Attempt ext = resolveExtended(matrix);
-        m_attempts.push_back(ext);
-        if (ext.accepted) accept(ext);
-      }
-      return;
-    }
-    // kappa * eps >= 1: no digit of the answer is supported and no rung can
-    // change that. Escalating here would burn full factorizations to rediscover
-    // a property of the matrix.
-    accept(first);
-    m_outcome = Outcome::IllConditioned;
-    m_info = NumericalIssue;
-    m_lastError =
-        "RobustLU: the factorization is backward stable and its residual is small, but the "
-        "estimated condition number leaves no correct digits guaranteed. The answer may still be "
-        "accurate -- a condition number is a worst-case bound, not a measurement -- and there is "
-        "no way to tell from the residual, which is exactly why this is flagged. This is the "
-        "matrix, not the solver: no fallback strategy can recover it in this precision.";
+    concludeStable(matrix, first, true, Strategy::ExtendedResidual);
     return;
   }
 
@@ -1062,7 +1086,7 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
     Attempt mc = runDirect(matrix, Strategy::MC64);
     m_attempts.push_back(mc);
     if (mc.accepted) {
-      accept(mc);
+      concludeStable(matrix, mc, true, Strategy::MC64Extended);
       return;
     }
   }
@@ -1076,11 +1100,7 @@ void RobustLU<MatrixType>::compute(const MatrixType& matrix) {
     m_attempts.push_back(pp);
     if (pp.accepted) {
       m_usePivoting = true;
-      m_strategy = Strategy::PartialPivoting;
-      m_outcome = Outcome::Solved;
-      m_info = Success;
-      m_backwardError = RealScalar(pp.backwardError);
-      m_conditionEstimate = NumTraits<RealScalar>::quiet_NaN();
+      concludeStable(matrix, pp, false, Strategy::PartialPivoting);
       return;
     }
   }

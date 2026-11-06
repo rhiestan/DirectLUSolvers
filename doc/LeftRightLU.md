@@ -59,10 +59,14 @@ patterns](#unsymmetric-nonzero-patterns) below, where doing so costs 102x the fi
    `adjoint()`, and `determinant()`. Selectable via `setPivoting(Pivoting::{None, Partial,
    Complete})`; default **Complete**.
 
-3. **Refinement gated on perturbation** (PARDISO `IPARM(8)=0`). By default `solve()` runs
-   refinement **only if the factorization actually bumped a static pivot**
-   (`replacedPivots() > 0`); an un-perturbed factorization is already backward-stable, so
-   refinement is skipped. Toggle with `setRefineOnlyIfPerturbed(false)` to always refine.
+3. **Refinement gated on perturbation** (PARDISO `IPARM(8)=0`), with a measured check. By
+   default `solve()` refines when the factorization bumped a static pivot
+   (`replacedPivots() > 0`), and otherwise only when the unrefined answer's normwise backward
+   error `||b - A x||∞ / (||A||∞ ||x||∞ + ||b||∞)` exceeds 100 eps. The check costs one
+   product with A. It is needed because pivoting never leaves the diagonal block: an
+   unperturbed factorization can still have a large growth factor (Boeing/nasa1824 in
+   binary128: growth 2.7e13, backward error 4e9 eps before refinement, 0.3 eps after one
+   step). Toggle with `setRefineOnlyIfPerturbed(false)` to always refine.
 
 4. **Log-determinant** (PARDISO `IPARM(33)`): `logAbsDeterminant()` returns `log|det(A)|` as
    a sum of logs (stays finite where `determinant()` would overflow), paired with
@@ -370,8 +374,8 @@ scheduler's headline advantage, which requires a parallel executor (see
   (tomography, YaleB_10NN) `LeftRightLU` lands on a visibly looser — but still safely
   small — residual than `SupernodalLU` (tomography resid 7.9e-13 vs 3.1e-16; YaleB 9.4e-14 vs
   1.8e-16; both far under the 1e-6 `solveFailureThreshold()`). This is the documented
-  **`setRefineOnlyIfPerturbed`** default at work: `LeftRightLU` skips refinement entirely when
-  `replacedPivots()==0`, while `SupernodalLU`'s default BiCGStab refinement always runs at least
+  **`setRefineOnlyIfPerturbed`** default at work: `LeftRightLU` skips refinement when
+  `replacedPivots()==0` and the backward error is already within 100 eps, while `SupernodalLU`'s default BiCGStab refinement always runs at least
   one matvec check (and polishes further) even on an already-accurate direct solve. Not a bug —
   call `setRefineOnlyIfPerturbed(false)` if you want the tighter residual at the cost of that
   extra matvec.
@@ -390,7 +394,8 @@ accessor, `transpose()`/`adjoint()`, `matrixL()`/`matrixU()`, `determinant()`, t
 - **`setPivoting(left_right_lu::Pivoting mode)`** — `None` / `Partial` (row-only) / `Complete`
   (row + column, **default**). `setDiagonalPivoting(true|false)` is a convenience alias
   mapping to `Complete` / `None`.
-- **`setRefineOnlyIfPerturbed(bool)`** (default **true**) — PARDISO-style refinement gating.
+- **`setRefineOnlyIfPerturbed(bool)`** (default **true**) — PARDISO-style refinement gating,
+  plus refinement of an unperturbed solve whose backward error exceeds 100 eps.
 - **`logAbsDeterminant() -> RealScalar`** and **`determinantSign() -> Scalar`** — the
   log-determinant pair. Not actually a delta: `SupernodalLU` exposes the same pair, since
   `determinant()` overflows on both solvers for the same reason. See its

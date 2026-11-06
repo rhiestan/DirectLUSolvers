@@ -59,6 +59,9 @@ on:
 env:
   # Eigen master snapshot the fill baselines were recorded against.
   EIGEN_COMMIT: 94152044e
+  # The mpfix release the multiprecision job builds against: the minimum that
+  # CMakeLists.txt accepts (DLU_MPFIX_MIN_VERSION).
+  MPFIX_REF: v0.1.0
 
 jobs:
   quick:
@@ -99,6 +102,59 @@ jobs:
       # repository. A failure here is a real failure, not a missing-data error.
       - name: Test
         run: ctest --test-dir build -C Release -L quick --output-on-failure
+
+  # The solvers with software scalars: Boost.Multiprecision's cpp_bin_float
+  # (Linux, from the distribution) and mpfix's binary128/256/512, at the
+  # minimum mpfix release the CMake check accepts. test_mpfix_corpus reads the
+  # checked-in corpus, which configure unpacks.
+  multiprecision:
+    name: multiprecision (${{ matrix.os }}, ${{ matrix.cxx }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  cc: gcc,   cxx: g++,     boost: 'ON' }
+          - { os: ubuntu-latest,  cc: clang, cxx: clang++, boost: 'ON' }
+          - { os: windows-latest, cc: '',    cxx: cl,      boost: 'OFF' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned Eigen
+        run: |
+          git clone --filter=blob:none https://gitlab.com/libeigen/eigen.git eigen-src
+          cd eigen-src && git checkout ${{ env.EIGEN_COMMIT }}
+
+      - name: Fetch mpfix
+        uses: actions/checkout@v4
+        with:
+          repository: rhiestan/mpfix
+          ref: ${{ env.MPFIX_REF }}
+          path: mpfix-src
+
+      - name: Install Boost
+        if: matrix.boost == 'ON'
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDLU_EIGEN_DIR="$PWD/eigen-src" \
+            -DDLU_WITH_MPFIX=ON -DDLU_MPFIX_DIR="$PWD/mpfix-src" \
+            -DDLU_WITH_BOOST_MULTIPRECISION=${{ matrix.boost }} \
+            ${{ matrix.cc != '' && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
+
+      # Only the multiprecision tests: the quick job builds the rest.
+      - name: Build
+        shell: bash
+        run: |
+          targets=$(ctest --test-dir build -N -L multiprecision | sed -n 's/^ *Test *#[0-9]*: //p' | sort -u)
+          cmake --build build --config Release --parallel 4 --target $targets
+
+      - name: Test
+        run: ctest --test-dir build -C Release -L multiprecision --output-on-failure
 
   suitesparse:
     name: SuiteSparse corpus

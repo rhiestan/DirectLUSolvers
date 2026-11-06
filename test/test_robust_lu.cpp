@@ -33,6 +33,7 @@
 
 #include <Eigen/SparseCore>
 
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -517,11 +518,16 @@ void testCorpus() {
   // built without it, fd12 squeaks past the first rung outright. Both are
   // correct behaviour -- pinning either one would pin the rounding, not the
   // ladder. What IS invariant is that the answer is trustworthy at the end.
-  const char* hard[] = {"Muite/Chebyshev3", "JGD_CAG/CAG_mat1916", "Hohn/fd12",
-                        "Mallya/lhr10c", "Shyy/shyy41",
+  const char* hard[] = {"JGD_CAG/CAG_mat1916", "Hohn/fd12", "Mallya/lhr10c",
                         // Rescued only by the rank-revealing rung: no LU
                         // configuration reaches a usable answer on it at all.
                         "Bai/rw5151", "Pajek/SmaGri"};
+  // These need more than the first rung too, and the rung that repairs the
+  // backward error then finds kappa * eps >= 1: both are numerically singular
+  // (MultifrontalQR verifies rank deficiency 2 and 8). A backward-stable answer
+  // from an escalated rung is no better conditioned than one from the first, so
+  // the ladder must say IllConditioned here rather than Solved.
+  const char* singular[] = {"Muite/Chebyshev3", "Shyy/shyy41"};
 
   long long firstRung = 0, escalated = 0, stopped = 0;
   for (const auto& m : all) {
@@ -548,11 +554,23 @@ void testCorpus() {
     else
       checkTrue(!s.lastErrorMessage().empty(), m.label() + ": a failure carries a diagnostic");
 
-    bool isHard = false;
+    bool isHard = false, isSingular = false;
     for (const char* h : hard)
       if (m.label() == h) isHard = true;
+    for (const char* h : singular)
+      if (m.label() == h) isSingular = true;
 
-    if (isHard) {
+    if (isSingular) {
+      checkTrue(s.outcome() == rlu::Outcome::IllConditioned && s.info() != Eigen::Success,
+                m.label() + ": an escalated rung is held to the kappa check");
+      check(double(s.conditionEstimate()) * DBL_EPSILON >= 1.0, m.label() + ": with kappa * eps >= 1",
+            double(s.conditionEstimate()) * DBL_EPSILON);
+      checkTrue(s.attempts().size() > 1 && s.strategy() != rlu::Strategy::Default,
+                m.label() + ": reached by escalation");
+      ++escalated;
+      std::printf("        %-24s %-22s via %s (%zu attempts)\n", m.label().c_str(),
+                  rlu::outcomeName(s.outcome()), rlu::strategyName(s.strategy()), s.attempts().size());
+    } else if (isHard) {
       const bool ok = s.outcome() == rlu::Outcome::Solved ||
                       s.outcome() == rlu::Outcome::RankDeficient;
       checkTrue(ok, m.label() + ": the ladder reaches a trustworthy answer");

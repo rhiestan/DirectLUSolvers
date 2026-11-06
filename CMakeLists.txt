@@ -339,28 +339,60 @@ add_dlu_test(test_multifrontal_qr SOURCE test/test_multifrontal_qr.cpp LABELS "q
 
 # The solvers with Boost.Multiprecision's cpp_bin_float_quad as the scalar,
 # side by side with double. Boost is header-only; the in-tree vcpkg is tried
-# after anything CMAKE_PREFIX_PATH / a toolchain file already provides.
+# after anything CMAKE_PREFIX_PATH / a toolchain file already provides. A Boost
+# without per-library CMake configs (a distribution's libboost-dev) is used
+# through Boost::headers.
 option(DLU_WITH_BOOST_MULTIPRECISION "Test the solvers with Boost.Multiprecision scalars" OFF)
 if(DLU_WITH_BOOST_MULTIPRECISION)
-  find_package(boost_multiprecision CONFIG REQUIRED
+  find_package(boost_multiprecision CONFIG QUIET
                HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../vcpkg/installed/x64-windows")
+  if(TARGET Boost::multiprecision)
+    set(DLU_BOOST_MP_TARGET Boost::multiprecision)
+  else()
+    find_package(Boost 1.71 CONFIG REQUIRED)
+    set(DLU_BOOST_MP_TARGET Boost::headers)
+  endif()
   add_dlu_test(test_multiprecision SOURCE test/test_multiprecision.cpp
-               LINK Boost::multiprecision LABELS "correctness;multiprecision")
+               LINK ${DLU_BOOST_MP_TARGET} LABELS "correctness;multiprecision")
 endif()
 
 # The same checks with mpfix's fixed-size IEEE types (binary128/256/512).
-# Header-only, but C++20, so only this target is raised to it. DLU_MPFIX_DIR
-# defaults to a sibling checkout.
+# Header-only, but C++20, so only these targets are raised to it. mpfix 0.1.0
+# is the minimum (MpfixSupport.h needs its frexp/ldexp and math.h). A checkout
+# at DLU_MPFIX_DIR (default: a sibling ../mpfix) is used when present, and its
+# version read from its CMakeLists.txt; otherwise find_package(mpfix), for an
+# installed copy.
 option(DLU_WITH_MPFIX "Test the solvers with mpfix scalars" OFF)
 if(DLU_WITH_MPFIX)
+  set(DLU_MPFIX_MIN_VERSION 0.1.0)
   set(DLU_MPFIX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../mpfix" CACHE PATH "mpfix checkout")
-  if(NOT EXISTS "${DLU_MPFIX_DIR}/include/mpfix/float.h")
-    message(FATAL_ERROR "DLU_WITH_MPFIX: no mpfix headers under ${DLU_MPFIX_DIR}/include")
+  if(EXISTS "${DLU_MPFIX_DIR}/include/mpfix/float.h")
+    set(_mpfix_version "")
+    if(EXISTS "${DLU_MPFIX_DIR}/CMakeLists.txt")
+      file(STRINGS "${DLU_MPFIX_DIR}/CMakeLists.txt" _mpfix_project REGEX "project\\(mpfix VERSION")
+      string(REGEX MATCH "VERSION ([0-9]+\\.[0-9]+\\.[0-9]+)" _ "${_mpfix_project}")
+      set(_mpfix_version "${CMAKE_MATCH_1}")
+    endif()
+    if(_mpfix_version STREQUAL "" OR _mpfix_version VERSION_LESS DLU_MPFIX_MIN_VERSION)
+      message(FATAL_ERROR "DLU_WITH_MPFIX: ${DLU_MPFIX_DIR} is mpfix '${_mpfix_version}'; "
+                          "${DLU_MPFIX_MIN_VERSION} or later is required (tag v${DLU_MPFIX_MIN_VERSION})")
+    endif()
+    message(STATUS "mpfix ${_mpfix_version} from ${DLU_MPFIX_DIR}")
+    add_library(dlu_mpfix INTERFACE)
+    target_include_directories(dlu_mpfix INTERFACE "${DLU_MPFIX_DIR}/include")
+    target_compile_features(dlu_mpfix INTERFACE cxx_std_20)
+    set(DLU_MPFIX_TARGET dlu_mpfix)
+  else()
+    find_package(mpfix ${DLU_MPFIX_MIN_VERSION} CONFIG REQUIRED)
+    message(STATUS "mpfix ${mpfix_VERSION} from ${mpfix_DIR}")
+    set(DLU_MPFIX_TARGET mpfix::mpfix)
   endif()
-  add_dlu_test(test_mpfix SOURCE test/test_mpfix.cpp LABELS "correctness;multiprecision")
-  target_include_directories(test_mpfix PRIVATE "${DLU_MPFIX_DIR}/include")
-  target_compile_features(test_mpfix PRIVATE cxx_std_20)
-  set_target_properties(test_mpfix PROPERTIES CXX_STANDARD 20)
+  add_dlu_test(test_mpfix SOURCE test/test_mpfix.cpp LINK ${DLU_MPFIX_TARGET}
+               LABELS "correctness;multiprecision")
+  # A few corpus matrices in binary128/256/512, solved by every solver.
+  add_dlu_test(test_mpfix_corpus SOURCE test/test_mpfix_corpus.cpp LINK ${DLU_MPFIX_TARGET}
+               LABELS "correctness;multiprecision")
+  set_target_properties(test_mpfix test_mpfix_corpus PROPERTIES CXX_STANDARD 20)
 endif()
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 

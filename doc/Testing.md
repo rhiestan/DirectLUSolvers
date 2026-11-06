@@ -19,7 +19,11 @@ data, a few seconds — while the remainder reads the benchmark matrices and tak
 substantially longer. That split is what makes CI possible: **Eigen and
 `testdata/` live outside this repository**, so `.github/workflows/ci.yml` runs
 the `quick` label on every push (gcc, clang, MSVC) and a scheduled job runs a
-real-matrix sweep over the checked-in SuiteSparse corpus.
+real-matrix sweep over the checked-in SuiteSparse corpus. A third job runs the
+`multiprecision` label on every push, on the same three compilers:
+`test_mpfix` and `test_mpfix_corpus` against mpfix v0.1.0 (`MPFIX_REF` in the
+workflow, the minimum `DLU_MPFIX_MIN_VERSION` accepts), and on Linux
+`test_multiprecision` against the distribution's Boost.
 
 CI **pins Eigen to an exact commit**, deliberately. The fill baselines below
 depend on the fill-reducing ordering, which comes from Eigen's AMD
