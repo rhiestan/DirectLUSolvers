@@ -146,9 +146,12 @@ jobs:
             -DDLU_WITH_BOOST_MULTIPRECISION=${{ matrix.boost }} \
             ${{ matrix.cc != '' && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
 
-      # Only the multiprecision tests: the quick job builds the rest.
+      # Only the multiprecision tests: the quick job builds the rest. Two jobs,
+      # not four: each of these TUs instantiates every solver for several
+      # software scalars, and three of them at once under g++ exhaust the
+      # runner's memory (the build is killed with no compiler error).
       - name: Build
-        run: cmake --build build --config Release --parallel 4 --target multiprecision_tests
+        run: cmake --build build --config Release --parallel 2 --target multiprecision_tests
 
       - name: Test
         run: ctest --test-dir build -C Release -L multiprecision --output-on-failure
