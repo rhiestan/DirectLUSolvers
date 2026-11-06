@@ -286,7 +286,9 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
     *  rows, and METIS or COLAMD often recovers most of it. */
   double denseRowFillPenalty() const { return m_denseRowPenalty; }
 
-  /** Numerical rank, from the rank-revealing rung. -1 when that rung never ran. */
+  /** Numerical rank, verified by the rank-revealing QR: from the terminal rung,
+    *  or from the rank check of an answer with kappa * eps in [1e-3, 1). -1 when
+    *  no QR ran. */
   Index rank() const { return m_rank; }
 
   /** True when the answer is a LEAST-SQUARES solution rather than a solution of
@@ -430,6 +432,17 @@ class RobustLU : public SparseSolverBase<RobustLU<MatrixType_>> {
   robust_lu::Attempt runRankRevealing(const MatrixType& matrix);
   /** The terminal rung, entered only from a diagnosis that says no LU exists. */
   bool tryRankRevealing(const MatrixType& matrix);
+  /** False, logging why as an attempt, when setMaxStrategy or the size cap rule
+    *  the rank-revealing QR out. `purpose` prefixes the logged note. */
+  bool rankRevealingAllowed(const MatrixType& matrix, const char* purpose);
+  /** Makes the accepted QR attempt `a` the answer: RankDeficient when its rank
+    *  is below n, Solved otherwise. */
+  void adoptRankRevealing(const MatrixType& matrix, const robust_lu::Attempt& a);
+  /** The rank check of a backward-stable LU answer whose kappa * eps lies in
+    *  [1e-3, 1): the QR's verified rank decides. Below n, the QR's least-squares
+    *  answer replaces the LU one (RankDeficient); at n, the LU answer stands and
+    *  the QR is released. */
+  void checkRank(const MatrixType& matrix);
   DenseVector probeFor(const MatrixType& matrix) const;
   /** Whether a rung's result may be handed to the caller.
     *
@@ -721,6 +734,14 @@ void RobustLU<MatrixType>::concludeStable(const MatrixType& matrix, const robust
         m_conditionEstimate = RealScalar(ext.conditionEstimate);
       }
     }
+    // In the same band a backward-stable LU answer can come from a matrix that
+    // is numerically singular: the probe is consistent, so the LU returns *a*
+    // solution, but an arbitrary one, and a wrong one for an inconsistent b.
+    // kappa alone cannot tell (it sits just below 1/eps either way), so the
+    // QR's verified rank decides. Measured on the corpus, the band held six
+    // matrices, three of them rank deficient; every matrix below it was full
+    // rank.
+    if (kappaEps >= 0.001) checkRank(matrix);
     return;
   }
   // kappa * eps >= 1: no digit of the answer is supported and no rung can
@@ -930,12 +951,12 @@ robust_lu::Attempt RobustLU<MatrixType>::runRankRevealing(const MatrixType& matr
 }
 
 template <typename MatrixType>
-bool RobustLU<MatrixType>::tryRankRevealing(const MatrixType& matrix) {
+bool RobustLU<MatrixType>::rankRevealingAllowed(const MatrixType& matrix, const char* purpose) {
   using namespace robust_lu;
   if (int(m_maxStrategy) < int(Strategy::RankRevealing)) {
     Attempt a;
     a.strategy = Strategy::RankRevealing;
-    a.note = "not attempted: setMaxStrategy caps the ladder below this rung";
+    a.note = std::string(purpose) + "not attempted: setMaxStrategy caps the ladder below this rung";
     m_attempts.push_back(a);
     return false;
   }
@@ -947,15 +968,52 @@ bool RobustLU<MatrixType>::tryRankRevealing(const MatrixType& matrix) {
                   "not attempted: %lld rows exceeds the rank-revealing size cap of %lld "
                   "(see setMaxRankRevealingSize)",
                   (long long)matrix.rows(), (long long)m_maxRankRevealingRows);
-    a.note = buf;
+    a.note = std::string(purpose) + buf;
     m_attempts.push_back(a);
     return false;
   }
+  return true;
+}
 
-  Attempt a = runRankRevealing(matrix);
+template <typename MatrixType>
+bool RobustLU<MatrixType>::tryRankRevealing(const MatrixType& matrix) {
+  if (!rankRevealingAllowed(matrix, "")) return false;
+  robust_lu::Attempt a = runRankRevealing(matrix);
   m_attempts.push_back(a);
   if (!a.accepted) return false;
+  adoptRankRevealing(matrix, a);
+  return true;
+}
 
+template <typename MatrixType>
+void RobustLU<MatrixType>::checkRank(const MatrixType& matrix) {
+  using namespace robust_lu;
+  const char* purpose = "rank check: ";
+  if (!rankRevealingAllowed(matrix, purpose)) return;
+  Attempt a = runRankRevealing(matrix);
+  a.note = purpose + a.note;
+  if (a.accepted && a.rank >= (long long)matrix.cols()) {
+    // Full rank, verified: the LU answer is what it claims to be. Keep it -- its
+    // solves are cheaper -- and release the QR.
+    a.note += "; full rank, the LU answer stands";
+    m_attempts.push_back(a);
+    m_rank = Index(a.rank);
+    m_rankRevealing.reset();
+    return;
+  }
+  m_attempts.push_back(a);
+  if (!a.accepted) {
+    // Declined (fill guard) or unverified: the LU answer stands, unconfirmed, and
+    // report() shows why.
+    m_rankRevealing.reset();
+    return;
+  }
+  adoptRankRevealing(matrix, a);
+}
+
+template <typename MatrixType>
+void RobustLU<MatrixType>::adoptRankRevealing(const MatrixType& matrix, const robust_lu::Attempt& a) {
+  using namespace robust_lu;
   m_useRankRevealing = true;
   m_usePivoting = false;
   m_strategy = Strategy::RankRevealing;
@@ -986,7 +1044,6 @@ bool RobustLU<MatrixType>::tryRankRevealing(const MatrixType& matrix) {
     m_outcome = Outcome::Solved;
     m_info = Success;
   }
-  return true;
 }
 
 template <typename MatrixType>

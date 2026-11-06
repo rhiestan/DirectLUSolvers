@@ -528,6 +528,13 @@ void testCorpus() {
   // from an escalated rung is no better conditioned than one from the first, so
   // the ladder must say IllConditioned here rather than Solved.
   const char* singular[] = {"Muite/Chebyshev3", "Shyy/shyy41"};
+  // Backward stable with kappa * eps in [1e-3, 1): the band where a singular
+  // matrix and a merely ill-conditioned one look alike, so the QR's verified
+  // rank decides. The first two are rank deficient (by 1 and 3) and must come
+  // back as least-squares answers; the other three are full rank and keep
+  // their LU answer, now with a verified rank.
+  const char* bandDeficient[] = {"Lucifora/cell2", "HB/nnc1374"};
+  const char* bandFullRank[] = {"Simon/raefsky5", "HB/mahindas", "Zitney/extr1b"};
 
   long long firstRung = 0, escalated = 0, stopped = 0;
   for (const auto& m : all) {
@@ -559,6 +566,20 @@ void testCorpus() {
       if (m.label() == h) isHard = true;
     for (const char* h : singular)
       if (m.label() == h) isSingular = true;
+    bool inBandDeficient = false, inBandFull = false;
+    for (const char* h : bandDeficient)
+      if (m.label() == h) inBandDeficient = true;
+    for (const char* h : bandFullRank)
+      if (m.label() == h) inBandFull = true;
+    if (inBandDeficient) {
+      checkTrue(s.outcome() == rlu::Outcome::RankDeficient && s.info() == Eigen::Success &&
+                    s.rank() < Eigen::Index(A.cols()),
+                m.label() + ": the rank check finds it rank deficient");
+    } else if (inBandFull) {
+      checkTrue(s.outcome() == rlu::Outcome::Solved && s.strategy() != rlu::Strategy::RankRevealing &&
+                    s.rank() == Eigen::Index(A.cols()),
+                m.label() + ": the rank check confirms full rank, the LU answer stands");
+    }
 
     if (isSingular) {
       checkTrue(s.outcome() == rlu::Outcome::IllConditioned && s.info() != Eigen::Success,
