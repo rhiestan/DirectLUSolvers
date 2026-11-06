@@ -180,7 +180,8 @@ jobs:
       # The whole `suitesparse` label, not just test_suitesparse: that also
       # covers test_parallel_consistency_corpus, which runs both solvers'
       # intra-supernode parallelism against their serial selves on real
-      # matrices.
+      # matrices, and test_robust_lu, which pins RobustLU's per-matrix
+      # verdicts (rescued, IllConditioned, RankDeficient) on the corpus.
       - name: Correctness sweep
         run: ctest --test-dir build -L suitesparse --output-on-failure
 

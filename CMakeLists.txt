@@ -322,11 +322,12 @@ add_dlu_test(test_condition_estimate SOURCE test/test_condition_estimate.cpp
 # so the target pins strict FP rather than trusting the ambient flags.
 add_dlu_test(test_extended_residual SOURCE test/test_extended_residual.cpp
                                                                   LABELS "quick;correctness")
-# The fallback ladder. Reads the SuiteSparse corpus when it is present (the
-# per-matrix outcomes were measured before the ladder existed) and falls back to
-# constructed matrices when it is not, so it is registered in both label sets.
+# The fallback ladder. Reads the checked-in SuiteSparse corpus when it is
+# unpacked (the per-matrix outcomes were measured before the ladder existed) and
+# falls back to constructed matrices when it is not. Labelled `suitesparse` so
+# the scheduled CI job runs its corpus verdicts; it needs nothing from testdata/.
 add_dlu_test(test_robust_lu SOURCE test/test_robust_lu.cpp
-                                                                  LABELS "testdata;correctness")
+                                                                  LABELS "suitesparse;correctness")
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(test_extended_residual PRIVATE -ffp-contract=off)
 elseif(MSVC)
