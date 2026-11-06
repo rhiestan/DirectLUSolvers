@@ -148,10 +148,7 @@ jobs:
 
       # Only the multiprecision tests: the quick job builds the rest.
       - name: Build
-        shell: bash
-        run: |
-          targets=$(ctest --test-dir build -N -L multiprecision | sed -n 's/^ *Test *#[0-9]*: //p' | sort -u)
-          cmake --build build --config Release --parallel 4 --target $targets
+        run: cmake --build build --config Release --parallel 4 --target multiprecision_tests
 
       - name: Test
         run: ctest --test-dir build -C Release -L multiprecision --output-on-failure

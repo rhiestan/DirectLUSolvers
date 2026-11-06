@@ -355,6 +355,7 @@ if(DLU_WITH_BOOST_MULTIPRECISION)
   endif()
   add_dlu_test(test_multiprecision SOURCE test/test_multiprecision.cpp
                LINK ${DLU_BOOST_MP_TARGET} LABELS "correctness;multiprecision")
+  list(APPEND DLU_MULTIPRECISION_TESTS test_multiprecision)
 endif()
 
 # The same checks with mpfix's fixed-size IEEE types (binary128/256/512).
@@ -394,6 +395,13 @@ if(DLU_WITH_MPFIX)
   add_dlu_test(test_mpfix_corpus SOURCE test/test_mpfix_corpus.cpp LINK ${DLU_MPFIX_TARGET}
                LABELS "correctness;multiprecision")
   set_target_properties(test_mpfix test_mpfix_corpus PROPERTIES CXX_STANDARD 20)
+  list(APPEND DLU_MULTIPRECISION_TESTS test_mpfix test_mpfix_corpus)
+endif()
+# `cmake --build <dir> --target multiprecision_tests` builds just the suites
+# labelled `multiprecision` (what the multiprecision CI job runs).
+if(DLU_MULTIPRECISION_TESTS)
+  add_custom_target(multiprecision_tests)
+  add_dependencies(multiprecision_tests ${DLU_MULTIPRECISION_TESTS})
 endif()
 add_dlu_test(test_parallel_lu   SOURCE test/test_parallel_lu.cpp   LABELS "testdata;parallel")
 
