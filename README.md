@@ -119,11 +119,14 @@ absolute, calibrated on double; tighten them for a wider type if a rung should m
 accuracy rather than double's.
 
 The same goes for [mpfix](https://github.com/rhiestan/mpfix)'s fixed-size IEEE types
-(`binary128`, `binary256`, `binary512`, C++20): include `<MpfixSupport>` in place of
+(`binary128`, `binary256`, `binary512`, C++20; **mpfix 0.1.0 or later**, tag `v0.1.0`):
+include `<MpfixSupport>` in place of
 `mpfix/eigen.h`. Its residuals accumulate in an `mpfix::Float` of twice the precision, 7.5x
 faster than the emulation for `binary128` (2.8x for `binary512`). `binary128` runs about 5x
-faster than `cpp_bin_float_quad` under clang. `test/test_mpfix.cpp` runs the same checks,
-built with `-DDLU_WITH_MPFIX=ON` (mpfix expected at `../mpfix`, or set `DLU_MPFIX_DIR`).
+faster than `cpp_bin_float_quad` under clang. `test/test_mpfix.cpp` runs the same checks, and
+`test/test_mpfix_corpus.cpp` solves a few corpus matrices with every solver in all three types.
+Both are built with `-DDLU_WITH_MPFIX=ON` (mpfix expected at `../mpfix`, or set `DLU_MPFIX_DIR`;
+without a checkout there, `find_package(mpfix)`), and CI runs them against mpfix v0.1.0.
 
 ## Quick start
 
@@ -238,7 +241,8 @@ ctest --test-dir build --output-on-failure     # ctest -L quick for the fast sub
 Optional dependencies are independent switches, all default `OFF`:
 `-DDLU_WITH_METIS=ON`, `-DDLU_WITH_PARDISO=ON`, `-DDLU_WITH_OPENMP=ON`, `-DDLU_WITH_TBB=ON`,
 `-DDLU_WITH_BOOST_MULTIPRECISION=ON` (finds `boost_multiprecision` through the usual CMake search,
-then in `../vcpkg/installed/x64-windows`).
+then in `../vcpkg/installed/x64-windows`, then any Boost 1.71 or later through `Boost::headers`),
+`-DDLU_WITH_MPFIX=ON` (mpfix 0.1.0 or later; configure fails on an older checkout).
 The build defaults to **Release**, deliberately set before `project()` — on an MSVC-targeting
 toolchain the usual guard placed after it never fires and you silently get `-O0`, which is a
 50-100x timing error here. See [Testing](doc/Testing.md) for the full story, the baseline

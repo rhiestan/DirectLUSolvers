@@ -59,6 +59,9 @@ on:
 env:
   # Eigen master snapshot the fill baselines were recorded against.
   EIGEN_COMMIT: 94152044e
+  # The mpfix release the multiprecision job builds against: the minimum that
+  # CMakeLists.txt accepts (DLU_MPFIX_MIN_VERSION).
+  MPFIX_REF: v0.1.0
 
 jobs:
   quick:
@@ -100,6 +103,59 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release -L quick --output-on-failure
 
+  # The solvers with software scalars: Boost.Multiprecision's cpp_bin_float
+  # (Linux, from the distribution) and mpfix's binary128/256/512, at the
+  # minimum mpfix release the CMake check accepts. test_mpfix_corpus reads the
+  # checked-in corpus, which configure unpacks.
+  multiprecision:
+    name: multiprecision (${{ matrix.os }}, ${{ matrix.cxx }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  cc: gcc,   cxx: g++,     boost: 'ON' }
+          - { os: ubuntu-latest,  cc: clang, cxx: clang++, boost: 'ON' }
+          - { os: windows-latest, cc: '',    cxx: cl,      boost: 'OFF' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned Eigen
+        run: |
+          git clone --filter=blob:none https://gitlab.com/libeigen/eigen.git eigen-src
+          cd eigen-src && git checkout ${{ env.EIGEN_COMMIT }}
+
+      - name: Fetch mpfix
+        uses: actions/checkout@v4
+        with:
+          repository: rhiestan/mpfix
+          ref: ${{ env.MPFIX_REF }}
+          path: mpfix-src
+
+      - name: Install Boost
+        if: matrix.boost == 'ON'
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDLU_EIGEN_DIR="$PWD/eigen-src" \
+            -DDLU_WITH_MPFIX=ON -DDLU_MPFIX_DIR="$PWD/mpfix-src" \
+            -DDLU_WITH_BOOST_MULTIPRECISION=${{ matrix.boost }} \
+            ${{ matrix.cc != '' && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
+
+      # Only the multiprecision tests: the quick job builds the rest. Two jobs,
+      # not four: each of these TUs instantiates every solver for several
+      # software scalars, and three of them at once under g++ exhaust the
+      # runner's memory (the build is killed with no compiler error).
+      - name: Build
+        run: cmake --build build --config Release --parallel 2 --target multiprecision_tests
+
+      - name: Test
+        run: ctest --test-dir build -C Release -L multiprecision --output-on-failure
+
   suitesparse:
     name: SuiteSparse corpus
     runs-on: ubuntu-latest
@@ -124,7 +180,8 @@ jobs:
       # The whole `suitesparse` label, not just test_suitesparse: that also
       # covers test_parallel_consistency_corpus, which runs both solvers'
       # intra-supernode parallelism against their serial selves on real
-      # matrices.
+      # matrices, and test_robust_lu, which pins RobustLU's per-matrix
+      # verdicts (rescued, IllConditioned, RankDeficient) on the corpus.
       - name: Correctness sweep
         run: ctest --test-dir build -L suitesparse --output-on-failure
 

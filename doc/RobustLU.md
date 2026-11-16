@@ -49,8 +49,11 @@ So the class does not climb. It measures, diagnoses, and jumps:
 |---|---|---|
 | ω ≈ eps and residual small | fine | done, one attempt |
 | `matchingIsPerfect() == false` | structurally singular | **rank-revealing QR** — no LU exists to try |
-| ω, residual fine; κ·eps ∈ [1e-3, 1) | losing digits, recoverable | extended-residual **re-solve** (no refactor) |
+| ω, residual fine; κ·eps ∈ [1e-3, 1) | losing digits, recoverable — or singular | extended-residual **re-solve** (no refactor), then a **rank check** by QR |
 | ω, residual fine; κ·eps ≥ 1 | the matrix, not the solver | **stop**, flagged |
+
+The two κ rows apply to whichever LU rung brought ω down — the first, MC64 or partial
+pivoting — not only to the first.
 | ω ≫ eps | the diagonal was unusable | **MC64** matching |
 | ω ≫ eps after MC64 | in-block pivoting insufficient | **true partial pivoting** via `PointBlockLU` |
 | every LU rung failed | numerical rank, not structure | **rank-revealing QR** — least squares + a rank |
@@ -152,7 +155,7 @@ scalars of LU fill and factors by QR in 0.13 s — while the QR's own symbolic c
 | matrix (symmetrized) | predicted nnz(R) | QR time | outcome |
 |---|---:|---:|---|
 | `SmaGri` | 273 k | 0.04 s | rescued |
-| `shyy41` | 259 k | 0.1 s | (partial pivoting got there first) |
+| `shyy41` | 259 k | 0.1 s | (partial pivoting got there first, and flags it IllConditioned) |
 | `rw5151` | 456 k | 0.3 s | rescued |
 | `lhr10c` | 41.9 M | **102 s** | declined (partial pivoting got there first) |
 | `foldoc` | 57.5 M | **76 s** | declined |
@@ -231,6 +234,39 @@ failure is a bad trade, so the stopping rules carry as much weight as the escala
   three digits from 5e10 to 4e18, for four extra solves paid only when a pivot was replaced. On the
   corpus it moved one verdict, `GHS_indef/sit100` (numerically singular, answer 76% off), from
   Solved to IllConditioned.
+- **An escalated rung is held to the same κ test as the first.** MC64 and partial pivoting repair
+  the backward error, not the conditioning, so a rung reached by escalation can be backward
+  stable on a matrix with no answer in double just as the first rung can. `Muite/Chebyshev3`
+  (κ·eps = 1.5e5 after MC64) and `Shyy/shyy41` (κ·eps = 4.3e10 after partial pivoting) are both
+  numerically singular — `MultifrontalQR` verifies rank deficiency 2 and 8 — and both are
+  IllConditioned, not Solved. `PointBlockLU` never perturbs a pivot, so its own Hager-Higham
+  estimate is of `A` and needs no refined re-estimate. After MC64, a κ·eps in [1e-3, 1) triggers
+  the same extended-residual re-solve as after the first rung, logged as `MC64Extended`.
+- **In the band κ·eps ∈ [1e-3, 1) the rank decides, not κ.** A numerically singular matrix can
+  pass every LU test: the probe right-hand side is consistent, so the LU returns *a* solution —
+  an arbitrary one, and a wrong one for any inconsistent `b` — and κ sits just below 1/eps, where
+  a merely ill-conditioned matrix also sits. So after the re-solve the rank-revealing QR runs as
+  a rank check. Below n, its verified least-squares answer replaces the LU one (RankDeficient);
+  at n, the LU answer stands with `rank()` = n and the QR is released. On the corpus the band
+  held six matrices:
+
+  | matrix | QR rank | QR time | verdict |
+  |---|---:|---:|---|
+  | `Lucifora/cell2` | 7054 / 7055 | 35 ms | RankDeficient |
+  | `HB/nnc1374` | 1371 / 1374 | 44 ms | RankDeficient |
+  | `Simon/raefsky5` | full | 370 ms | Solved, rank verified |
+  | `HB/mahindas` | full | 39 ms | Solved, rank verified |
+  | `Zitney/extr1b` | full | 277 ms | Solved, rank verified |
+  | `Mallya/lhr10c` | 10670 / 10672 | 97 s | Solved, unverified: past the fill guard |
+
+  Every matrix below the band (`fd12`, `meg1`, `adder_dcop_11`, `b2_ss` at κ·eps 3e-4 to 8e-4)
+  is full rank. On an inconsistent `b` the difference is the whole answer: on `cell2` the LU
+  returned ‖x‖ = 6.6e6 with ‖Aᵀr‖ / (‖A‖ ‖r‖) = 0.01, the QR ‖x‖ = 2.8 and 7.7e-13; on `nnc1374`
+  the LU's residual was 7.7 ‖b‖, worse than x = 0. `nnc1374` is also a reminder that numerical
+  rank can be ill-defined: σ_min(R11) is 1.5e-11 against a threshold of 1.2e-11, so its
+  least-squares answer is large (‖x‖ = 3e10), and the report gives σ_min for exactly that reason.
+  `lhr10c` is singular too, but its QR would take 97 s, so the fill guard declines it and the
+  report says the rank went unchecked.
 
 This is why step 4 came after [condition estimation](LeftRightLU.md#whats-different-from-supernodallu):
 "the solver did badly" and "the matrix is unsolvable" are indistinguishable from a residual, and

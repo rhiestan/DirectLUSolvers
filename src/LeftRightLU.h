@@ -40,7 +40,8 @@
 //      None / Partial (row-only) / Complete (default); the column permutation is
 //      folded transparently through solve()/transpose()/determinant().
 //   3. Refinement GATED on whether perturbation occurred (PARDISO IPARM(8)=0):
-//      by default solve() only runs refinement when static pivots were bumped.
+//      by default solve() refines when static pivots were bumped, or when the
+//      unrefined answer's backward error exceeds 100 eps.
 //   4. logAbsDeterminant() (PARDISO IPARM(33) log-determinant).
 //
 // Excluded by design (per project scope): NUMA-aware data placement, out-of-core
@@ -434,9 +435,12 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   left_right_lu::Refinement refinementMethod() const { return m_refinementMethod; }
 
   /** Gate refinement on perturbation (PARDISO IPARM(8)=0 behavior). When on
-   *  (default), solve() runs refinement only if the factorization actually bumped
-   *  a static pivot (replacedPivots() > 0); an un-perturbed factorization is
-   *  already backward-stable, so refinement is skipped. Turn off to always refine. */
+   *  (default), solve() refines when the factorization bumped a static pivot
+   *  (replacedPivots() > 0), and otherwise only when the unrefined answer's
+   *  normwise backward error ||b - A x||_inf / (||A||_inf ||x||_inf + ||b||_inf)
+   *  exceeds 100 eps. Pivoting is confined to the diagonal blocks, so an
+   *  unperturbed factorization can still have a large growth factor; measuring
+   *  costs one product with A. Turn off to always refine. */
   void setRefineOnlyIfPerturbed(bool on) { m_refineOnlyIfPerturbed = on; }
   bool refineOnlyIfPerturbed() const { return m_refineOnlyIfPerturbed; }
 
@@ -580,7 +584,8 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
     *
     *  Cost is O(nnz) per refinement step against the correction solve's O(fill).
     *  It buys nothing when refinement does not run at all, which by default is
-    *  whenever no static pivot was perturbed (see setRefineOnlyIfPerturbed).
+    *  whenever no static pivot was perturbed and the backward error is already
+    *  within 100 eps (see setRefineOnlyIfPerturbed).
     *
     *  \warning Compiling with -ffast-math or /fp:fast silently disables the
     *  effect: those flags let the compiler cancel the compensation terms
@@ -1240,6 +1245,10 @@ class LeftRightLU : public SparseSolverBase<LeftRightLU<MatrixType_, OrderingTyp
   void solveTriangular(const DenseMatrix& rhs, DenseMatrix& solution) const;
   template <typename ApplyA>
   void recordSolveStatus(const DenseMatrix& rhs, const DenseMatrix& solution, ApplyA applyA) const;
+  // Whether solve() refines `solution`, the unrefined answer for op(A) =
+  // A^T / A^H when Transposed. See setRefineOnlyIfPerturbed().
+  template <bool Transposed, typename ApplyA>
+  bool shouldRefine(const DenseMatrix& rhs, const DenseMatrix& solution, ApplyA applyA) const;
   // Only ever called when errorBounds() is on -- this is the whole reason the
   // default solve path is unchanged.
   void recordErrorBounds(const DenseMatrix& rhs, const DenseMatrix& solution) const;
@@ -2720,8 +2729,9 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_impl(const MatrixBa
       r = b2 - r;
     }
   };
-  // PARDISO IPARM(8)=0: refine only if the factorization perturbed a pivot.
-  if (!(m_refineOnlyIfPerturbed && m_replacedPivots == 0))
+  // PARDISO IPARM(8)=0 by default, plus a measured backward error: see
+  // setRefineOnlyIfPerturbed().
+  if (shouldRefine<false>(rhs, solution, applyA))
     refineSolution(rhs, solution, applyA,
                    [this](const DenseMatrix& in, DenseMatrix& out) { solveTriangular(in, out); },
                    formResidual);
@@ -2829,6 +2839,39 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::solveTriangular(const Dens
   for (StorageIndex i = 0; i < n; ++i) y.row(m_rowToInternal[i]) = m_rowScale[i] * rhs.row(i);
   applyInverseBlocks(y);
   for (StorageIndex i = 0; i < n; ++i) x.row(i) = m_colScale[i] * y.row(m_toInternal[i]);
+}
+
+template <typename MatrixType, typename OrderingType, typename Executor>
+template <bool Transposed, typename ApplyA>
+bool LeftRightLU<MatrixType, OrderingType, Executor>::shouldRefine(const DenseMatrix& rhs,
+                                                                   const DenseMatrix& solution,
+                                                                   ApplyA applyA) const {
+  if (!m_refineOnlyIfPerturbed || m_replacedPivots > 0 || m_maxRefinementIterations <= 0) return true;
+  // ||op(A)||_inf: the largest absolute row sum of A, or column sum of A^T.
+  RealScalar normA(0);
+  if (Transposed) {
+    for (Index j = 0; j < m_originalMatrix.outerSize(); ++j) {
+      RealScalar sum(0);
+      for (typename MatrixType::InnerIterator it(m_originalMatrix, j); it; ++it) sum += numext::abs(it.value());
+      normA = numext::maxi(normA, sum);
+    }
+  } else {
+    std::vector<RealScalar> rowSum(std::size_t(m_originalMatrix.rows()), RealScalar(0));
+    for (Index j = 0; j < m_originalMatrix.outerSize(); ++j)
+      for (typename MatrixType::InnerIterator it(m_originalMatrix, j); it; ++it)
+        rowSum[std::size_t(it.row())] += numext::abs(it.value());
+    for (const RealScalar& v : rowSum) normA = numext::maxi(normA, v);
+  }
+  DenseMatrix product(rhs.rows(), rhs.cols());
+  applyA(solution, product);
+  const RealScalar tol = RealScalar(100) * NumTraits<RealScalar>::epsilon();
+  for (Index c = 0; c < rhs.cols(); ++c) {
+    const RealScalar r = (rhs.col(c) - product.col(c)).template lpNorm<Infinity>();
+    const RealScalar scale =
+        normA * solution.col(c).template lpNorm<Infinity>() + rhs.col(c).template lpNorm<Infinity>();
+    if (!(r <= tol * scale)) return true;  // also catches NaN
+  }
+  return false;
 }
 
 template <typename MatrixType, typename OrderingType, typename Executor>
@@ -3182,7 +3225,7 @@ void LeftRightLU<MatrixType, OrderingType, Executor>::_solve_transposed_impl(con
       r = b2 - r;
     }
   };
-  if (!(m_refineOnlyIfPerturbed && m_replacedPivots == 0))
+  if (shouldRefine<true>(rhs, solution, applyA))
     refineSolution(rhs, solution, applyA,
                    [this](const DenseMatrix& in, DenseMatrix& out) {
                      this->template solveTriangularTransposed<Conjugate>(in, out);
