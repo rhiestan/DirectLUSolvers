@@ -1209,7 +1209,8 @@ void testWeightedMinimumNormFallback() {
   const Eigen::VectorXd xb = qr.solve(b);
   double deadNorm = 0.0;
   for (auto c : qr.deadColumns()) deadNorm += std::abs(xb[c]);
-  checkTrue(deadNorm == 0.0 && qr.lastSolveMessage().empty(), "weighted fallback: Basic ignores the weights");
+  check(deadNorm == 0.0, "weighted fallback: Basic leaves the dead columns at zero", deadNorm);
+  checkTrue(qr.lastSolveMessage().empty(), "weighted fallback: Basic ignores the weights, no message");
 }
 
 }  // namespace
