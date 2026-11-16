@@ -9,6 +9,7 @@
 #include <Eigen/Sparse>
 
 #include <complex>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <vector>
@@ -1209,6 +1210,12 @@ void testWeightedMinimumNormFallback() {
   const Eigen::VectorXd xb = qr.solve(b);
   double deadNorm = 0.0;
   for (auto c : qr.deadColumns()) deadNorm += std::abs(xb[c]);
+  if (deadNorm != 0.0) {
+    std::printf("  [DIAG] n=%d rank=%ld dead=%zu deferred=%zu deferredNullity=%ld repairs=%ld scaling=%d\n", n,
+                long(qr.rank()), qr.deadColumns().size(), qr.deferredColumns().size(), long(qr.deferredNullity()),
+                long(qr.repairIterations()), int(qr.scalingUsed()));
+    for (auto c : qr.deadColumns()) std::printf("  [DIAG] dead col %ld  xb=%.6e  x(minnorm)=%.6e\n", long(c), xb[c], x[c]);
+  }
   check(deadNorm == 0.0, "weighted fallback: Basic leaves the dead columns at zero", deadNorm);
   checkTrue(qr.lastSolveMessage().empty(), "weighted fallback: Basic ignores the weights, no message");
 }
