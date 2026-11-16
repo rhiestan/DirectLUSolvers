@@ -177,7 +177,11 @@ enum class Ordering { Auto, COLAMD, AMD, Natural };
  *   MinimumNorm              the least-squares solution of smallest ||x||_2, or
  *                            of smallest ||diag(w) x||_2 under
  *                            setMinimumNormWeights(w).
- *   Basic                    the basic solution: dead columns zero.
+ *   Basic                    the basic solution: dead columns zero. (Of the
+ *                            factorization that answers: for an inconsistent
+ *                            right-hand side under Scaling::Auto, the
+ *                            column-scaled fallback, whose dead columns need
+ *                            not be deadColumns().)
  *   ColumnScaledMinimumNorm  the least-squares solution of smallest
  *                            ||diag(||A(:,j)||_2) x||_2: the minimum norm of
  *                            the matrix with unit columns, mapped back, so

@@ -173,7 +173,7 @@ block stops at 1373, and the repair loop can then only report failure; the SVD r
 | rank r < n, `Solution::MinimumNorm` (default) | the **minimum-norm** least-squares solution — `pinv(A) b` up to the rank decision |
 | rank r < n, `Solution::ColumnScaledMinimumNorm` | the least-squares solution of smallest `‖diag(‖A(:,j)‖₂) x‖`: invariant under column scaling |
 | rank r < n, `setMinimumNormWeights(w)` | the least-squares solution of smallest `‖diag(w) x‖` (under either minimum-norm setting) |
-| rank r < n, `Solution::Basic` | the basic solution: dead columns and null directions zero |
+| rank r < n, `Solution::Basic` | the basic solution: dead columns and null directions zero (of the factorization that answers: for an inconsistent right-hand side under `Scaling::Auto` that is the column-scaled fallback, whose dead columns need not be `deadColumns()`) |
 
 The minimum-norm answer is the basic one projected orthogonally off the null space, in the
 *original* (unscaled) inner product, **then refined again**. The projection cancels
